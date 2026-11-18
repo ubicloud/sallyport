@@ -1,7 +1,6 @@
 //! The library reaches the operating system through this module, which
 //! keeps the unsafe calls in one place.
 
-use std::io::Read;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -23,6 +22,20 @@ fn result(n: isize) -> isize {
 
 pub fn read(fd: RawFd, buf: &mut [u8]) -> isize {
     result(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) })
+}
+
+/// Sends on a socket without waiting. If the other end is closed, the
+/// error is returned and no signal is raised.
+pub fn send(fd: RawFd, buf: &[u8]) -> isize {
+    result(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) })
+}
+
+/// Says whether the other end of a socket pair is closed. poll(2)
+/// reports a hangup whatever events it is asked about.
+pub fn hung_up(fd: RawFd) -> bool {
+    let mut p = libc::pollfd { fd, events: 0, revents: 0 };
+    unsafe { libc::poll(&mut p, 1, 0) };
+    p.revents & (libc::POLLHUP | libc::POLLERR) != 0
 }
 
 /// Waits until a descriptor is ready or the time has passed, for a second
@@ -54,6 +67,18 @@ pub fn write_byte(fd: RawFd) {
 pub fn drain(fd: RawFd) {
     let mut buf = [0u8; 64];
     while read(fd, &mut buf) > 0 {}
+}
+
+/// Makes a Unix socket pair for a connection. Returns our end, which
+/// does not block, and Ruby's end.
+pub fn socketpair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut ends = [0 as RawFd; 2];
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    if unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, ends.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe { libc::fcntl(ends[0], libc::F_SETFL, libc::O_NONBLOCK) };
+    Ok(unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) })
 }
 
 /// Makes a UDP socket that does not block, bound to the port, or to any
@@ -104,7 +129,17 @@ pub fn udp_send(socket: &UdpSocket, v6: bool, datagram: &[u8], to: SocketAddr) {
     let _ = socket.send_to(datagram, to);
 }
 
-/// Fills the buffer from the system's random number generator.
+/// Returns bytes from the system's random number generator.
+pub fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    random_fill(&mut bytes);
+    bytes
+}
+
+/// Fills the buffer, of 256 bytes at most, from the system's random
+/// number generator. getrandom(2) needs no descriptor, so it does not
+/// fail when the process has none to spare.
 pub fn random_fill(buf: &mut [u8]) {
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).expect("/dev/urandom");
+    let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+    assert_eq!(n, buf.len() as isize, "getrandom: {}", std::io::Error::last_os_error());
 }

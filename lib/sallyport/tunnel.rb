@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "io/wait"
+
 module Sallyport
   # A Peer is what a tunnel knows of one of its peers: the peer's public
   # key, the address and port that it was last heard from or was
@@ -82,8 +84,44 @@ module Sallyport
       raise TypeError, "a tunnel cannot be copied"
     end
 
-    # Stops the tunnel. A signal handler cannot call this, because it
-    # takes a lock.
+    # Connects to a TCP port of an IP address through the tunnel, and
+    # returns the connection's Socket.
+    #
+    # Raises as connect(2) would: Errno::ECONNREFUSED, Errno::ENETUNREACH
+    # if no peer's AllowedIPs hold the address, and Errno::ETIMEDOUT if the
+    # connection is not established in +timeout+ seconds. Raises
+    # SocketError if +host+ is not an IP address, and Errno::ENETDOWN if
+    # the tunnel has failed.
+    def connect(host, port, timeout: 30)
+      port = self.class.port(port)
+      # An address is asked for, and never a name: a tunnel has no
+      # resolver.
+      remote = Addrinfo.getaddrinfo(host.to_s, port, nil, :STREAM, nil, ::Socket::AI_NUMERICHOST).first
+      # ::ffff:10.9.0.1 is the IPv4 address 10.9.0.1 in IPv6's writing.
+      remote = Addrinfo.tcp(remote.ipv6_to_ipv4.ip_address, port) if remote.ipv6_v4mapped?
+      to = "#{remote.ip_address} port #{port}"
+      # The wait for the lock can be interrupted. From the call until the
+      # descriptor has an owner, an exception from another thread waits.
+      socket = synchronize do
+        Thread.handle_interrupt(Object => :never) do
+          fd, code = Native::CONNECT.call(handle, remote.ip_address, port), Fiddle.last_error
+          raise SystemCallError.new(to, code) if fd.negative?
+
+          Socket.adopt(fd, remote, self)
+        end
+      end
+      begin
+        raise Errno::ETIMEDOUT, to unless socket.wait_readable(timeout)
+
+        outcome(socket, to)
+        established = socket
+      ensure
+        socket.close unless established
+      end
+    end
+
+    # Stops the tunnel. Its sockets reach end of file. A signal handler
+    # cannot call this, because it takes a lock.
     def close
       synchronize { self.class.release(@holder, @pid) }
       nil
@@ -123,6 +161,15 @@ module Sallyport
       raise ArgumentError, "a configuration value holds a line break or a #" if lines.any? { |l| l.match?(/[\r\n#]/) }
 
       lines.join("\n")
+    end
+
+    # Returns a TCP port as an Integer. A String is read as decimal, where
+    # Integer would read "022" as octal.
+    def self.port(port) # :nodoc:
+      port = Integer(port, 10) if port.is_a?(String)
+      raise ArgumentError, "#{port.inspect} is not a TCP port" unless port.is_a?(Integer) && port.between?(1, 65_535)
+
+      port
     end
 
     # Writes one address or network. An IPAddr keeps its prefix apart from
@@ -166,6 +213,19 @@ module Sallyport
       raise Error, "a tunnel does not survive fork" unless @pid == Process.pid
 
       handle
+    end
+
+    # Reads the status that the tunnel's thread sends first on a pair, and
+    # raises what it stands for unless it is 0.
+    def outcome(io, what)
+      # recv takes the status and no more. A buffered read would take
+      # with it whatever else has arrived, and what does not read through
+      # Ruby's buffer, as OpenSSL does not, would miss that.
+      status = io.recv(1)
+      # The thread closes its end when the tunnel is closed. At the end of
+      # a stream recv returns nil, or "" before Ruby 3.3.
+      raise IOError, "the tunnel was closed" if status.nil? || status.empty?
+      raise Native::STATUS.fetch(status.ord), what unless status.ord.zero?
     end
 
     def stats

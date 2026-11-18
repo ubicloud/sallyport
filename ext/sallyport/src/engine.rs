@@ -1,10 +1,11 @@
-//! A tunnel's thread owns the UDP socket and the WireGuard sessions, and
-//! serves them from one loop that never takes Ruby's GVL.
+//! A tunnel's thread owns the UDP socket, the WireGuard sessions and the
+//! TCP stack, and serves them from one loop that never takes Ruby's GVL.
 
 use crate::config::Config;
 use crate::peers::Peers;
 use crate::sys;
-use std::net::{SocketAddr, UdpSocket};
+use crate::tcp::{status, Stack};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,8 +18,18 @@ const TICK: Duration = Duration::from_millis(250);
 /// is dropped when the buffer fills, and one that has been taken is not.
 const UDP_BATCH: usize = 1024;
 
+/// A command is what a call into the library asks of a tunnel's thread.
+/// It carries our end of a socket pair, which is closed if the command is
+/// dropped.
+pub enum Cmd {
+    Connect { fd: OwnedFd, addr: IpAddr, port: u16 },
+}
+
 /// A tunnel's thread shares this with its handle.
 pub struct Shared {
+    pub cmds: Mutex<Vec<Cmd>>,
+    /// The thread has ended, and takes no more commands.
+    pub dead: AtomicBool,
     /// The pipe that wakes the loop. It is closed with the handle, which
     /// is the last to hold it, once the thread has ended.
     pub wake_r: OwnedFd,
@@ -42,6 +53,7 @@ pub struct Engine {
     /// mapped form.
     udp_v6: bool,
     peers: Peers,
+    stack: Stack,
     next_tick: Instant,
     buf: Vec<u8>,
 }
@@ -56,9 +68,23 @@ impl Engine {
         (wake_r, wake_w): (OwnedFd, OwnedFd),
     ) -> Result<(Engine, Arc<Shared>), String> {
         let peers = Peers::new(cfg)?;
-        let shared = Arc::new(Shared { wake_r, wake_w, stop: AtomicBool::new(false), stats: Mutex::default() });
-        let engine =
-            Engine { shared: shared.clone(), udp, udp_v6, peers, next_tick: Instant::now(), buf: vec![0; 65536] };
+        let shared = Arc::new(Shared {
+            cmds: Mutex::default(),
+            dead: AtomicBool::new(false),
+            wake_r,
+            wake_w,
+            stop: AtomicBool::new(false),
+            stats: Mutex::default(),
+        });
+        let engine = Engine {
+            shared: shared.clone(),
+            udp,
+            udp_v6,
+            peers,
+            stack: Stack::new(cfg),
+            next_tick: Instant::now(),
+            buf: vec![0; 65536],
+        };
         engine.publish();
         Ok((engine, shared))
     }
@@ -70,17 +96,39 @@ impl Engine {
         *self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = text;
     }
 
-    /// Takes datagrams from the UDP socket and gives them to the peers.
-    /// Returns whether it stopped with more left to take.
+    /// Takes the commands that have been queued, and does each.
+    fn commands(&mut self) {
+        let cmds = std::mem::take(&mut *self.shared.cmds.lock().unwrap_or_else(|e| e.into_inner()));
+        for cmd in cmds {
+            match cmd {
+                Cmd::Connect { fd, addr, port } if self.peers.reaches(&addr) => self.stack.connect(fd, addr, port),
+                Cmd::Connect { fd, .. } => Stack::refuse(fd, status::NO_ROUTE),
+            }
+        }
+    }
+
+    /// Takes datagrams from the UDP socket, and gives the stack the IP
+    /// packets that they carry. Returns whether it stopped with more left
+    /// to take.
     fn udp_in(&mut self) -> bool {
         for _ in 0..UDP_BATCH {
             let Ok((len, from)) = self.udp.recv_from(&mut self.buf) else { return false };
             let from = SocketAddr::new(from.ip().to_canonical(), from.port());
             let (udp, v6) = (&self.udp, self.udp_v6);
-            // There is nothing yet to give an IP packet to.
-            self.peers.receive(&self.buf[..len], from, &mut |d, to| sys::udp_send(udp, v6, d, to));
+            let packet = self.peers.receive(&self.buf[..len], from, &mut |d, to| sys::udp_send(udp, v6, d, to));
+            if let Some(packet) = packet {
+                self.stack.receive(packet);
+            }
         }
         true
+    }
+
+    /// Encrypts and sends the packets that the stack has queued.
+    fn flush(&mut self) {
+        while let Some(packet) = self.stack.transmit() {
+            let (udp, v6) = (&self.udp, self.udp_v6);
+            self.peers.send(&packet, &mut |d, to| sys::udp_send(udp, v6, d, to));
+        }
     }
 
     fn tick(&mut self) {
@@ -92,22 +140,52 @@ impl Engine {
     pub fn run(mut self) {
         let (udp, v6) = (&self.udp, self.udp_v6);
         self.peers.start(&mut |d, to| sys::udp_send(udp, v6, d, to));
+        let mut fds: Vec<libc::pollfd> = Vec::new();
         while !self.shared.stop.load(Ordering::Acquire) {
+            self.commands();
             let more = self.udp_in();
             if Instant::now() >= self.next_tick {
                 self.tick();
                 self.next_tick = Instant::now() + TICK;
             }
-            let wait = if more { Duration::ZERO } else { self.next_tick.saturating_duration_since(Instant::now()) };
-            let mut fds = [self.shared.wake_r.as_raw_fd(), self.udp.as_raw_fd()].map(|fd| libc::pollfd {
+            let moved = self.stack.turn();
+            self.flush();
+
+            let mut wait = self.next_tick.saturating_duration_since(Instant::now());
+            if let Some(delay) = self.stack.poll_delay() {
+                wait = wait.min(delay);
+            }
+            // A connection that moved may have given its socket something
+            // to send, which the next turn sends.
+            if more || moved {
+                wait = Duration::ZERO;
+            }
+            fds.clear();
+            fds.extend([self.shared.wake_r.as_raw_fd(), self.udp.as_raw_fd()].map(|fd| libc::pollfd {
                 fd,
                 events: libc::POLLIN,
                 revents: 0,
-            });
+            }));
+            self.stack.poll_fds(&mut fds);
             sys::poll(&mut fds, wait);
             if fds[0].revents != 0 {
                 sys::drain(self.shared.wake_r.as_raw_fd());
             }
         }
+    }
+}
+
+/// The thread ends when run returns, or with a panic. Either way the
+/// engine is dropped, and every descriptor that the thread holds is
+/// closed with it. Ruby's ends then reach end of file, so a tunnel that
+/// has failed looks closed to Ruby, and not silent.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // A call queues a command under this lock, and only while `dead`
+        // is false. So no command is queued after this, to be left with
+        // its descriptor open.
+        let mut cmds = self.shared.cmds.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.dead.store(true, Ordering::Release);
+        cmds.clear();
     }
 }

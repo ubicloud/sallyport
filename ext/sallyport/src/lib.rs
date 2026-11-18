@@ -1,17 +1,22 @@
 //! sallyport: WireGuard and TCP in user space, behind a C ABI small
 //! enough to bind by hand.
+//!
+//! No call here waits for a connection to be made. A connection is a
+//! descriptor that is returned at once, and whether it was established
+//! arrives on it, as its first byte. So the caller waits in its own I/O,
+//! where it waits for everything else and can be interrupted.
 
 mod config;
 mod engine;
 mod keys;
-// Nothing sends a packet through a tunnel yet, so only the tests call
-// some of this module.
-#[allow(dead_code)]
 mod peers;
 mod sys;
+mod tcp;
 
-use engine::{Engine, Shared};
+use engine::{Cmd, Engine, Shared};
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::net::IpAddr;
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 use std::panic::catch_unwind;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -23,6 +28,24 @@ pub struct Handle {
     /// The UDP port, which the system chose if the configuration named
     /// none.
     port: u16,
+}
+
+impl Handle {
+    /// Makes a socket pair, queues the command that carries our end of
+    /// it for the tunnel's thread, and returns Ruby's end. An error is an
+    /// errno, which is ENETDOWN if the thread has ended and the system's
+    /// error if the system refused the pair.
+    fn pair(&self, cmd: impl FnOnce(OwnedFd) -> Cmd) -> Result<RawFd, c_int> {
+        let (ours, theirs) = sys::socketpair().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        let mut cmds = self.shared.cmds.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shared.dead.load(Ordering::Acquire) {
+            return Err(libc::ENETDOWN);
+        }
+        cmds.push(cmd(ours));
+        drop(cmds);
+        self.shared.wake();
+        Ok(theirs.into_raw_fd())
+    }
 }
 
 /// Copies as much of the text as fits into the buffer, in whole
@@ -95,7 +118,7 @@ pub unsafe extern "C" fn sp_open(conf: *const c_char, err: *mut c_char, errlen: 
     std::ptr::null_mut()
 }
 
-/// Stops a tunnel.
+/// Stops a tunnel, and closes every connection through it.
 ///
 /// # Safety
 /// `h` came from sp_open, and is not used again.
@@ -112,6 +135,35 @@ pub unsafe extern "C" fn sp_close(h: *mut c_void) {
     }
     // The pipe is closed here, as the handle is dropped. The thread has
     // ended, and nothing else can write to the pipe or wait on it.
+}
+
+/// Begins a TCP connection through the tunnel, and returns a descriptor
+/// for it at once. The first byte read from the descriptor is a status.
+/// It is 0 once the connection is established, and the connection's
+/// stream follows it. Otherwise it is 1 for refused, 2 for timed out, 3
+/// for an address that no peer takes, or 4 for no local port left, and
+/// the stream ends. Closing the descriptor before the status arrives
+/// abandons the attempt.
+///
+/// Returns -1 and sets errno if no connection was begun: EINVAL if `addr`
+/// is not an IP address or `port` not a port, ENETDOWN if the tunnel's
+/// thread has ended, or the system's error.
+///
+/// # Safety
+/// `h` came from sp_open, and `addr` is a C string.
+#[no_mangle]
+pub unsafe extern "C" fn sp_connect(h: *mut c_void, addr: *const c_char, port: c_int) -> c_int {
+    let h = &*h.cast::<Handle>();
+    let addr = text(addr).and_then(|addr| addr.parse::<IpAddr>().ok());
+    let port = u16::try_from(port).ok().filter(|port| *port != 0);
+    let begun = match (addr, port) {
+        (Some(addr), Some(port)) => h.pair(|fd| Cmd::Connect { fd, addr, port }),
+        _ => Err(libc::EINVAL),
+    };
+    begun.unwrap_or_else(|errno| {
+        *libc::__errno_location() = errno;
+        -1
+    })
 }
 
 /// Returns the tunnel's UDP port.
