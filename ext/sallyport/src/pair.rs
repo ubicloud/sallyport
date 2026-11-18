@@ -15,9 +15,10 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 // The module "pair" is this contract as the model "conn" has it. The
 // lines of the module are here and beside the calls below.
 //
-// TLA-pair> \* This is a connection's socket pair as the kernel keeps it, with what
-// TLA-pair> \* Ruby may do with its end. A state of the pair is a record with these
-// TLA-pair> \* fields.
+// TLA-pair> \* This is a connection's socket pair as pair.rs lets the stack see it,
+// TLA-pair> \* with what Ruby may do with its end. A state of the pair is a record
+// TLA-pair> \* with these fields. The kernel keeps the first six, and our end keeps
+// TLA-pair> \* the last three.
 // TLA-pair> \*   fromRuby  the bytes that Ruby wrote and the stack has not read
 // TLA-pair> \*   forRuby   the bytes that the stack wrote and Ruby has not read
 // TLA-pair> \*   fromShut  no more goes from Ruby to the stack, because Ruby has shut
@@ -28,11 +29,15 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 // TLA-pair> \*   err       Ruby closed its end with bytes unread, and the stack has yet
 // TLA-pair> \*             to be told
 // TLA-pair> \*   quota     the bytes that Ruby may still write
+// TLA-pair> \*   done      Pair::done
+// TLA-pair> \*   deaf      Pair::deaf
+// TLA-pair> \*   told      Pair::told
 // TLA-pair> EXTENDS Naturals
 // TLA-pair> CONSTANTS PairCap, Budget
 // TLA-pair> When(cond, x) == IF cond THEN {x} ELSE {}
 // TLA-pair> New == [fromRuby |-> 0, forRuby |-> 0, fromShut |-> FALSE, forShut |-> FALSE,
-// TLA-pair>         gone |-> "no", err |-> FALSE, quota |-> Budget]
+// TLA-pair>         gone |-> "no", err |-> FALSE, quota |-> Budget,
+// TLA-pair>         done |-> FALSE, deaf |-> FALSE, told |-> FALSE]
 // TLA-pair> \* Ruby may write, read, shut down either way and close, in any order and
 // TLA-pair> \* at any time. Each of these is the set of the states that a move of
 // TLA-pair> \* Ruby leads to, and it is empty when Ruby cannot make the move.
@@ -118,12 +123,12 @@ impl Pair {
         Pair { fd, done: false, deaf: false, told: false }
     }
 
-    // TLA-pair> \* Pair::read says one of these, and takes bytes if there are some. It
-    // TLA-pair> \* tells once of bytes that Ruby left unread.
+    // TLA-pair> \* Pair::read says one of these. It tells once of bytes that Ruby left
+    // TLA-pair> \* unread. Took is the pair after a read that took n bytes.
     // TLA-pair> Read(p) == IF p.fromRuby > 0 THEN "bytes" ELSE IF p.err THEN "reset"
     // TLA-pair>            ELSE IF p.fromShut THEN "end" ELSE "nothing"
-    // TLA-pair> Took(p, n) == [p EXCEPT !.fromRuby = @ - n]
-    // TLA-pair> Heard(p) == [p EXCEPT !.err = FALSE]
+    // TLA-pair> Took(p, n) == [p EXCEPT !.fromRuby = @ - n, !.err = @ /\ Read(p) # "reset",
+    // TLA-pair>                         !.done = @ \/ Read(p) = "end"]
     /// Reads bytes that Ruby wrote, the oldest first. A read that finds
     /// none says why. It tells once of bytes that Ruby left unread when it
     /// closed its end. After that it gives the end, if Ruby has closed its
@@ -148,7 +153,7 @@ impl Pair {
     }
 
     // TLA-pair> \* Pair::stop
-    // TLA-pair> Stop(p) == [p EXCEPT !.fromShut = TRUE]
+    // TLA-pair> Stop(p) == [p EXCEPT !.fromShut = TRUE, !.done = TRUE]
     /// Ends what Ruby may write: a write by Ruby fails from now on. Ruby
     /// can still read what it is given
     /// (`a_pair_whose_reading_we_stop_refuses_what_ruby_writes`).
@@ -157,10 +162,12 @@ impl Pair {
         self.done = true;
     }
 
-    // TLA-pair> \* Pair::write says one of these, and gives bytes if the pair takes them.
+    // TLA-pair> \* Pair::write says one of these. Room is how many bytes a write may
+    // TLA-pair> \* give, and Gave is the pair after a write that gave n.
     // TLA-pair> Write(p) == IF p.forShut \/ p.gone # "no" THEN "refused"
     // TLA-pair>             ELSE IF p.forRuby < PairCap THEN "bytes" ELSE "full"
-    // TLA-pair> Gave(p, n) == [p EXCEPT !.forRuby = @ + n]
+    // TLA-pair> Room(p) == IF Write(p) = "bytes" THEN PairCap - p.forRuby ELSE 0
+    // TLA-pair> Gave(p, n) == [p EXCEPT !.forRuby = @ + n, !.deaf = @ \/ Write(p) = "refused"]
     /// Writes bytes for Ruby. The pair refuses them once Ruby has closed
     /// its end or shut down its reading, and from then on
     /// (`a_write_is_refused_once_ruby_reads_no_more`). While Ruby closes
@@ -184,7 +191,7 @@ impl Pair {
     }
 
     // TLA-pair> \* Pair::end
-    // TLA-pair> End(p) == [p EXCEPT !.forShut = TRUE]
+    // TLA-pair> End(p) == [p EXCEPT !.forShut = TRUE, !.told = TRUE]
     /// Ends what Ruby reads, after the bytes that were written already
     /// (`ruby_reads_the_end_after_what_it_was_given`).
     pub fn end(&mut self) {
