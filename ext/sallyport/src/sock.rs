@@ -21,6 +21,17 @@ pub enum Up {
     Ended,
 }
 
+/// A handshake, as step sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Opening {
+    /// The handshake is not over.
+    Pending,
+    /// The connection is established, or was and has gone further.
+    Done,
+    /// The peer refused or reset the connection, or it timed out.
+    Failed,
+}
+
 /// One connection's socket, with the bytes that were taken out of it for
 /// Ruby before smoltcp could clear them.
 pub struct Sock<'a, 'b> {
@@ -122,6 +133,19 @@ impl<'a, 'b> Sock<'a, 'b> {
         self.tail.clear();
         while self.s.can_recv() {
             let _ = self.s.recv(|buf| (buf.len(), ()));
+        }
+    }
+
+    /// Says how the handshake of a socket stands. A socket that listens
+    /// and has seen no SYN is pending too. smoltcp puts a socket that
+    /// listened back in LISTEN when its handshake is reset, and
+    /// Stack::unlisten removes such a socket before step sees it
+    /// (`a_handshake_that_its_peer_resets_leaves_no_socket`).
+    pub fn opening(s: &tcp::Socket) -> Opening {
+        match s.state() {
+            tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived => Opening::Pending,
+            tcp::State::Closed => Opening::Failed,
+            _ => Opening::Done,
         }
     }
 

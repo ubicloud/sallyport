@@ -88,7 +88,7 @@ desc "Check the TLA+ models with TLC (needs Java)"
 task tla: "tla:tools" do
   # The models are named, so that one that the tool no longer finds is
   # missed.
-  sh "tools/tla", "check", "wake", "conn"
+  sh "tools/tla", "check", "wake", "birth", "conn"
 end
 
 namespace :tla do

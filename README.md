@@ -136,15 +136,17 @@ tunnels makes.
 
 ## Models
 
-Two parts of the library are easier to get wrong than to test, and each
-has a TLA+ model. The model `wake` is of what a tunnel's thread shares
-with the threads that call the library: how a call reaches the thread, how
-a caller is answered, and how the thread and its handle end. The model
-`conn` is of one connection: how bytes move between Ruby's descriptor and
-the TCP socket, what `poll` is asked about the descriptor, and how the
-connection ends.
+Three parts of the library are easier to get wrong than to test, and
+each has a TLA+ model. The model `wake` is of what a tunnel's thread
+shares with the threads that call the library: how a call reaches the
+thread, how a caller is answered, and how the thread and its handle end.
+The model `birth` is of a connection before it is open: how Ruby is
+answered when it makes one, and how it is handed one that a peer made.
+The model `conn` is of a connection that is open: how bytes move between
+Ruby's descriptor and the TCP socket, what `poll` is asked about the
+descriptor, and how the connection ends.
 
-A third module, `stream`, is what a connection promises to Ruby and to
+One more module, `stream`, is what a connection promises to Ruby and to
 the peer, with no word of sockets or descriptors: no byte is lost while
 someone may read it, and a stream ends once, after its last byte. TLC
 checks that every step of `conn` is a step that `stream` allows.

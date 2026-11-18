@@ -7,7 +7,7 @@
 
 use crate::config::Config;
 use crate::packet::{rst, split_fin, syn, without_sack};
-use crate::sock::{Sock, Up};
+use crate::sock::{Opening, Sock, Up};
 use crate::sys::{self, Sent};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -917,6 +917,99 @@ impl Stack {
 // TLA-conn> PumpDead == /\ s.phase = "dead"
 // TLA-conn>             /\ (s.quiet /\ s.owed = "none") \/ s.age >= Linger
 // TLA-conn>             /\ s' = [s EXCEPT !.phase = "removed"]
+// The model "birth" is of one connection before it is open: how step
+// answers a Ruby that makes a connection, and how it hands a Ruby that
+// listens a connection that a peer made. It leaves out what wakes the
+// loop, which the tick does four times a second in any case.
+//
+// TLA-birth> EXTENDS Naturals
+// TLA-birth> CONSTANTS Way,    \* "out" for a connection that Ruby makes, "in" for one that it accepts
+// TLA-birth>           Fault   \* the fault that a variant puts in, or "none"
+// TLA-birth> VARIABLE b
+// TLA-birth> Init == \E r \in BOOLEAN : b = [
+// TLA-birth>   phase  |-> IF Way = "out" THEN "connecting" ELSE "listening",
+// TLA-birth>   sk     |-> "pending",  \* Sock::opening: "pending", "done" or "failed"
+// TLA-birth>   late   |-> FALSE,      \* the attempt is as old as smoltcp's timeout, less a second
+// TLA-birth>   ruby   |-> "waits",    \* "left": Ruby has closed its end of the pair, or the listener
+// TLA-birth>   status |-> "none",     \* the byte that Ruby is sent for a connection that it makes
+// TLA-birth>   room   |-> r,          \* the listener's pair has room for a message
+// TLA-birth>   told   |-> 0,          \* how many times Ruby was sent this connection
+// TLA-birth>   owed   |-> "none"]     \* what the socket has yet to send: "none" or "rst"
+// TLA-birth> Waiting == b.phase \in {"connecting", "listening", "accepting"}
+// TLA-birth> \* The peer finishes the handshake, refuses it, or resets the connection
+// TLA-birth> \* before Ruby has it. smoltcp gives a silent peer up.
+// TLA-birth> Answers == b.sk = "pending" /\ b' = [b EXCEPT !.sk = "done"]
+// TLA-birth> Refuses == b.sk = "pending" /\ b' = [b EXCEPT !.sk = "failed"]
+// TLA-birth> Resets == b.sk = "done" /\ Waiting /\ b' = [b EXCEPT !.sk = "failed"]
+// TLA-birth> Ages == b.sk = "pending" /\ ~b.late /\ b' = [b EXCEPT !.late = TRUE]
+// TLA-birth> TimesOut == b.sk = "pending" /\ b.late /\ b' = [b EXCEPT !.sk = "failed"]
+// TLA-birth> \* Ruby gives up, or closes the listener. It accepts other connections,
+// TLA-birth> \* and others take the room that it makes.
+// TLA-birth> Leaves == b.ruby = "waits" /\ b' = [b EXCEPT !.ruby = "left"]
+// TLA-birth> Accepts == Way = "in" /\ ~b.room /\ b' = [b EXCEPT !.room = TRUE]
+// TLA-birth> Fills == Way = "in" /\ b.room /\ b' = [b EXCEPT !.room = FALSE]
+// TLA-birth> \* step. A connection that is reset or closed keeps its socket until the
+// TLA-birth> \* socket has sent what it owes.
+// TLA-birth> Abort == [b EXCEPT !.phase = "dead", !.sk = "failed", !.owed = IF b.sk = "failed" THEN "none" ELSE "rst"]
+// TLA-birth> Close == [b EXCEPT !.phase = "dead"]
+// TLA-birth> Step ==
+// TLA-birth>   \/ /\ b.phase = "connecting"
+// TLA-birth>      /\ \/ b.ruby = "left" /\ b' = Abort
+// TLA-birth>         \/ b.ruby # "left" /\ b.sk = "failed"
+// TLA-birth>            /\ b' = [Close EXCEPT !.status = IF b.late THEN "timedout" ELSE "refused"]
+// TLA-birth>         \/ b.ruby # "left" /\ (b.sk = "done" \/ Fault = "greets early")
+// TLA-birth>            /\ b' = [b EXCEPT !.status = "ok", !.phase = "open"]
+// TLA-birth>   \/ /\ b.phase = "listening"
+// TLA-birth>      /\ \/ b.ruby = "left" /\ b' = Abort
+// TLA-birth>         \/ b.ruby # "left" /\ b.sk = "failed" /\ Fault # "keeps a failure" /\ b' = Close
+// TLA-birth>         \/ b.ruby # "left" /\ b.sk = "done" /\ b' = [b EXCEPT !.phase = "accepting"]
+// TLA-birth>   \/ /\ b.phase = "accepting"
+// TLA-birth>      /\ \/ (b.ruby = "left" \/ b.sk = "failed") /\ b' = Abort
+// TLA-birth>         \/ b.ruby # "left" /\ b.sk = "done" /\ b.room
+// TLA-birth>            /\ \E r \in BOOLEAN : b' = [b EXCEPT !.told = @ + 1, !.phase = "open", !.room = r]
+// TLA-birth> Dispatch == b.owed # "none" /\ b' = [b EXCEPT !.owed = "none"]
+// TLA-birth> Remove == b.phase = "dead" /\ b.owed = "none" /\ b' = [b EXCEPT !.phase = "removed"]
+// TLA-birth> Loop == Step \/ Dispatch \/ Remove
+// TLA-birth> Next == Answers \/ Refuses \/ Resets \/ Ages \/ TimesOut \/ Leaves \/ Accepts \/ Fills \/ Loop
+// TLA-birth> Spec == Init /\ [][Next]_b /\ WF_b(Loop) /\ WF_b(TimesOut)
+// TLA-birth>
+// TLA-birth> \* An open connection is one whose handshake is over, and Ruby has been
+// TLA-birth> \* told of it once: with the status, or with the descriptor.
+// TLA-birth> OpenIsGreeted == b.phase = "open" =>
+// TLA-birth>                    b.sk = "done" /\ IF Way = "out" THEN b.status = "ok" /\ b.told = 0
+// TLA-birth>                                                  ELSE b.status = "none" /\ b.told = 1
+// TLA-birth> \* Ruby is told of nothing else, and is told of a failure when the
+// TLA-birth> \* attempt is over.
+// TLA-birth> ToldOnce == /\ b.phase # "open" => b.status # "ok" /\ b.told = 0
+// TLA-birth>             /\ b.status \in {"refused", "timedout"} => b.phase \in {"dead", "removed"} /\ Way = "out"
+// TLA-birth> StatusStays == [][b.status # "none" => b'.status = b.status]_b
+// TLA-birth> \* An attempt that failed leaves no socket, and neither does one that Ruby
+// TLA-birth> \* gave up before it was open.
+// TLA-birth> FailureGoes == b.sk = "failed" ~> b.phase = "removed"
+// TLA-birth> GivenUpGoes == b.ruby = "left" ~> b.phase \in {"open", "removed"}
+// TLA-birth> \* Ruby has its answer when the handshake is over, unless it left.
+// TLA-birth> Answered == Way = "out" /\ b.sk = "done" ~> b.phase \in {"open", "removed"}
+//
+// TLA-birth.cfg> SPECIFICATION Spec
+// TLA-birth.cfg> CONSTANTS Way = "out"
+// TLA-birth.cfg>   Fault = "none"
+// TLA-birth.cfg> INVARIANTS OpenIsGreeted ToldOnce
+// TLA-birth.cfg> PROPERTIES StatusStays FailureGoes GivenUpGoes Answered
+// TLA-birth.cfg> CHECK_DEADLOCK FALSE
+//
+// The same for a connection that Ruby accepts:
+//
+// TLA-birth.cfg/in> Way = "in"
+//
+// Each of the variants that follow has a fault, and TLC must find it.
+// Ruby is sent the status before the handshake is over:
+//
+// TLA-birth.cfg/greets-early!OpenIsGreeted> Fault = "greets early"
+//
+// A socket that listened is kept when its handshake has failed:
+//
+// TLA-birth.cfg/keeps-a-failure!FailureGoes> Fault = "keeps a failure"
+// TLA-birth.cfg/keeps-a-failure!FailureGoes> Way = "in"
 /// Moves one connection as far as it will go. Returns whether it moved,
 /// and what becomes of it.
 fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Duration) -> (bool, Fate) {
@@ -930,12 +1023,12 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
         Phase::Connecting(_) if c.orphan || sys::hung_up(c.raw()) => (true, Fate::Abort),
         // Ruby closed the listener.
         Phase::Listening | Phase::Accepting if c.listener.is_none() => (true, Fate::Abort),
-        Phase::Listening => match s.state() {
-            tcp::State::Listen | tcp::State::SynReceived => (false, Fate::Keep),
+        Phase::Listening => match Sock::opening(s) {
+            Opening::Pending => (false, Fate::Keep),
             // The peer left the handshake unfinished, or it finished the
             // handshake and reset the connection at once.
-            tcp::State::Closed => (true, Fate::Close),
-            _ => match sys::socketpair(libc::SOCK_STREAM) {
+            Opening::Failed => (true, Fate::Close),
+            Opening::Done => match sys::socketpair(libc::SOCK_STREAM) {
                 Ok((ours, theirs)) => {
                     c.fd = Some(ours);
                     c.theirs = Some(theirs);
@@ -966,18 +1059,18 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
                 Sent::Gone => (true, Fate::Abort),
             }
         }
-        Phase::Connecting(since) => match s.state() {
+        Phase::Connecting(since) => match Sock::opening(s) {
             // The peer answers a SYN with a bare SYN if it was connecting
             // to us at the same moment, and the handshake is not over.
-            tcp::State::SynSent | tcp::State::SynReceived => (false, Fate::Keep),
-            tcp::State::Closed => {
+            Opening::Pending => (false, Fate::Keep),
+            Opening::Failed => {
                 // smoltcp does not say whether a reset or its timeout
                 // closed the socket, so the time taken has to.
                 let late = now - since + Duration::from_secs(1) >= TCP_TIMEOUT;
                 sys::send(c.raw(), &[if late { status::TIMED_OUT } else { status::REFUSED }]);
                 (true, Fate::Close)
             }
-            _ => {
+            Opening::Done => {
                 sys::send(c.raw(), &[status::OK]);
                 c.phase = Phase::Open;
                 (true, Fate::Keep)
