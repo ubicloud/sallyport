@@ -32,6 +32,11 @@ const KEEP_ALIVE: Duration = Duration::from_secs(75);
 /// A closed connection's socket stays this long to acknowledge the
 /// peer's FIN. smoltcp delays an ACK by 10 ms at most.
 const LINGER: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 500 });
+/// The retransmission timer waits this long at the least for a segment
+/// to be acknowledged. smoltcp's waits a second by default, as RFC 6298
+/// advises, and that of Linux waits 200 ms. A peer may delay an ACK for
+/// nearly as long, so a shorter wait would send again what was not lost.
+const MIN_RTO: Duration = Duration::from_millis(200);
 /// A connection that Ruby has closed is given this long to hear the
 /// peer's FIN, once the peer has acknowledged ours. Linux gives as long.
 const FIN_WAIT: Duration = Duration::from_secs(60);
@@ -241,6 +246,7 @@ fn socket() -> tcp::Socket<'static> {
     // smoltcp has no congestion control unless one is chosen: it sends
     // as much as the peer's window takes, whatever the path can carry.
     s.set_congestion_control(tcp::CongestionControl::Cubic);
+    s.set_min_rto(SDuration::from_millis(MIN_RTO.as_millis() as u64));
     s
 }
 
@@ -951,6 +957,7 @@ mod tests {
         let s = a.sockets.get::<tcp::Socket>(a.conns[0].handle);
         assert_eq!(s.congestion_control(), tcp::CongestionControl::Cubic);
         assert!(!s.nagle_enabled());
+        assert_eq!(s.min_rto(), SDuration::from_millis(200));
     }
 
     #[test]
