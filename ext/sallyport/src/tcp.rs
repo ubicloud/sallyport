@@ -8,58 +8,24 @@
 use crate::config::Config;
 use crate::packet::{rst, split_fin, syn, without_sack};
 use crate::pair::{Gave, Hangup, Pair, Took};
-use crate::sock::{Opening, Sock, Up};
+use crate::sock::{Opening, Sock, Socket, Up, ACK_DELAY, TCP_TIMEOUT};
 use crate::sys::{self, Sent};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
-use smoltcp::time::{Duration as SDuration, Instant as SInstant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
+use smoltcp::time::Instant as SInstant;
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-/// A socket holds this many bytes that Ruby wrote, until the peer has
-/// acknowledged them.
-const SEND_BUF: usize = 256 * 1024;
-/// A socket holds this many bytes that the peer sent, until the pair has
-/// room for them. A TCP header can give a window of this size and no more
-/// unless the window is scaled, so the peer sends this much at the most
-/// in one round trip.
-///
-/// smoltcp gets a scaled window wrong. It rounds the window down to the
-/// scale, so the end of the window moves back by a few bytes as the
-/// buffer fills. It takes a segment as far as the end that it has on
-/// record, which its last ACK gave, and the peer may have sent as far as
-/// an end that it was given before. smoltcp drops the bytes between the
-/// two, and takes the FIN of that segment all the same. Ruby would read
-/// the end of the stream without those bytes. While a window is shut,
-/// smoltcp also counts nothing from such a peer as heard, and its
-/// timeout would reset a peer that is there. The peer may scale its own
-/// window whatever this size is.
-const RECV_BUF: usize = 65535;
-/// A connection is dead when its peer has sent nothing for this long.
-/// smoltcp counts the silence whether or not anything waits to be
-/// acknowledged, so a connection has to ask a quiet peer to answer.
-const TCP_TIMEOUT: Duration = Duration::from_secs(300);
-/// A connection asks its peer for an ACK when the peer has been quiet for
-/// this long.
-const KEEP_ALIVE: Duration = Duration::from_secs(75);
 /// A closed connection's socket stays this long to acknowledge the
 /// peer's FIN. smoltcp delays an ACK by 10 ms at most.
 const LINGER: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 500 });
-/// The retransmission timer waits this long at the least for a segment
-/// to be acknowledged. smoltcp's waits a second by default, as RFC 6298
-/// advises, and that of Linux waits 200 ms. A peer may delay an ACK for
-/// nearly as long, so a shorter wait would send again what was not lost.
-const MIN_RTO: Duration = Duration::from_millis(200);
 /// A connection that Ruby has closed is given this long to hear the
 /// peer's FIN, once the peer has acknowledged ours. Linux gives as long.
 const FIN_WAIT: Duration = Duration::from_secs(60);
-/// smoltcp delays an ACK for this long at the most.
-const ACK_DELAY: Duration = Duration::from_millis(10);
 /// A connection that has ended is given this long to send its last ACK
 /// when the tunnel is closing, which is twice smoltcp's longest delay.
 const LAST_ACK: Duration = Duration::from_millis(20);
@@ -411,20 +377,6 @@ pub struct Stack {
     closing: bool,
 }
 
-fn socket() -> tcp::Socket<'static> {
-    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; RECV_BUF]), tcp::SocketBuffer::new(vec![0; SEND_BUF]));
-    s.set_timeout(Some(SDuration::from_millis(TCP_TIMEOUT.as_millis() as u64)));
-    s.set_keep_alive(Some(SDuration::from_millis(KEEP_ALIVE.as_millis() as u64)));
-    // The socket pair has already gathered what Ruby wrote, and a key
-    // typed into an interactive session must not wait for an ACK.
-    s.set_nagle_enabled(false);
-    // smoltcp has no congestion control unless one is chosen: it sends
-    // as much as the peer's window takes, whatever the path can carry.
-    s.set_congestion_control(tcp::CongestionControl::Cubic);
-    s.set_min_rto(SDuration::from_millis(MIN_RTO.as_millis() as u64));
-    s
-}
-
 impl Stack {
     pub fn new(cfg: &Config, sack: bool) -> Stack {
         let mut link = Link { rx: VecDeque::new(), tx: VecDeque::new(), mtu: cfg.mtu };
@@ -525,13 +477,10 @@ impl Stack {
         let Some(local) = ports.find(|port| self.local_ports.insert(*port)) else {
             return Stack::refuse(fd, status::NO_PORT);
         };
-        let mut s = socket();
-        let from = IpListenEndpoint { addr: None, port: local };
-        // smoltcp refuses the unspecified address.
-        if s.connect(self.iface.context(), (IpAddress::from(addr), port), from).is_err() {
+        let Some(s) = Sock::connecting(self.iface.context(), addr, port, local) else {
             self.local_ports.remove(&local);
             return Stack::refuse(fd, status::NO_ROUTE);
-        }
+        };
         let handle = self.sockets.add(s);
         let phase = Phase::Connecting { pair: Pair::new(fd), since: self.clock };
         self.conns.push(Conn { handle, local_port: Some(local), phase });
@@ -579,10 +528,10 @@ impl Stack {
         l.credit();
         let waits = |c: &&Conn| matches!(c.phase, Phase::Listening { listener } | Phase::Accepting { listener, .. } if listener == l.id);
         let pending = l.unaccepted + self.conns.iter().filter(waits).count();
-        let mut s = socket();
-        if pending >= l.backlog || s.listen(port).is_err() {
+        if pending >= l.backlog {
             return Welcome::Full;
         }
+        let Some(s) = Sock::listening(port) else { return Welcome::Full };
         let handle = self.sockets.add(s);
         self.conns.push(Conn { handle, local_port: None, phase: Phase::Listening { listener: l.id } });
         Welcome::Socket
@@ -593,11 +542,7 @@ impl Stack {
     /// Says whether a socket already has the connection between these two
     /// ends.
     fn has(&self, from: SocketAddr, to: SocketAddr) -> bool {
-        let (from, to) = (Some(IpEndpoint::from(from)), Some(IpEndpoint::from(to)));
-        self.conns
-            .iter()
-            .map(|c| self.sockets.get::<tcp::Socket>(c.handle))
-            .any(|s| s.state() != tcp::State::Listen && s.remote_endpoint() == from && s.local_endpoint() == to)
+        self.conns.iter().any(|c| Sock::has(self.sockets.get::<Socket>(c.handle), from, to))
     }
 
     // TLA-listen> \* smoltcp gives a SYN to the first socket that will take it. A socket
@@ -670,8 +615,7 @@ impl Stack {
     fn unlisten(&mut self) {
         let sockets = &mut self.sockets;
         self.conns.retain(|c| {
-            let listens = matches!(c.phase, Phase::Listening { .. })
-                && sockets.get::<tcp::Socket>(c.handle).state() == tcp::State::Listen;
+            let listens = matches!(c.phase, Phase::Listening { .. }) && Sock::listens(sockets.get::<Socket>(c.handle));
             if listens {
                 sockets.remove(c.handle);
             }
@@ -719,33 +663,23 @@ impl Stack {
                 Phase::Open(open) => (open.tail.len(), open.left.is_some()),
                 _ => (0, false),
             };
-            let s = self.sockets.get::<tcp::Socket>(c.handle);
-            let end = |end: Option<IpEndpoint>| end.map_or("-".into(), |end| end.to_string());
+            let s = self.sockets.get::<Socket>(c.handle);
             let _ = writeln!(
                 text,
-                "{phase} {} to {}: {}, {} bytes to send and {} to give Ruby, {} waiting in the pair{}{}{}",
-                end(s.local_endpoint()),
-                end(s.remote_endpoint()),
-                s.state(),
-                s.send_queue(),
-                s.recv_queue() + tail,
+                "{phase} {}, {} waiting in the pair{}{}{}",
+                Sock::describe(s, tail),
                 pair.map_or(0, Pair::waiting),
                 if pair.is_some_and(Pair::done) { ", no more comes from Ruby" } else { "" },
                 if pair.is_some_and(Pair::told) { ", the peer has ended its stream" } else { "" },
                 if left { ", Ruby is gone" } else { "" },
             );
-            let mut detail = format!("{s:?}");
-            while let Some(from) = detail.find("Owned([") {
-                let to = detail[from..].find("])").map_or(detail.len(), |to| from + to + 2);
-                detail.replace_range(from..to, "..");
-            }
-            let _ = writeln!(text, "  {detail}");
+            let _ = writeln!(text, "  {}", Sock::detail(s));
         }
     }
 
     // TLA-conn> \* Every turn of the loop has each socket send what it owes. smoltcp may
     // TLA-conn> \* delay an ACK past the turn.
-    // TLA-conn> Dispatch == s.phase # "removed" /\ s.k.owed # "none" /\ s' = [s EXCEPT !.k.owed = "none"]
+    // TLA-conn> Dispatch == s.phase # "removed" /\ s.k.owed # "none" /\ s' = [s EXCEPT !.k = K!Sent(@)]
     /// Has every socket send what it has to send.
     pub fn poll(&mut self) {
         let now = self.now();
@@ -817,12 +751,12 @@ impl Stack {
     // TLA-conn> \* among it, and the thread ends.
     // TLA-conn> Finish == /\ s.at = "idle" /\ s.closing /\ s.phase # "removed"
     // TLA-conn>           /\ LET k == IF s.phase = "dead" THEN s.k ELSE K!Abort(s.k)
-    // TLA-conn>              IN s' = [s EXCEPT !.phase = "removed", !.k = [k EXCEPT !.owed = "none"]]
+    // TLA-conn>              IN s' = [s EXCEPT !.phase = "removed", !.k = K!Sent(k)]
     /// Resets every connection that has not ended. The resets leave at
     /// the next poll.
     pub fn abort(&mut self) {
         for c in self.conns.iter().filter(|c| !matches!(c.phase, Phase::Dead { .. })) {
-            self.sockets.get_mut::<tcp::Socket>(c.handle).abort();
+            Sock::abort(self.sockets.get_mut::<Socket>(c.handle));
         }
         // A socket that has just taken the peer's FIN may still delay its
         // ACK, and the next poll is the last. So the stack's clock is put
@@ -845,7 +779,7 @@ impl Stack {
         }
         self.reap();
         for c in &mut self.conns {
-            let s = self.sockets.get_mut::<tcp::Socket>(c.handle);
+            let s = self.sockets.get_mut::<Socket>(c.handle);
             // The step takes the phase and gives back the phase to go on
             // in. If it gives none back, the connection is over for Ruby,
             // and what the phase held is closed: our end of the pair, and
@@ -856,7 +790,7 @@ impl Stack {
             match step(phase, s, &mut self.listeners, self.clock, self.closing) {
                 Fate::Keep(phase) => c.phase = phase,
                 Fate::Close => {}
-                Fate::Abort => s.abort(),
+                Fate::Abort => Sock::abort(s),
             }
         }
     }
@@ -879,7 +813,7 @@ impl Stack {
             let Phase::Dead { since } = c.phase else { return true };
             // A socket in TIME-WAIT may still owe the peer's FIN an ACK,
             // which smoltcp may delay.
-            if !Sock::silent(sockets.get::<tcp::Socket>(c.handle)) && now - since < LINGER {
+            if !Sock::silent(sockets.get::<Socket>(c.handle)) && now - since < LINGER {
                 return true;
             }
             sockets.remove(c.handle);
@@ -930,7 +864,7 @@ impl Stack {
                     // The pair is read while the socket has room, and
                     // written while the socket has bytes for Ruby, unless
                     // the pair has refused them.
-                    let (room, holds) = Sock::asks(self.sockets.get::<tcp::Socket>(c.handle), tail);
+                    let (room, holds) = Sock::asks(self.sockets.get::<Socket>(c.handle), tail);
                     let read = if !pair.done() && room { libc::POLLIN } else { 0 };
                     let write = if holds && !pair.deaf() { libc::POLLOUT } else { 0 };
                     // Once the hangup has been seen, poll would return
@@ -976,7 +910,7 @@ impl Stack {
 // TLA-conn>          ELSE Rest(t)
 /// Moves one connection as far as it will go, through each phase that it
 /// can leave now, and says what becomes of it.
-fn step(mut phase: Phase, s: &mut tcp::Socket, listeners: &mut [Listener], now: Duration, closing: bool) -> Fate {
+fn step(mut phase: Phase, s: &mut Socket, listeners: &mut [Listener], now: Duration, closing: bool) -> Fate {
     loop {
         phase = match phase {
             // sweep removes it.
@@ -1018,7 +952,7 @@ fn step(mut phase: Phase, s: &mut tcp::Socket, listeners: &mut [Listener], now: 
                 // Ruby may have closed the listener, and the peer may have
                 // reset the connection already.
                 let l = listeners.iter_mut().find(|l| l.id == listener);
-                let (Some(l), Some(from)) = (l, s.remote_endpoint()) else { return Fate::Abort };
+                let (Some(l), Some(from)) = (l, Sock::peer(s)) else { return Fate::Abort };
                 let message = format!("{} {}", from.addr, from.port);
                 match sys::send_fd(l.ctl.as_raw_fd(), message.as_bytes(), theirs.as_raw_fd()) {
                     Sent::Ok => {
@@ -1039,7 +973,7 @@ fn step(mut phase: Phase, s: &mut tcp::Socket, listeners: &mut [Listener], now: 
 
 /// Moves bytes each way for an open connection, and passes on the end of
 /// each direction.
-fn carry(mut open: Open, s: &mut tcp::Socket, now: Duration, closing: bool) -> Fate {
+fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
     let Open { pair, left, wait, tail } = &mut open;
     // The socket's contract has the tail, and carry has the rest.
     let s = &mut Sock::new(s, tail);
@@ -1421,6 +1355,9 @@ fn carry(mut open: Open, s: &mut tcp::Socket, now: Duration, closing: bool) -> F
 mod tests {
     use super::*;
     use crate::config;
+    use crate::sock::{RECV_BUF, SEND_BUF};
+    use smoltcp::socket::tcp;
+    use smoltcp::time::Duration as SDuration;
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::fd::{FromRawFd, RawFd};
@@ -1559,7 +1496,7 @@ mod tests {
     fn a_socket_has_the_settings_that_the_stack_gives() {
         let mut a = stack(A);
         let _ruby = connect(&mut a, B, 7);
-        let s = a.sockets.get::<tcp::Socket>(a.conns[0].handle);
+        let s = a.sockets.get::<Socket>(a.conns[0].handle);
         assert_eq!(s.congestion_control(), tcp::CongestionControl::Cubic);
         assert!(!s.nagle_enabled());
         assert_eq!(s.min_rto(), SDuration::from_millis(200));
@@ -1802,7 +1739,7 @@ mod tests {
     /// Returns how many bytes the socket of a stack's one connection holds
     /// for Ruby.
     fn held(stack: &Stack) -> usize {
-        stack.sockets.get::<tcp::Socket>(stack.conns[0].handle).recv_queue()
+        stack.sockets.get::<Socket>(stack.conns[0].handle).recv_queue()
     }
 
     /// Changes the 16-bit word at a place in the TCP header of an IPv4
@@ -2013,7 +1950,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(a.sockets.get::<tcp::Socket>(a.conns[0].handle).state(), tcp::State::Established);
+        assert_eq!(a.sockets.get::<Socket>(a.conns[0].handle).state(), tcp::State::Established);
     }
 
     #[test]
@@ -2391,7 +2328,7 @@ mod tests {
         }
         drop(server);
         settle(&mut a, &mut b);
-        let s = b.sockets.get::<tcp::Socket>(b.conns[0].handle);
+        let s = b.sockets.get::<Socket>(b.conns[0].handle);
         assert!(s.state() == tcp::State::CloseWait && s.send_queue() > 0, "{} with {}", s.state(), s.send_queue());
         let mut got = Vec::new();
         for _ in 0..100 {
@@ -2435,7 +2372,7 @@ mod tests {
         assert_eq!(read(&mut client).0, b"x");
         client.write_all(b"ab").unwrap();
         drop(client);
-        let state = |a: &Stack| a.sockets.get::<tcp::Socket>(a.conns[0].handle).state();
+        let state = |a: &Stack| a.sockets.get::<Socket>(a.conns[0].handle).state();
         let begun = Instant::now();
         while state(&a) != tcp::State::FinWait2 {
             assert!(begun.elapsed() < Duration::from_secs(20), "the socket is in {}", state(&a));

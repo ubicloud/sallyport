@@ -1,12 +1,56 @@
-//! What carry may ask of a TCP socket, and what it may take for granted.
+//! This file says what the stack may ask of a TCP socket, and what it
+//! may take for granted.
 //!
 //! smoltcp's socket has eleven states, and carry needs to know two things
-//! of each direction. Each method here says what carry relies on. Where
-//! smoltcp does not give that by itself, the method says what makes it so,
-//! and which test holds smoltcp to it.
+//! of each direction. Each method here says what the stack relies on.
+//! Where smoltcp does not give that by itself, the method says what makes
+//! it so, and which test holds smoltcp to it. Nothing else in the library
+//! makes a socket, or names a state of one.
 
+use smoltcp::iface::Context;
 use smoltcp::socket::tcp;
+use smoltcp::time::Duration as SDuration;
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+
+/// A Socket is smoltcp's socket for one TCP connection.
+pub type Socket = tcp::Socket<'static>;
+
+/// A socket holds this many bytes that Ruby wrote, until the peer has
+/// acknowledged them.
+pub const SEND_BUF: usize = 256 * 1024;
+/// A socket holds this many bytes that the peer sent, until the pair has
+/// room for them. A TCP header can give a window of this size and no more
+/// unless the window is scaled, so the peer sends this much at the most
+/// in one round trip.
+///
+/// smoltcp gets a scaled window wrong. It rounds the window down to the
+/// scale, so the end of the window moves back by a few bytes as the
+/// buffer fills. It takes a segment as far as the end that it has on
+/// record, which its last ACK gave, and the peer may have sent as far as
+/// an end that it was given before. smoltcp drops the bytes between the
+/// two, and takes the FIN of that segment all the same. Ruby would read
+/// the end of the stream without those bytes. While a window is shut,
+/// smoltcp also counts nothing from such a peer as heard, and its
+/// timeout would reset a peer that is there. The peer may scale its own
+/// window whatever this size is.
+pub const RECV_BUF: usize = 65535;
+/// A connection is dead when its peer has sent nothing for this long.
+/// smoltcp counts the silence whether or not anything waits to be
+/// acknowledged, so a connection has to ask a quiet peer to answer.
+pub const TCP_TIMEOUT: Duration = Duration::from_secs(300);
+/// A connection asks its peer for an ACK when the peer has been quiet for
+/// this long.
+const KEEP_ALIVE: Duration = Duration::from_secs(75);
+/// The retransmission timer waits this long at the least for a segment
+/// to be acknowledged. smoltcp's waits a second by default, as RFC 6298
+/// advises, and that of Linux waits 200 ms. A peer may delay an ACK for
+/// nearly as long, so a shorter wait would send again what was not lost.
+const MIN_RTO: Duration = Duration::from_millis(200);
+/// smoltcp delays an ACK for this long at the most.
+pub const ACK_DELAY: Duration = Duration::from_millis(10);
 
 // The module "sock" is this contract as the model "conn" has it. The
 // lines of the module are here and beside the calls below.
@@ -69,8 +113,8 @@ use std::collections::VecDeque;
 // TLA-sock> \* when it sends those bytes again.
 // TLA-sock> TimesOut(k) == When(~(k.up = "ended" /\ ~k.down) /\ (k.gone \/ Fault = "no keep-alive"),
 // TLA-sock>                     [Cut(k) EXCEPT !.owed = "rst"])
-// TLA-sock> \* tcp::Socket::abort. A socket that is cut already has no peer to reset.
-// TLA-sock> Abort(k) == [Cut(k) EXCEPT !.owed = IF k.cut THEN @ ELSE "rst"]
+// TLA-sock> \* Stack::poll has smoltcp send what a socket owes.
+// TLA-sock> Sent(k) == [k EXCEPT !.owed = "none"]
 
 /// The stream to the peer, as carry sees it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -102,12 +146,101 @@ pub trait Moved {
 
 /// One connection's socket, with the bytes that were taken out of it for
 /// Ruby before smoltcp could clear them.
-pub struct Sock<'a, 'b> {
-    s: &'a mut tcp::Socket<'b>,
+pub struct Sock<'a> {
+    s: &'a mut Socket,
     tail: &'a mut VecDeque<u8>,
 }
 
-impl<'a, 'b> Sock<'a, 'b> {
+impl<'a> Sock<'a> {
+    /// Makes a socket with the settings that this contract rests on.
+    fn make() -> Socket {
+        let mut s = Socket::new(tcp::SocketBuffer::new(vec![0; RECV_BUF]), tcp::SocketBuffer::new(vec![0; SEND_BUF]));
+        s.set_timeout(Some(SDuration::from_millis(TCP_TIMEOUT.as_millis() as u64)));
+        s.set_keep_alive(Some(SDuration::from_millis(KEEP_ALIVE.as_millis() as u64)));
+        // The socket pair has already gathered what Ruby wrote, and a key
+        // typed into an interactive session must not wait for an ACK.
+        s.set_nagle_enabled(false);
+        // smoltcp has no congestion control unless one is chosen: it sends
+        // as much as the peer's window takes, whatever the path can carry.
+        s.set_congestion_control(tcp::CongestionControl::Cubic);
+        s.set_min_rto(SDuration::from_millis(MIN_RTO.as_millis() as u64));
+        s
+    }
+
+    /// Makes a socket that begins a connection to a port of a peer, from
+    /// a local port. smoltcp refuses the unspecified address, and none is
+    /// made then.
+    pub fn connecting(cx: &mut Context, addr: IpAddr, port: u16, local: u16) -> Option<Socket> {
+        let mut s = Sock::make();
+        let from = IpListenEndpoint { addr: None, port: local };
+        s.connect(cx, (IpAddress::from(addr), port), from).ok()?;
+        Some(s)
+    }
+
+    /// Makes a socket that listens on a port. It takes one connection:
+    /// smoltcp keeps no queue of them.
+    pub fn listening(port: u16) -> Option<Socket> {
+        let mut s = Sock::make();
+        s.listen(port).ok()?;
+        Some(s)
+    }
+
+    /// Says whether a socket listens still. One that has taken a SYN does
+    /// not, unless its peer reset the handshake: smoltcp has such a
+    /// socket listen again
+    /// (`a_socket_whose_handshake_was_reset_takes_no_other_syn`).
+    pub fn listens(s: &Socket) -> bool {
+        s.state() == tcp::State::Listen
+    }
+
+    /// Says whether a socket has the connection between these two ends. A
+    /// socket that listens has none.
+    pub fn has(s: &Socket, from: SocketAddr, to: SocketAddr) -> bool {
+        !Sock::listens(s)
+            && s.remote_endpoint() == Some(IpEndpoint::from(from))
+            && s.local_endpoint() == Some(IpEndpoint::from(to))
+    }
+
+    /// Returns the peer's end of a connection. A socket that has yet to
+    /// take a SYN has none, and neither has one that is cut and has sent
+    /// what it owed.
+    pub fn peer(s: &Socket) -> Option<IpEndpoint> {
+        s.remote_endpoint()
+    }
+
+    // TLA-sock> \* Sock::abort. A socket that is cut already has no peer to reset.
+    // TLA-sock> Abort(k) == [Cut(k) EXCEPT !.owed = IF k.cut THEN @ ELSE "rst"]
+    /// Cuts the connection, and has the socket reset the peer.
+    pub fn abort(s: &mut Socket) {
+        s.abort();
+    }
+
+    /// Describes a socket in a few words, for a person: its two ends, its
+    /// state as smoltcp names it, and how many bytes it holds each way.
+    /// `tail` is how many bytes for Ruby were taken out of it.
+    pub fn describe(s: &Socket, tail: usize) -> String {
+        let end = |end: Option<IpEndpoint>| end.map_or("-".into(), |end| end.to_string());
+        format!(
+            "{} to {}: {}, {} bytes to send and {} to give Ruby",
+            end(s.local_endpoint()),
+            end(s.remote_endpoint()),
+            s.state(),
+            s.send_queue(),
+            s.recv_queue() + tail,
+        )
+    }
+
+    /// Returns what smoltcp prints of a socket, and leaves out the bytes
+    /// in its buffers.
+    pub fn detail(s: &Socket) -> String {
+        let mut detail = format!("{s:?}");
+        while let Some(from) = detail.find("Owned([") {
+            let to = detail[from..].find("])").map_or(detail.len(), |to| from + to + 2);
+            detail.replace_range(from..to, "..");
+        }
+        detail
+    }
+
     // TLA-sock> \* Sock::new. The socket keeps what it holds for Ruby until Ruby is given
     // TLA-sock> \* it. smoltcp alone would clear it ten seconds after both streams have
     // TLA-sock> \* ended, and this is that fault.
@@ -117,7 +250,7 @@ impl<'a, 'b> Sock<'a, 'b> {
     /// seconds, and its receive buffer with it. So those bytes are taken
     /// out of the buffer as soon as both streams have ended, and are
     /// given from the tail (`what_ruby_has_not_read_outlasts_time_wait`).
-    pub fn new(s: &'a mut tcp::Socket<'b>, tail: &'a mut VecDeque<u8>) -> Self {
+    pub fn new(s: &'a mut Socket, tail: &'a mut VecDeque<u8>) -> Self {
         if s.state() == tcp::State::TimeWait {
             while s.can_recv() {
                 let _ = s.recv(|buf| {
@@ -217,7 +350,7 @@ impl<'a, 'b> Sock<'a, 'b> {
     /// listened back in LISTEN when its handshake is reset, and
     /// Stack::unlisten removes such a socket before step sees it
     /// (`a_handshake_that_its_peer_resets_leaves_no_socket`).
-    pub fn opening(s: &tcp::Socket) -> Opening {
+    pub fn opening(s: &Socket) -> Opening {
         match s.state() {
             tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived => Opening::Pending,
             tcp::State::Closed => Opening::Failed,
@@ -231,13 +364,13 @@ impl<'a, 'b> Sock<'a, 'b> {
     /// smoltcp forgets the peer once it has no more to send it. A socket
     /// that waits out TIME-WAIT is never silent in this sense: the peer's
     /// FIN may still be owed an ACK.
-    pub fn silent(s: &tcp::Socket) -> bool {
+    pub fn silent(s: &Socket) -> bool {
         s.state() == tcp::State::Closed && s.remote_endpoint().is_none()
     }
 
     /// Says what poll is to be asked for a socket: whether it has room for
     /// bytes from Ruby, and whether it holds bytes for Ruby.
-    pub fn asks(s: &tcp::Socket, tail: &VecDeque<u8>) -> (bool, bool) {
+    pub fn asks(s: &Socket, tail: &VecDeque<u8>) -> (bool, bool) {
         (s.can_send(), s.can_recv() || !tail.is_empty())
     }
 }
