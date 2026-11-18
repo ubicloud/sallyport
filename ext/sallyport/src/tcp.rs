@@ -19,9 +19,25 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
-/// Each direction of a connection has a buffer of this size. It is more
-/// than 64 KiB so that smoltcp negotiates window scaling.
-const TCP_BUF: usize = 256 * 1024;
+/// A socket holds this many bytes that Ruby wrote, until the peer has
+/// acknowledged them.
+const SEND_BUF: usize = 256 * 1024;
+/// A socket holds this many bytes that the peer sent, until the pair has
+/// room for them. A TCP header can give a window of this size and no more
+/// unless the window is scaled, so the peer sends this much at the most
+/// in one round trip.
+///
+/// smoltcp gets a scaled window wrong. It rounds the window down to the
+/// scale, so the end of the window moves back by a few bytes as the
+/// buffer fills. It takes a segment as far as the end that it has on
+/// record, which its last ACK gave, and the peer may have sent as far as
+/// an end that it was given before. smoltcp drops the bytes between the
+/// two, and takes the FIN of that segment all the same. Ruby would read
+/// the end of the stream without those bytes. While a window is shut,
+/// smoltcp also counts nothing from such a peer as heard, and its
+/// timeout would reset a peer that is there. The peer may scale its own
+/// window whatever this size is.
+const RECV_BUF: usize = 65535;
 /// A connection is dead when its peer has sent nothing for this long.
 /// smoltcp counts the silence whether or not anything waits to be
 /// acknowledged, so a connection has to ask a quiet peer to answer.
@@ -309,7 +325,9 @@ impl Conn {
 // TLA-conn@10> \* anything waits for an answer. So the socket asks a quiet peer to
 // TLA-conn@10> \* answer, with set_keep_alive, and the model takes it that the socket
 // TLA-conn@10> \* hears a peer that is there. The stack's clock does not count the time
-// TLA-conn@10> \* that the thread stood still, so the socket has asked by then.
+// TLA-conn@10> \* that the thread stood still, so the socket has asked by then. And
+// TLA-conn@10> \* with a window that has no scale, a peer that has sent past the end
+// TLA-conn@10> \* that smoltcp has on record is heard when it sends those bytes again.
 // TLA-conn@10> TcpTimeout == /\ s.st \notin {"Closed", "TimeWait"} /\ s.phase # "removed"
 // TLA-conn@10>               /\ (s.peer = "gone" \/ Fault = "no keep-alive")
 // TLA-conn@10>               /\ s' = [s EXCEPT !.st = "Closed", !.owed = "rst", !.tx = 0, !.kick = TRUE]
@@ -374,7 +392,7 @@ pub struct Stack {
 }
 
 fn socket() -> tcp::Socket<'static> {
-    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUF]), tcp::SocketBuffer::new(vec![0; TCP_BUF]));
+    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; RECV_BUF]), tcp::SocketBuffer::new(vec![0; SEND_BUF]));
     s.set_timeout(Some(SDuration::from_millis(TCP_TIMEOUT.as_millis() as u64)));
     s.set_keep_alive(Some(SDuration::from_millis(KEEP_ALIVE.as_millis() as u64)));
     // The socket pair has already gathered what Ruby wrote, and a key
@@ -1594,7 +1612,7 @@ mod tests {
             }
         }
         // Nobody reads, so the two pairs and the two sockets are full.
-        assert!((2 * TCP_BUF..END).contains(&at), "the writer waits after {at} bytes");
+        assert!((SEND_BUF + RECV_BUF..END).contains(&at), "the writer waits after {at} bytes");
         let mut got = Vec::new();
         for _ in 0..1000 {
             at = write_from(&mut client, at, END);
@@ -1606,6 +1624,179 @@ mod tests {
         }
         assert_eq!(got.len(), END);
         assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
+    }
+
+    /// Returns how many bytes the socket of a stack's one connection holds
+    /// for Ruby.
+    fn held(stack: &Stack) -> usize {
+        stack.sockets.get::<tcp::Socket>(stack.conns[0].handle).recv_queue()
+    }
+
+    /// Changes the 16-bit word at a place in the TCP header of an IPv4
+    /// packet, and corrects the checksum as RFC 1624 has it.
+    fn set_word(packet: &mut [u8], at: usize, change: impl Fn(u16) -> u16) {
+        let t = &mut packet[20..];
+        let old = u16::from_be_bytes([t[at], t[at + 1]]);
+        let new = change(old);
+        let mut sum = u32::from(!u16::from_be_bytes([t[16], t[17]])) + u32::from(!old) + u32::from(new);
+        sum = (sum & 0xffff) + (sum >> 16);
+        sum = (sum & 0xffff) + (sum >> 16);
+        t[at..at + 2].copy_from_slice(&new.to_be_bytes());
+        t[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    }
+
+    fn put_fin(packet: &mut [u8]) {
+        set_word(packet, 12, |flags| flags | 0x01);
+    }
+
+    /// Gives A what B has to send. Linux puts its FIN on the last segment
+    /// of data that it has still to send when a program closes its end.
+    /// This stack has smoltcp send its FIN apart, so the FIN is put on
+    /// B's segments here. A segment of one byte is left as it is, because
+    /// it may be a probe of A's window.
+    fn give_with_a_fin(b: &mut Stack, a: &mut Stack) {
+        while let Some(mut packet) = b.transmit() {
+            // The headers of IP and of TCP are 40 bytes.
+            if packet.len() > 41 {
+                put_fin(&mut packet);
+            }
+            a.receive(packet);
+        }
+    }
+
+    /// Returns what Ruby reads from A as far as the end of the stream,
+    /// with a FIN on the segments of B that have data.
+    fn read_to_a_fin(a: &mut Stack, b: &mut Stack, ruby: &mut UnixStream) -> Vec<u8> {
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            give_with_a_fin(b, a);
+            a.turn();
+            while let Some(packet) = a.transmit() {
+                b.receive(packet);
+            }
+            b.turn();
+            let (bytes, end) = read(ruby);
+            got.extend(bytes);
+            if end {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(12));
+        }
+        panic!("Ruby read {} bytes and no end of the stream", got.len());
+    }
+
+    #[test]
+    fn a_stream_that_ends_where_the_window_ends_is_read_whole() {
+        // The client's socket has this much room when the server writes
+        // the last of its stream, which is two writes. A window that
+        // smoltcp scaled would be all of the room before the first write,
+        // which is a multiple of 8 bytes, and less than the room for the
+        // second, which is an odd number of bytes.
+        const ROOM: usize = 4096;
+        const LAST: usize = 1001;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // The client reads nothing. Its pair fills, and then its socket
+        // begins to.
+        let mut at = 0;
+        while held(&a) == 0 {
+            at = write_from(&mut server, at, at + 16384);
+            settle(&mut a, &mut b);
+        }
+        // The stream ends where the socket is full.
+        let end = at - held(&a) + RECV_BUF;
+        while at < end - ROOM {
+            at = write_from(&mut server, at, end - ROOM);
+            settle(&mut a, &mut b);
+        }
+        assert_eq!(held(&a), RECV_BUF - ROOM);
+        // Both writes leave B before A has answered the first.
+        at = write_from(&mut server, at, end - LAST);
+        while b.turn() {}
+        while let Some(packet) = b.transmit() {
+            a.receive(packet);
+        }
+        assert_eq!(write_from(&mut server, at, end), end);
+        while b.turn() {}
+        // A acknowledges the first write at once, as it is more than a
+        // segment, and the window that it tells of is all of the room.
+        // With a scaled window it would be a byte short of the second
+        // write: smoltcp would drop the last byte of the stream, and take
+        // the FIN that comes with it.
+        a.turn();
+        // The second write is all that B has left to send, and A takes the
+        // whole of it.
+        give_with_a_fin(&mut b, &mut a);
+        a.turn();
+        assert_eq!(held(&a), RECV_BUF);
+        let got = read_to_a_fin(&mut a, &mut b, &mut client);
+        assert_eq!(got.len(), end);
+        assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
+    }
+
+    #[test]
+    fn a_peer_that_has_filled_a_shut_window_is_still_heard() {
+        // The server fills the client's socket with the two writes of the
+        // test above, and the client reads nothing.
+        const ROOM: usize = 4096;
+        const LAST: usize = 1001;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (_client, mut server) = connected(&mut a, &mut b);
+        let mut at = 0;
+        while held(&a) == 0 {
+            at = write_from(&mut server, at, at + 16384);
+            settle(&mut a, &mut b);
+        }
+        let end = at - held(&a) + RECV_BUF;
+        while at < end - ROOM {
+            at = write_from(&mut server, at, end - ROOM);
+            settle(&mut a, &mut b);
+        }
+        at = write_from(&mut server, at, end - LAST);
+        while b.turn() {}
+        while let Some(packet) = b.transmit() {
+            a.receive(packet);
+        }
+        assert_eq!(write_from(&mut server, at, end), end);
+        while b.turn() {}
+        a.turn();
+        // `top` is the sequence number after the last byte that B sends.
+        let mut top = 0;
+        while let Some(packet) = b.transmit() {
+            let seq = u32::from_be_bytes(packet[24..28].try_into().unwrap());
+            top = seq.wrapping_add(packet.len() as u32 - 40);
+            a.receive(packet);
+        }
+        a.turn();
+        // A's timers run 150 times as fast: its timeout is two seconds,
+        // and it asks B to answer every half second.
+        let s = a.sockets.get_mut::<tcp::Socket>(a.conns[0].handle);
+        s.set_timeout(s.timeout().map(|timeout| timeout / 150));
+        let interval = s.keep_alive().map(|interval| interval / 150);
+        s.set_keep_alive(None);
+        s.set_keep_alive(interval);
+        // B answers with an ACK that has no data. Linux numbers such an
+        // ACK from the last byte that it has sent, and B's ACK is given
+        // that number here. With a scaled window that byte would be past
+        // the end of A's window, and A would not count the answer.
+        let begun = a.clock;
+        while a.clock - begun < Duration::from_secs(4) {
+            a.turn();
+            while let Some(packet) = a.transmit() {
+                assert!(!is_reset(&packet), "A resets a peer that answers");
+                b.receive(packet);
+            }
+            b.turn();
+            while let Some(mut packet) = b.transmit() {
+                if packet.len() == 40 {
+                    set_word(&mut packet, 4, |_| (top >> 16) as u16);
+                    set_word(&mut packet, 6, |_| top as u16);
+                }
+                a.receive(packet);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(a.sockets.get::<tcp::Socket>(a.conns[0].handle).state(), tcp::State::Established);
     }
 
     #[test]
@@ -1674,7 +1865,7 @@ mod tests {
 
     #[test]
     fn a_closed_end_is_not_kept_for_a_peer_that_takes_nothing() {
-        const END: usize = 700 << 10;
+        const END: usize = 500 << 10;
         let (mut a, mut b) = (stack(A), stack(B));
         let (mut client, mut server) = connected(&mut a, &mut b);
         // The server reads nothing, so its window shuts with part of this
@@ -1692,22 +1883,27 @@ mod tests {
         age(&mut a, Duration::from_secs(1));
         settle(&mut a, &mut b);
         assert!(a.conns.is_empty());
-        // The server can still read what reached it, and then the end.
-        let mut got = 0;
+        // The server can still read what reached it, and then the end. That
+        // is what its pair holds, and what its socket holds after the
+        // reset.
+        let in_socket = held(&b);
+        let (in_pair, _) = read(&mut server);
+        let mut got = in_pair.len();
         for _ in 0..100 {
+            settle(&mut a, &mut b);
             let (bytes, end) = read(&mut server);
             got += bytes.len();
             if end {
                 break;
             }
-            settle(&mut a, &mut b);
         }
-        assert!(got > TCP_BUF && got < END && b.conns.is_empty(), "{got} bytes arrived");
+        assert!(in_socket > 0 && got == in_pair.len() + in_socket && got < END, "{got} bytes arrived");
+        assert!(b.conns.is_empty());
     }
 
     #[test]
     fn the_peer_has_its_time_from_when_it_has_taken_everything() {
-        const END: usize = 700 << 10;
+        const END: usize = 500 << 10;
         let (mut a, mut b) = (stack(A), stack(B));
         let (mut client, mut server) = connected(&mut a, &mut b);
         // The server reads nothing yet, so part of this is still to send
@@ -1872,15 +2068,14 @@ mod tests {
     #[test]
     #[ignore]
     fn what_ruby_has_not_read_outlasts_time_wait() {
-        const END: usize = 400 << 10;
         let (mut a, mut b) = (stack(A), stack(B));
         let (mut client, mut server) = connected(&mut a, &mut b);
         // Ruby ends its writing. The peer answers with more than the pair
-        // holds, and ends too.
+        // holds, so the socket holds the rest, and ends too.
         client.shutdown(Shutdown::Write).unwrap();
         let mut at = 0;
-        while at < END {
-            at = write_from(&mut server, at, END);
+        while held(&a) == 0 {
+            at = write_from(&mut server, at, at + 16384);
             settle(&mut a, &mut b);
         }
         drop(server);
@@ -1898,13 +2093,13 @@ mod tests {
             }
             settle(&mut a, &mut b);
         }
-        assert_eq!(got.len(), END);
+        assert_eq!(got.len(), at);
         assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
     }
 
     #[test]
     fn a_fin_waits_for_a_peer_that_ended_first_to_take_the_data() {
-        const END: usize = 700 << 10;
+        const END: usize = 500 << 10;
         let (mut a, mut b) = (stack(A), stack(B));
         let (mut client, mut server) = connected(&mut a, &mut b);
         client.shutdown(Shutdown::Write).unwrap();
@@ -2031,18 +2226,11 @@ mod tests {
         drop(server);
         b.turn();
         b.turn();
-        // A peer such as Linux puts its FIN on its last segment of data.
-        // smoltcp sends its FIN apart, so the FIN is put on B's segment
-        // here, and the checksum is corrected as RFC 1624 has it.
+        // A peer such as Linux may put its FIN on its last segment of
+        // data. This stack has smoltcp send its FIN apart, so the FIN is
+        // put on B's segment here.
         let mut last = b.transmit().unwrap();
-        let t = &mut last[20..];
-        let old = u16::from_be_bytes([t[12], t[13]]);
-        t[13] |= 0x01;
-        let new = u16::from_be_bytes([t[12], t[13]]);
-        let mut sum = u32::from(!u16::from_be_bytes([t[16], t[17]])) + u32::from(!old) + u32::from(new);
-        sum = (sum & 0xffff) + (sum >> 16);
-        sum = (sum & 0xffff) + (sum >> 16);
-        t[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        put_fin(&mut last);
         a.receive(last);
         while a.turn() {}
         assert!(matches!(a.conns[0].phase, Phase::Dead(_)) && a.transmit().is_none(), "the ACK is delayed");
