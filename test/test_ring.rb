@@ -110,6 +110,15 @@ class TestRing < Minitest::Test
     assert_equal Digest::SHA256.hexdigest(down), Digest::SHA256.hexdigest(back.value)
   end
 
+  # The outage takes a whole flight of the segments that Wireproxy sends.
+  # With selective acknowledgement agreed, netstack then sends two
+  # segments at each of its timeouts and no more, and this takes minutes.
+  def test_a_transfer_from_wireproxy_gets_past_an_outage
+    _, client, server = around(6, debug: "drop=1500:30")
+    data = Random.new(6).bytes(6 << 20)
+    assert_equal Digest::SHA256.hexdigest(data), Digest::SHA256.hexdigest(transfer(server, client, data))
+  end
+
   # Wireproxy does not pass on the end of one direction: when either ends,
   # it closes both. So a close goes round the ring, and a shutdown of
   # writing alone does not.

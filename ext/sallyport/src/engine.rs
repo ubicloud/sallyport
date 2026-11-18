@@ -80,6 +80,9 @@ pub struct Knobs {
     /// `drop=PASS:MS` makes an outage. Once PASS datagrams have arrived,
     /// the thread drops those that arrive in the next MS milliseconds.
     pub drop: Option<(u64, Duration)>,
+    /// `sack` leaves the offer of selective acknowledgement in the SYNs,
+    /// which the stack otherwise takes out.
+    pub sack: bool,
 }
 
 impl Knobs {
@@ -91,6 +94,7 @@ impl Knobs {
             match name {
                 "trace" => knobs.trace = value.parse::<usize>().map_err(|_| bad())?.min(1_000_000),
                 "fail" if value.is_empty() => knobs.fail = true,
+                "sack" if value.is_empty() => knobs.sack = true,
                 "drop" => {
                     let (pass, ms) = value.split_once(':').ok_or_else(bad)?;
                     let ms = Duration::from_millis(ms.parse().map_err(|_| bad())?);
@@ -154,7 +158,7 @@ impl Engine {
             udp,
             udp_v6,
             peers,
-            stack: Stack::new(cfg),
+            stack: Stack::new(cfg, knobs.sack),
             next_tick: Instant::now(),
             buf: vec![0; 65536],
             datagrams: 0,
@@ -373,9 +377,9 @@ mod tests {
     fn knobs_are_read_from_text() {
         assert_eq!(Knobs::parse("").unwrap(), Knobs::default());
         assert_eq!(Knobs::parse(" trace=40 ,").unwrap(), Knobs { trace: 40, ..Knobs::default() });
-        let all = Knobs { trace: 1_000_000, fail: true, drop: Some((1500, Duration::from_millis(30))) };
-        assert_eq!(Knobs::parse("fail,trace=5000000,drop=1500:30").unwrap(), all);
-        for bad in ["trace", "trace=x", "trace=-1", "loud", "trace=1,loud", "fail=1", "drop=5", "drop=a:b"] {
+        let all = Knobs { trace: 1_000_000, fail: true, drop: Some((1500, Duration::from_millis(30))), sack: true };
+        assert_eq!(Knobs::parse("fail,trace=5000000,drop=1500:30,sack").unwrap(), all);
+        for bad in ["trace", "trace=x", "trace=-1", "loud", "trace=1,loud", "fail=1", "drop=5", "drop=a:b", "sack=0"] {
             let knob = bad.rsplit(',').next().unwrap();
             assert_eq!(Knobs::parse(bad).unwrap_err(), format!("bad debug knob {knob:?}"));
         }

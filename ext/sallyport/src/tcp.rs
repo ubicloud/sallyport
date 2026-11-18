@@ -6,7 +6,7 @@
 //! control from end to end.
 
 use crate::config::Config;
-use crate::packet::{rst, syn};
+use crate::packet::{rst, syn, without_sack};
 use crate::sys::{self, Sent};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -238,6 +238,8 @@ pub struct Stack {
     local_ports: HashSet<u16>,
     addrs: Vec<IpAddr>,
     epoch: Instant,
+    /// Selective acknowledgement is left on offer in the SYNs.
+    sack: bool,
 }
 
 fn socket() -> tcp::Socket<'static> {
@@ -255,7 +257,7 @@ fn socket() -> tcp::Socket<'static> {
 }
 
 impl Stack {
-    pub fn new(cfg: &Config) -> Stack {
+    pub fn new(cfg: &Config, sack: bool) -> Stack {
         let mut link = Link { rx: VecDeque::new(), tx: VecDeque::new(), mtu: cfg.mtu };
         let mut ic = IfaceConfig::new(HardwareAddress::Ip);
         ic.random_seed = u64::from_ne_bytes(sys::random());
@@ -280,6 +282,7 @@ impl Stack {
             local_ports: HashSet::new(),
             addrs: cfg.addrs.clone(),
             epoch: Instant::now(),
+            sack,
         }
     }
 
@@ -288,13 +291,20 @@ impl Stack {
     }
 
     /// Queues an IP packet that arrived for the stack.
-    pub fn receive(&mut self, packet: Vec<u8>) {
+    pub fn receive(&mut self, mut packet: Vec<u8>) {
+        if !self.sack {
+            without_sack(&mut packet);
+        }
         self.link.rx.push_back(packet);
     }
 
     /// Returns the next IP packet that the stack wants sent.
     pub fn transmit(&mut self) -> Option<Vec<u8>> {
-        self.link.tx.pop_front()
+        let mut packet = self.link.tx.pop_front()?;
+        if !self.sack {
+            without_sack(&mut packet);
+        }
+        Some(packet)
     }
 
     /// Tells Ruby, on its descriptor, why a connection was not begun, and
@@ -856,7 +866,7 @@ mod tests {
 
     fn stack(addr: &str) -> Stack {
         let key = crate::keys::encode(&[1; 32]);
-        Stack::new(&config::parse(&format!("[Interface]\nPrivateKey = {key}\nAddress = {addr}")).unwrap())
+        Stack::new(&config::parse(&format!("[Interface]\nPrivateKey = {key}\nAddress = {addr}")).unwrap(), false)
     }
 
     /// Begins a connection, and returns Ruby's end of its pair.
@@ -986,6 +996,20 @@ mod tests {
         assert_eq!(s.congestion_control(), tcp::CongestionControl::Cubic);
         assert!(!s.nagle_enabled());
         assert_eq!(s.min_rto(), SDuration::from_millis(200));
+    }
+
+    #[test]
+    fn a_syn_offers_selective_acknowledgement_only_if_the_stack_is_told_to() {
+        let key = crate::keys::encode(&[1; 32]);
+        let cfg = config::parse(&format!("[Interface]\nPrivateKey = {key}\nAddress = {A}")).unwrap();
+        for sack in [false, true] {
+            let mut a = Stack::new(&cfg, sack);
+            let _ruby = connect(&mut a, B, 7);
+            a.turn();
+            let syn = a.transmit().unwrap();
+            // The options follow 20 bytes of IP header and 20 of TCP.
+            assert_eq!(syn[40..].windows(2).any(|option| option == [4, 2]), sack);
+        }
     }
 
     #[test]

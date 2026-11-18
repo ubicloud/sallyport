@@ -52,6 +52,8 @@ pub fn rst(p: &[u8]) -> bool {
     tcp(p).is_some_and(|t| t[13] & RST != 0)
 }
 
+const NOP: u8 = 1;
+const SACK_PERMITTED: u8 = 4;
 const SACK: u8 = 5;
 
 /// Calls `f` with the kind of each TCP option that has a length, where
@@ -64,7 +66,7 @@ fn options(t: &[u8], mut f: impl FnMut(u8, usize, usize)) {
         match t[i] {
             // These two are the end of the options and a byte of padding.
             0 => break,
-            1 => i += 1,
+            NOP => i += 1,
             kind => {
                 let Some(&len) = t.get(i + 1) else { break };
                 let len = len as usize;
@@ -74,6 +76,38 @@ fn options(t: &[u8], mut f: impl FnMut(u8, usize, usize)) {
                 f(kind, i, len);
                 i += len;
             }
+        }
+    }
+}
+
+/// Takes the offer of selective acknowledgement out of a SYN or a
+/// SYN-ACK, and corrects the checksum. Padding takes the offer's place.
+pub fn without_sack(p: &mut [u8]) {
+    let Some(at) = tcp_offset(p) else { return };
+    let Some(t) = tcp(p) else { return };
+    if t[13] & SYN == 0 {
+        return;
+    }
+    let mut offers = Vec::new();
+    options(t, |kind, i, len| {
+        if kind == SACK_PERMITTED && len == 2 {
+            offers.push(i);
+        }
+    });
+    let t = &mut p[at..];
+    for i in offers {
+        for j in [i, i + 1] {
+            // The checksum is corrected for the 16-bit word that the byte
+            // is in, as RFC 1624 has it: HC' = ~(~HC + ~m + m').
+            let word = j & !1;
+            let old = u16::from_be_bytes([t[word], t[word + 1]]);
+            t[j] = NOP;
+            let new = u16::from_be_bytes([t[word], t[word + 1]]);
+            let sum = u16::from_be_bytes([t[16], t[17]]);
+            let mut x = u32::from(!sum) + u32::from(!old) + u32::from(new);
+            x = (x & 0xffff) + (x >> 16);
+            x = (x & 0xffff) + (x >> 16);
+            t[16..18].copy_from_slice(&(!(x as u16)).to_be_bytes());
         }
     }
 }
@@ -113,8 +147,31 @@ pub fn describe(p: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Sums 16-bit words as a checksum does.
+    fn sum(data: &[u8], mut acc: u32) -> u32 {
+        for pair in data.chunks(2) {
+            acc += u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
+        }
+        acc
+    }
+
+    /// Computes the TCP checksum of an IP packet from nothing, with the
+    /// checksum's field taken as zero.
+    fn checksum(p: &[u8]) -> u16 {
+        let t = &p[tcp_offset(p).unwrap()..];
+        let mut acc = if p[0] >> 4 == 4 { sum(&p[12..20], 0) } else { sum(&p[8..40], 0) };
+        acc += 6 + t.len() as u32;
+        acc = sum(&t[..16], acc);
+        acc = sum(&t[18..], acc);
+        while acc >> 16 != 0 {
+            acc = (acc & 0xffff) + (acc >> 16);
+        }
+        !(acc as u16)
+    }
+
     /// Builds an IP packet around a TCP segment from port 51000 to port
-    /// 7000 that has these flags, options and payload.
+    /// 7000 that has these flags, options and payload, and a checksum
+    /// that is right.
     fn packet(version: u8, flags: u8, opts: &[u8], payload: &[u8]) -> Vec<u8> {
         assert_eq!(opts.len() % 4, 0);
         let mut t = vec![0u8; 20];
@@ -139,6 +196,9 @@ mod tests {
             h
         };
         p.extend_from_slice(&t);
+        let at = p.len() - t.len();
+        let right = checksum(&p);
+        p[at + 16..at + 18].copy_from_slice(&right.to_be_bytes());
         p
     }
 
@@ -207,5 +267,77 @@ mod tests {
         // An option that claims more than the header holds ends the walk.
         let cut = packet(4, ACK, &[5, 18, 0, 0, 0, 100, 0, 0, 0, 200, 1, 1], &[]);
         assert_eq!(describe(&cut).unwrap(), "51000>7000 . seq 16909060 ack 168496141 win 4096 len 0");
+    }
+
+    const OFFER: [u8; 2] = [SACK_PERMITTED, 2];
+
+    #[test]
+    fn the_offer_goes_and_the_checksum_holds() {
+        // The offer starts on an even byte, on an odd one, and at the end.
+        let layouts: [&[u8]; 4] = [
+            &[2, 4, 5, 0x50, 4, 2, 1, 1],
+            &[2, 4, 5, 0x50, 1, 4, 2, 1],
+            &[1, 1, 4, 2],
+            &[2, 4, 5, 0x50, 1, 3, 3, 7, 1, 1, 4, 2],
+        ];
+        for version in [4, 6] {
+            for flags in [SYN, SYN | ACK] {
+                for opts in layouts {
+                    let before = packet(version, flags, opts, &[]);
+                    let mut after = before.clone();
+                    without_sack(&mut after);
+                    let at = tcp_offset(&after).unwrap();
+                    assert_eq!(u16::from_be_bytes([after[at + 16], after[at + 17]]), checksum(&after));
+                    let changed: Vec<usize> = (0..before.len()).filter(|&i| before[i] != after[i]).collect();
+                    let offer = at + 20 + opts.windows(2).position(|w| w == OFFER).unwrap();
+                    assert!(changed.contains(&offer) && changed.contains(&(offer + 1)));
+                    assert!(changed.iter().all(|i| [offer, offer + 1, at + 16, at + 17].contains(i)));
+                    assert_eq!(after[offer..offer + 2], [NOP, NOP]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_checksum_holds_at_its_extremes() {
+        // The payload is varied until the checksum has been every value
+        // near 0x0000 and 0xffff that 16 bits of payload can make it.
+        let mut seen = 0;
+        for v in 0..=u16::MAX {
+            let before = packet(4, SYN, &[2, 4, 5, 0x50, 4, 2, 1, 1], &v.to_be_bytes());
+            let was = u16::from_be_bytes([before[36], before[37]]);
+            if was > 2 && was < 0xfffd {
+                continue;
+            }
+            seen += 1;
+            let mut after = before;
+            without_sack(&mut after);
+            let (got, want) = (u16::from_be_bytes([after[36], after[37]]), checksum(&after));
+            // 0x0000 and 0xffff are the same sum in ones' complement.
+            assert!(got == want || (got == 0xffff && want == 0) || (got == 0 && want == 0xffff));
+        }
+        assert!(seen >= 4);
+    }
+
+    #[test]
+    fn nothing_but_an_offer_in_a_syn_is_touched() {
+        let untouched = [
+            packet(4, ACK, &[1, 1, 4, 2], b"not a SYN"),
+            packet(6, SYN, &MSS, &[]),
+            // An option that claims more than the header holds ends the
+            // walk before the offer.
+            packet(4, SYN, &[2, 9, 5, 0x50, 4, 2, 1, 1], &[]),
+        ];
+        for before in untouched {
+            let mut after = before.clone();
+            without_sack(&mut after);
+            assert_eq!(after, before);
+        }
+        // A header that claims more than the packet holds is no TCP
+        // header, and an offer in what there is of it is left alone.
+        let whole = packet(4, SYN, &[1, 4, 2, 1], &[]);
+        let mut cut = whole[..whole.len() - 1].to_vec();
+        without_sack(&mut cut);
+        assert_eq!(cut, whole[..whole.len() - 1]);
     }
 }
