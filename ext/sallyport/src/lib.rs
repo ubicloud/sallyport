@@ -248,6 +248,19 @@ pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> isize {
     h.shared.connections.load(Ordering::Relaxed) as isize
 }
 
+// TLA-wake> \* sp_dump asks under the lock on `dump`, and wakes the thread.
+// TLA-wake> AAsk == /\ s.apc = "ask" /\ s.dlock = "none"
+// TLA-wake>         /\ s' = [s EXCEPT !.dlock = "asker", !.dump = "asked", !.apc = "wake"]
+// TLA-wake> AWake == /\ s.apc = "wake" /\ s' = Woke([s EXCEPT !.apc = "check"])
+// TLA-wake> \* It waits until it is answered or the thread has ended. It holds the
+// TLA-wake> \* lock while it looks, and lets it go only as it begins to wait.
+// TLA-wake> ACheck == /\ s.apc = "check"
+// TLA-wake>           /\ s' = [s EXCEPT !.apc = IF s.dump = "done" \/ s.dead THEN "take" ELSE "sleep"]
+// TLA-wake> ASleep == /\ s.apc = "sleep" /\ s' = [s EXCEPT !.dlock = "none", !.apc = "wait"]
+// TLA-wake> AWoken == /\ s.apc = "woken" /\ s.dlock = "none"
+// TLA-wake>           /\ s' = [s EXCEPT !.dlock = "asker", !.apc = "check"]
+// TLA-wake> ATake == /\ s.apc = "take"
+// TLA-wake>          /\ s' = [s EXCEPT !.dump = "none", !.dlock = "none", !.apc = "return"]
 /// Writes a description of the tunnel into `buf`, for a person to read:
 /// what the tunnel has counted, then a line for each peer as sp_stats
 /// gives it, then two lines for each connection. The tunnel's thread

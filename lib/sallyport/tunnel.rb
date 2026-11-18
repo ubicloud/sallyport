@@ -216,6 +216,11 @@ module Sallyport
       count.negative? ? failed : count
     end
 
+    # TLA-wake> \* Tunnel#dump holds the lock for as long as it waits.
+    # TLA-wake> AEnter == /\ s.apc = "idle" /\ s.mon = "none" /\ s.held
+    # TLA-wake>           /\ s' = [s EXCEPT !.mon = "asker", !.apc = "ask"]
+    # TLA-wake> AReturn == /\ s.apc = "return" /\ s' = [s EXCEPT !.mon = "none", !.apc = "done"]
+
     # Returns a description of the tunnel for a person to read: what it
     # has counted, a line for each peer, and two lines for each connection,
     # of which the second is the TCP socket as smoltcp prints it. It is
