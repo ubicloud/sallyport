@@ -59,14 +59,27 @@ pub fn shutdown(fd: RawFd) {
     unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
 }
 
-/// Says whether poll(2) reports a hangup on an end of a socket pair,
-/// which it does whatever events it is asked about. It reports one when
-/// no more can go either way: the other end is closed, or this end is
-/// shut down both ways, or each end has shut down its writing.
-pub fn hung_up(fd: RawFd) -> bool {
+/// poll(2) reports one of these of an end of a socket pair, whatever
+/// events it is asked about.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Hangup {
+    /// Bytes can still go one way or the other.
+    No,
+    /// No more can go either way: the other end is closed, or this end is
+    /// shut down both ways, or each end has shut down its writing.
+    Yes,
+    /// The other end is closed, and it had not read all that it was sent.
+    Unread,
+}
+
+pub fn hangup(fd: RawFd) -> Hangup {
     let mut p = libc::pollfd { fd, events: 0, revents: 0 };
     unsafe { libc::poll(&mut p, 1, 0) };
-    p.revents & (libc::POLLHUP | libc::POLLERR) != 0
+    match p.revents {
+        r if r & libc::POLLERR != 0 => Hangup::Unread,
+        r if r & libc::POLLHUP != 0 => Hangup::Yes,
+        _ => Hangup::No,
+    }
 }
 
 /// Says whether the other end of a socket pair will send no more: it is

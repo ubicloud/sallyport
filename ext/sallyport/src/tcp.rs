@@ -8,7 +8,7 @@
 use crate::config::Config;
 use crate::packet::{rst, split_fin, syn, without_sack};
 use crate::sock::{Opening, Sock, Up};
-use crate::sys::{self, Sent};
+use crate::sys::{self, Hangup, Sent};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -314,7 +314,7 @@ impl Conn {
 // TLA-conn@0> Min(a, b) == IF a < b THEN a ELSE b
 // TLA-conn@0> \* The socket is the one that sock.rs describes, and no more of smoltcp
 // TLA-conn@0> \* shows here than that file lets carry see.
-// TLA-conn@0> \* sys::hung_up. poll reports a hangup on our end when no more can go
+// TLA-conn@0> \* sys::hangup. poll reports a hangup on our end when no more can go
 // TLA-conn@0> \* either way. Ruby has closed its end, or the tunnel has shut the pair
 // TLA-conn@0> \* down. Or carry has shut down the writing of our end, to pass on the
 // TLA-conn@0> \* peer's FIN, and nothing comes the other way: Ruby has shut down its
@@ -1025,7 +1025,7 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
         }
         // Ruby gave up waiting, and closed its end. Or the tunnel is
         // closing, and has shut the pair down.
-        Phase::Connecting(_) if sys::hung_up(c.raw()) => (true, Fate::Abort),
+        Phase::Connecting(_) if sys::hangup(c.raw()) != Hangup::No => (true, Fate::Abort),
         // Ruby closed the listener.
         Phase::Listening | Phase::Accepting if c.listener.is_none() => (true, Fate::Abort),
         Phase::Listening => match Sock::opening(s) {
@@ -1142,9 +1142,18 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fat
         s.end();
         moved = true;
     }
-    // TLA-conn> Hung(t) == IF t.gone = "no" /\ HungUp(t) THEN [t EXCEPT !.gone = "yes"] ELSE t
-    if c.app_gone.is_none() && sys::hung_up(fd) {
-        c.app_gone = Some(now);
+    // TLA-conn> \* poll also tells of a Ruby that closed its end with bytes that it had
+    // TLA-conn> \* not read, whether or not carry reads the pair.
+    // TLA-conn> Hung(t) == IF t.gone # "no" \/ ~HungUp(t) THEN t
+    // TLA-conn>            ELSE IF t.rerr THEN [t EXCEPT !.fate = "abort"] ELSE [t EXCEPT !.gone = "yes"]
+    if c.app_gone.is_none() {
+        match sys::hangup(fd) {
+            Hangup::No => {}
+            Hangup::Yes => c.app_gone = Some(now),
+            // The peer sent those bytes, and it is reset, as a TCP socket
+            // of the kernel resets it when it is closed with bytes unread.
+            Hangup::Unread => return (true, Fate::Abort),
+        }
     }
     // TLA-conn> Waits(t) == IF t.wait = "no" /\ t.gone # "no" /\ t.up = "ended" /\ t.down
     // TLA-conn>             THEN [t EXCEPT !.wait = "yes"] ELSE t
@@ -2003,6 +2012,26 @@ mod tests {
         assert!(!got.is_empty() && got.iter().enumerate().all(|(i, b)| *b == byte(i)));
         settle(&mut a, &mut b);
         assert!(b.conns.is_empty());
+    }
+
+    #[test]
+    fn an_end_closed_with_bytes_unread_resets_though_its_pair_is_not_read() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // The server reads nothing. So A's socket fills, and A reads the
+        // client's pair no more.
+        let (mut at, mut before) = (0, usize::MAX);
+        while at != before {
+            before = at;
+            at = write_from(&mut client, at, 1 << 20);
+            settle(&mut a, &mut b);
+        }
+        server.write_all(b"unread").unwrap();
+        settle(&mut a, &mut b);
+        drop(client);
+        settle(&mut a, &mut b);
+        assert!(a.conns.is_empty(), "A finds the bytes unread without a read of the pair");
+        assert_eq!(server.write(b"more").unwrap_err().kind(), std::io::ErrorKind::BrokenPipe, "and B was reset");
     }
 
     #[test]
