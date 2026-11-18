@@ -7,7 +7,7 @@ use crate::sys;
 use crate::tcp::{status, Stack};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,9 @@ pub struct Shared {
     pub wake_r: OwnedFd,
     pub wake_w: OwnedFd,
     pub stop: AtomicBool,
+    /// How many milliseconds the thread may take to end its connections
+    /// in order, once it is told to stop.
+    pub linger: AtomicU32,
     /// The state of the peers as Peers::stats writes it, and as it was
     /// when the timers last ran.
     pub stats: Mutex<String>,
@@ -75,6 +78,7 @@ impl Engine {
             wake_r,
             wake_w,
             stop: AtomicBool::new(false),
+            linger: AtomicU32::new(0),
             stats: Mutex::default(),
         });
         let engine = Engine {
@@ -145,35 +149,69 @@ impl Engine {
         let mut fds: Vec<libc::pollfd> = Vec::new();
         while !self.shared.stop.load(Ordering::Acquire) {
             self.commands();
-            let more = self.udp_in();
-            if Instant::now() >= self.next_tick {
-                self.tick();
-                self.next_tick = Instant::now() + TICK;
-            }
-            let moved = self.stack.turn();
-            self.flush();
-
-            let mut wait = self.next_tick.saturating_duration_since(Instant::now());
-            if let Some(delay) = self.stack.poll_delay() {
-                wait = wait.min(delay);
-            }
-            // A connection that moved may have given its socket something
-            // to send, which the next turn sends.
-            if more || moved {
-                wait = Duration::ZERO;
-            }
-            fds.clear();
-            fds.extend([self.shared.wake_r.as_raw_fd(), self.udp.as_raw_fd()].map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            }));
-            self.stack.poll_fds(&mut fds);
-            sys::poll(&mut fds, wait);
-            if fds[0].revents != 0 {
-                sys::drain(self.shared.wake_r.as_raw_fd());
-            }
+            self.serve(&mut fds, TICK);
         }
+        self.finish(&mut fds);
+    }
+
+    /// Makes one turn of the loop. It takes what has arrived, moves the
+    /// connections, sends what they have to send, and then waits until
+    /// there is more to do, or for `most` at the longest.
+    fn serve(&mut self, fds: &mut Vec<libc::pollfd>, most: Duration) {
+        let more = self.udp_in();
+        if Instant::now() >= self.next_tick {
+            self.tick();
+            self.next_tick = Instant::now() + TICK;
+        }
+        let moved = self.stack.turn();
+        self.flush();
+
+        let mut wait = self.next_tick.saturating_duration_since(Instant::now()).min(most);
+        if let Some(delay) = self.stack.poll_delay() {
+            wait = wait.min(delay);
+        }
+        // A connection that moved may have given its socket something to
+        // send, which the next turn sends.
+        if more || moved {
+            wait = Duration::ZERO;
+        }
+        fds.clear();
+        fds.extend([self.shared.wake_r.as_raw_fd(), self.udp.as_raw_fd()].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }));
+        self.stack.poll_fds(fds);
+        sys::poll(fds, wait);
+        if fds[0].revents != 0 {
+            sys::drain(self.shared.wake_r.as_raw_fd());
+        }
+    }
+
+    /// Ends the connections in order, when Ruby has closed the tunnel.
+    /// Each is treated as if Ruby had closed its end: what was written to
+    /// it is sent, and then a FIN. The thread gives that as long as the
+    /// linger allows. It then resets every connection that has not ended,
+    /// so that no peer is left to wait for one that is gone.
+    fn finish(&mut self, fds: &mut Vec<libc::pollfd>) {
+        self.refuse_commands();
+        self.stack.orphan();
+        let until = Instant::now() + Duration::from_millis(self.shared.linger.load(Ordering::Acquire).into());
+        while !self.stack.finished() && Instant::now() < until {
+            self.serve(fds, Duration::from_millis(10).min(until.saturating_duration_since(Instant::now())));
+        }
+        self.stack.abort();
+        self.stack.poll();
+        self.flush();
+    }
+
+    /// Sees that no command is queued from now on, and drops those that
+    /// are. A call queues a command under this lock, and only while `dead`
+    /// is false, so none is left behind with its descriptor open.
+    fn refuse_commands(&self) {
+        let mut cmds = self.shared.cmds.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.dead.store(true, Ordering::Release);
+        cmds.clear();
     }
 }
 
@@ -183,11 +221,6 @@ impl Engine {
 /// has failed looks closed to Ruby, and not silent.
 impl Drop for Engine {
     fn drop(&mut self) {
-        // A call queues a command under this lock, and only while `dead`
-        // is false. So no command is queued after this, to be left with
-        // its descriptor open.
-        let mut cmds = self.shared.cmds.lock().unwrap_or_else(|e| e.into_inner());
-        self.shared.dead.store(true, Ordering::Release);
-        cmds.clear();
+        self.refuse_commands();
     }
 }

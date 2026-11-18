@@ -32,7 +32,7 @@ module Sallyport
 
     VERSION = bind("sp_version", [], P)
     OPEN = bind("sp_open", [P, P, Z], P, waits: true)
-    CLOSE = bind("sp_close", [P], Fiddle::TYPE_VOID, waits: true)
+    CLOSE = bind("sp_close", [P, I], Fiddle::TYPE_VOID, waits: true)
     CONNECT = bind("sp_connect", [P, P, I], I)
     LISTEN = bind("sp_listen", [P, I, I], I)
     PORT = bind("sp_port", [P], I)

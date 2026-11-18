@@ -221,10 +221,38 @@ class TestTCP < Minitest::Test
     assert_raises(Errno::EPIPE, Errno::ECONNRESET) { loop { server.write("more") } }
   end
 
-  def test_closing_a_tunnel_ends_its_connections
-    a, b = pair
-    _, server = connection(a, b)
-    a.close
-    assert_nil server.read(1)
+  def test_closing_a_tunnel_sends_what_was_written
+    data = Random.new(2).bytes(1 << 20)
+    [true, false].each do |closed|
+      b, a = pair.reverse
+      client, server = connection(a, b)
+      reader = Thread.new { server.read }
+      client.write(data)
+      client.close if closed
+      b.close
+      assert_equal Digest::SHA256.hexdigest(data), Digest::SHA256.hexdigest(reader.value)
+    end
+  end
+
+  def test_closing_a_tunnel_tells_its_peers
+    [1, 0].each do |linger|
+      a, b = pair
+      client, server = connection(a, b)
+      a.close(linger: linger)
+      assert_nil server.read(1)
+      assert client.wait_readable(5)
+      assert_nil client.read(1)
+    end
+  end
+
+  # A linger that is no number is refused before the tunnel is touched.
+  def test_a_linger_that_is_no_number_leaves_the_tunnel_open
+    a, = pair
+    [nil, "soon", Float::NAN].each do |linger|
+      assert_raises(TypeError, ArgumentError) { a.close(linger: linger) }
+      refute_predicate a, :closed?
+    end
+    a.close(linger: Float::INFINITY)
+    assert_predicate a, :closed?
   end
 end

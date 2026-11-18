@@ -28,6 +28,10 @@ module Sallyport
   # tunnel's descriptors, and the UDP port stays bound until the child
   # ends or calls exec.
   class Tunnel
+    # A tunnel that is closed, or let go of, gives its connections this
+    # many seconds to end in order.
+    LINGER = 1
+
     # The tunnel's UDP port, which the system chose if the configuration
     # named none.
     attr_reader :listen_port
@@ -146,10 +150,19 @@ module Sallyport
       end
     end
 
-    # Stops the tunnel. Its sockets and its listeners reach end of file.
-    # A signal handler cannot call this, because it takes a lock.
-    def close
-      synchronize { self.class.release(@holder, @pid) }
+    # Stops the tunnel. Its listeners stop at once. Each connection is
+    # ended as if its Socket had been closed: what was written to it is
+    # sent, and then the end of its stream. The call waits for that for up
+    # to +linger+ seconds, and resets a connection that has not ended by
+    # then. Every socket and listener of the tunnel then reaches end of
+    # file. If another thread writes to a socket while the tunnel closes,
+    # those bytes are not sent. A signal handler cannot call this, because
+    # it takes a lock.
+    def close(linger: LINGER)
+      # The linger is made a number before the handle is taken. One that
+      # is no number then leaves the tunnel as it was.
+      milliseconds = self.class.milliseconds(linger)
+      synchronize { self.class.release(@holder, @pid, milliseconds) }
       nil
     end
 
@@ -207,14 +220,24 @@ module Sallyport
       text
     end
 
+    # Returns a linger in milliseconds, and no more of them than the
+    # library takes.
+    def self.milliseconds(seconds) # :nodoc:
+      seconds = Float(seconds)
+      raise ArgumentError, "a linger is a number of seconds" if seconds.nan?
+
+      (seconds.clamp(0, 2_000_000) * 1000).round
+    end
+
     # Frees the handle that a holder has, if it still has one. A forked
     # child has the handle and not the thread, and frees nothing.
-    def self.release(holder, pid) # :nodoc:
+    def self.release(holder, pid, milliseconds = LINGER * 1000) # :nodoc:
       # An exception from another thread between the two lines would leave
-      # the tunnel running with nothing to close it.
+      # the tunnel running with nothing to close it. Nothing between them
+      # raises one of its own.
       Thread.handle_interrupt(Object => :never) do
         handle = holder.pop
-        Native::CLOSE.call(handle) if handle && pid == Process.pid
+        Native::CLOSE.call(handle, milliseconds) if handle && pid == Process.pid
       end
     end
 

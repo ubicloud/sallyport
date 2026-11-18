@@ -124,16 +124,21 @@ pub unsafe extern "C" fn sp_open(conf: *const c_char, err: *mut c_char, errlen: 
     std::ptr::null_mut()
 }
 
-/// Stops a tunnel, and closes every connection through it.
+/// Stops a tunnel. Its listeners stop at once. Each connection is ended
+/// as if its descriptor had been closed: what was written to it is sent,
+/// and then the end of the stream. The call waits for that for up to
+/// `linger_ms` milliseconds, and a connection that has not ended by then
+/// is reset. Every descriptor of the tunnel then reaches end of file.
 ///
 /// # Safety
 /// `h` came from sp_open, and is not used again.
 #[no_mangle]
-pub unsafe extern "C" fn sp_close(h: *mut c_void) {
+pub unsafe extern "C" fn sp_close(h: *mut c_void, linger_ms: c_int) {
     if h.is_null() {
         return;
     }
     let mut h = Box::from_raw(h.cast::<Handle>());
+    h.shared.linger.store(linger_ms.max(0) as u32, Ordering::Release);
     h.shared.stop.store(true, Ordering::Release);
     h.shared.wake();
     if let Some(thread) = h.thread.take() {

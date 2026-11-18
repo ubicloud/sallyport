@@ -31,6 +31,11 @@ const KEEP_ALIVE: Duration = Duration::from_secs(75);
 /// A closed connection's socket stays this long to acknowledge the
 /// peer's FIN. smoltcp delays an ACK by 10 ms at most.
 const LINGER: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 500 });
+/// smoltcp delays an ACK for this long at the most.
+const ACK_DELAY: Duration = Duration::from_millis(10);
+/// A connection that has ended is given this long to send its last ACK
+/// when the tunnel is closing, which is twice smoltcp's longest delay.
+const LAST_ACK: Duration = Duration::from_millis(20);
 /// One turn of the loop has the sockets send this many rounds of packets
 /// at the most, with a packet from each socket in a round.
 const EGRESS_ROUNDS: usize = 1024;
@@ -149,6 +154,9 @@ struct Conn {
     /// The tail holds what the peer sent last and Ruby has yet to be
     /// given, once that is taken out of the socket's buffer.
     tail: VecDeque<u8>,
+    /// The tunnel is closing, and the connection is treated as if Ruby
+    /// had closed its end.
+    orphan: bool,
 }
 
 impl Conn {
@@ -164,6 +172,7 @@ impl Conn {
             rx_shut: false,
             app_gone: false,
             tail: VecDeque::new(),
+            orphan: false,
         }
     }
 
@@ -397,11 +406,8 @@ impl Stack {
         });
     }
 
-    /// Takes in the packets that arrived, has every socket send what it
-    /// has to send, and then moves each connection on. Returns whether a
-    /// connection moved, in which case the stack has more to do.
-    pub fn turn(&mut self) -> bool {
-        self.ingress();
+    /// Has every socket send what it has to send.
+    pub fn poll(&mut self) {
         let now = self.now();
         // smoltcp's poll sends until no socket has more to send. A socket
         // whose timer did not move would keep it there for ever, so the
@@ -411,7 +417,51 @@ impl Stack {
                 break;
             }
         }
+    }
+
+    /// Takes in the packets that arrived, has every socket send what it
+    /// has to send, and then moves each connection on. Returns whether a
+    /// connection moved, in which case the stack has more to do.
+    pub fn turn(&mut self) -> bool {
+        self.ingress();
+        self.poll();
         self.pump()
+    }
+
+    /// Stops the listening, and leaves every connection as it would be if
+    /// Ruby had closed its end. The tunnel is closing.
+    pub fn orphan(&mut self) {
+        self.listeners.clear();
+        for c in &mut self.conns {
+            // The next step resets a connection that Ruby was not sent,
+            // or that is not yet established.
+            c.listener = None;
+            c.orphan = true;
+            if c.phase == Phase::Open {
+                // Ruby reads the end of its stream, and what the peer
+                // sends from now on has nobody to read it.
+                sys::shutdown_write(c.raw());
+                c.app_gone = true;
+            }
+        }
+    }
+
+    /// Says whether every connection has ended, and has had the time to
+    /// send its last ACK.
+    pub fn finished(&self) -> bool {
+        self.conns.iter().all(|c| matches!(c.phase, Phase::Dead(since) if since.elapsed() >= LAST_ACK))
+    }
+
+    /// Resets every connection that has not ended. The resets leave at
+    /// the next poll.
+    pub fn abort(&mut self) {
+        for c in self.conns.iter().filter(|c| !matches!(c.phase, Phase::Dead(_))) {
+            self.sockets.get_mut::<tcp::Socket>(c.handle).abort();
+        }
+        // A socket that has just taken the peer's FIN may still delay its
+        // ACK, and the next poll is the last. So the stack's clock is put
+        // on by the delay, and the ACK leaves with the resets.
+        self.epoch -= ACK_DELAY;
     }
 
     /// Returns how long the stack can wait before its next timer.
@@ -511,7 +561,7 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener]) -> (bool,
             (false, if sent { Fate::Remove } else { Fate::Keep })
         }
         // Ruby gave up waiting, and closed its end.
-        Phase::Connecting(_) if sys::hung_up(c.raw()) => (true, Fate::Abort),
+        Phase::Connecting(_) if c.orphan || sys::hung_up(c.raw()) => (true, Fate::Abort),
         // Ruby closed the listener.
         Phase::Listening | Phase::Accepting if c.listener.is_none() => (true, Fate::Abort),
         Phase::Listening => match s.state() {
@@ -589,6 +639,11 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
         }) {
             Ok(n) if n > 0 => moved = true,
             Ok(0) => {
+                c.fd_eof = true;
+                moved = true;
+            }
+            // An orphan's pair is read until it is empty, and no more.
+            Ok(sys::AGAIN) if c.orphan => {
                 c.fd_eof = true;
                 moved = true;
             }
@@ -1241,5 +1296,70 @@ mod tests {
         while a.transmit().is_some() {}
         a.turn();
         assert!(std::iter::from_fn(|| a.transmit()).count() < 2);
+    }
+
+    #[test]
+    fn a_stack_that_is_closing_sends_what_was_written() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        client.write_all(b"written, and not closed").unwrap();
+        a.orphan();
+        assert!(!a.finished());
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (b"written, and not closed".to_vec(), true));
+        assert_eq!(read(&mut client), (vec![], true), "Ruby reads the end of its stream");
+        assert!(a.finished() && b.conns.is_empty());
+    }
+
+    #[test]
+    fn a_stack_that_is_closing_resets_what_does_not_end() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, _server) = connected(&mut a, &mut b);
+        let _connecting = connect(&mut a, B, 8);
+        client.write_all(b"never acknowledged").unwrap();
+        a.orphan();
+        // B is gone, and nothing that A sends is answered.
+        while a.turn() {}
+        let sent: Vec<Vec<u8>> = std::iter::from_fn(|| a.transmit()).collect();
+        assert_eq!(sent.iter().filter(|packet| is_reset(packet)).count(), 1, "the attempt is given up");
+        assert!(!a.finished());
+        a.abort();
+        a.poll();
+        assert!(is_reset(&a.transmit().unwrap()));
+    }
+
+    #[test]
+    fn a_stack_that_is_closing_sends_an_ack_that_it_delayed() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        client.shutdown(Shutdown::Write).unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (vec![], true));
+        server.write_all(b"bye").unwrap();
+        drop(server);
+        b.turn();
+        b.turn();
+        // A peer such as Linux puts its FIN on its last segment of data.
+        // smoltcp sends its FIN apart, so the FIN is put on B's segment
+        // here, and the checksum is corrected as RFC 1624 has it.
+        let mut last = b.transmit().unwrap();
+        let t = &mut last[20..];
+        let old = u16::from_be_bytes([t[12], t[13]]);
+        t[13] |= 0x01;
+        let new = u16::from_be_bytes([t[12], t[13]]);
+        let mut sum = u32::from(!u16::from_be_bytes([t[16], t[17]])) + u32::from(!old) + u32::from(new);
+        sum = (sum & 0xffff) + (sum >> 16);
+        sum = (sum & 0xffff) + (sum >> 16);
+        t[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        a.receive(last);
+        while a.turn() {}
+        assert!(matches!(a.conns[0].phase, Phase::Dead(_)) && a.transmit().is_none(), "the ACK is delayed");
+        assert_eq!(read(&mut client), (b"bye".to_vec(), true));
+        // The tunnel closes with no linger, as Engine::finish has it.
+        a.orphan();
+        a.abort();
+        a.poll();
+        let ack = a.transmit().expect("the ACK of the peer's FIN");
+        assert!(!is_reset(&ack));
     }
 }
