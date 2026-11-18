@@ -91,7 +91,9 @@ descriptor.
   only if the socket still held bytes that the tunnel had not taken. A
   write after a reset raises `Errno::EPIPE`.
 - A socket that has shut down its reading, with `close_read`, goes on
-  writing. What the peer sends to it from then on is dropped.
+  writing. What the peer sends to it from then on stays in the tunnel,
+  64 KiB of it at the most, and the peer is held after that. If the
+  socket is closed while the tunnel holds such bytes, the peer is reset.
 - It agrees to no selective acknowledgement. The last section says why.
 - The window that it gives a peer has no scale, so a peer sends 64 KiB
   at the most in one round trip. Where a round trip takes 100 ms, Ruby

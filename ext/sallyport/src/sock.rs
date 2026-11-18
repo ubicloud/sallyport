@@ -128,14 +128,6 @@ impl<'a, 'b> Sock<'a, 'b> {
             .unwrap_or(0)
     }
 
-    /// Throws away what the socket holds for Ruby.
-    pub fn discard(&mut self) {
-        self.tail.clear();
-        while self.s.can_recv() {
-            let _ = self.s.recv(|buf| (buf.len(), ()));
-        }
-    }
-
     /// Says how the handshake of a socket stands. A socket that listens
     /// and has seen no SYN is pending too. smoltcp puts a socket that
     /// listened back in LISTEN when its handshake is reset, and
