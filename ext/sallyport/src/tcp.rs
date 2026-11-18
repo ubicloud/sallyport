@@ -169,6 +169,9 @@ struct Conn {
     /// The tunnel is closing, and the connection is treated as if Ruby
     /// had closed its end.
     orphan: bool,
+    /// Ruby has shut down its reading, and may still write. The pair
+    /// takes no more bytes for Ruby, so what the peer sends is dropped.
+    deaf: bool,
 }
 
 impl Conn {
@@ -186,6 +189,7 @@ impl Conn {
             fin_wait: None,
             tail: VecDeque::new(),
             orphan: false,
+            deaf: false,
         }
     }
 
@@ -705,6 +709,7 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener]) -> (bool,
 /// each direction.
 fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
     let mut moved = false;
+    let was_deaf = c.deaf;
 
     if !c.fd_eof && !s.may_send() {
         // The peer reset the connection, or it timed out.
@@ -767,25 +772,48 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
             });
         }
     }
-    while !c.tail.is_empty() {
+    // A write to the pair fails when Ruby has closed its end, and also
+    // when Ruby has only shut down its reading. poll reports a hangup for
+    // the first and none for the second.
+    let deafened = |n: isize, c: &Conn| n == sys::PIPE && !c.orphan && !sys::hung_up(fd);
+    while !c.deaf && !c.tail.is_empty() {
         match sys::send(fd, c.tail.as_slices().0) {
             n if n > 0 => {
                 c.tail.drain(..n as usize);
                 moved = true;
             }
             sys::AGAIN => break,
+            n if deafened(n, c) => c.deaf = true,
             _ => return (true, Fate::Abort),
         }
     }
-    while s.can_recv() {
+    while !c.deaf && s.can_recv() {
         match s.recv(|buf| {
             let n = sys::send(fd, buf);
             (n.max(0) as usize, n)
         }) {
             Ok(n) if n > 0 => moved = true,
             Ok(sys::AGAIN) => break,
+            Ok(n) if deafened(n, c) => c.deaf = true,
             // Ruby closed its end with bytes still to come.
             _ => return (true, Fate::Abort),
+        }
+    }
+    if c.deaf && !was_deaf {
+        // The pair has just refused a write, and poll reports no hangup.
+        // Ruby has shut down its reading, or its close of its end is under
+        // way, which looks the same for a moment. The bytes stay, and the
+        // next pass tells which it was.
+        moved = true;
+    } else if c.deaf && c.app_gone.is_some() && (s.can_recv() || !c.tail.is_empty()) {
+        // A hangup has shown since, so Ruby has left. What the peer sends
+        // is reset, as it is for any end that is closed.
+        return (true, Fate::Abort);
+    } else if c.deaf {
+        c.tail.clear();
+        while s.can_recv() {
+            let _ = s.recv(|buf| (buf.len(), ()));
+            moved = true;
         }
     }
     if !c.rx_shut && !s.may_recv() && !s.can_recv() && c.tail.is_empty() {
@@ -1588,5 +1616,18 @@ mod tests {
         a.poll();
         let ack = a.transmit().expect("the ACK of the peer's FIN");
         assert!(!is_reset(&ack));
+    }
+
+    #[test]
+    fn an_end_that_stops_reading_may_still_write() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        client.shutdown(Shutdown::Read).unwrap();
+        server.write_all(b"unheard").unwrap();
+        settle(&mut a, &mut b);
+        client.write_all(b"still talking").unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (b"still talking".to_vec(), false));
+        assert!(a.conns.len() == 1 && a.conns[0].deaf && b.conns.len() == 1);
     }
 }

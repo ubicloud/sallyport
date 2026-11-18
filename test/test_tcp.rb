@@ -280,6 +280,17 @@ class TestTCP < Minitest::Test
     assert_equal "answer", client.read
   end
 
+  def test_an_end_that_stops_reading_may_still_write
+    client, server = connection(*pair)
+    client.close_read
+    server.write("unheard")
+    client.write("still talking")
+    assert_equal "still talking", server.readpartial(32)
+    server.write("unheard as well")
+    client.write(", and still")
+    assert_equal ", and still", server.readpartial(32)
+  end
+
   # The writer has more to send than the buffers along the way hold, so
   # it must wait for the reader, and the reader must get every byte.
   def test_a_reader_that_stops_holds_the_writer_and_loses_nothing

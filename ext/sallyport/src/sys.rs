@@ -7,15 +7,18 @@ use std::time::Duration;
 
 /// What a read returns when it would have to wait.
 pub const AGAIN: isize = -2;
+/// What a write returns when the other end takes no more.
+pub const PIPE: isize = -3;
 
-/// Maps what a system call returned to a count, AGAIN, or -1 for any
-/// other error.
+/// Maps what a system call returned to a count, AGAIN, PIPE, or -1 for
+/// any other error.
 fn result(n: isize) -> isize {
     if n >= 0 {
         return n;
     }
     match std::io::Error::last_os_error().raw_os_error() {
         Some(libc::EAGAIN | libc::EINTR) => AGAIN,
+        Some(libc::EPIPE) => PIPE,
         _ => -1,
     }
 }
