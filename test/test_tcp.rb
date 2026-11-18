@@ -183,6 +183,18 @@ class TestTCP < Minitest::Test
     assert_equal Encoding::UTF_8, text.encoding
   end
 
+  def test_a_trace_of_the_packets_inside_a_tunnel
+    a, b = pair(debug: "trace=100")
+    client, server = connection(a, b)
+    client.write("ping")
+    assert_equal "ping", server.readpartial(16)
+    trace = b.dump[/^the last TCP packets.*\n((?: .*\n)+)/, 1].lines
+    assert_match(/\A +\d+\.\d{4} out \d+>7 S seq \d+ ack 0 win \d+ len 0\n\z/, trace[0])
+    assert_match(/\A +\d+\.\d{4} in  7>\d+ S\. seq \d+ ack \d+ win \d+ len 0\n\z/, trace[1])
+    assert(trace.any? { |line| line.match?(/ out \d+>7 P?\. seq \d+ ack \d+ win \d+ len 4\n\z/) })
+    refute_match(/the last TCP packets/, pair.first.dump)
+  end
+
   def test_each_direction_ends_on_its_own
     client, server = connection(*pair)
     client.write("question")

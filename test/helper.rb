@@ -43,14 +43,15 @@ module Helper
 
   # Starts two tunnels that are each other's peer: a at 10.9.0.1 and
   # fd09::1, and b at 10.9.0.2 and fd09::2. Only b is told where its peer
-  # is, and +peer+ adds to what b is told of it.
-  def pair(**peer)
+  # is, and +peer+ adds to what b is told of it. Both tunnels take the
+  # settings in +debug+.
+  def pair(debug: nil, **peer)
     (a_key, a_public), (b_key, b_public) = keypair, keypair
     a_is = {public_key: a_public, allowed_ips: ["10.9.0.1/32", "fd09::1/128"]}
     b_is = {public_key: b_public, allowed_ips: ["10.9.0.2/32", "fd09::2/128"]}
-    a = tunnel(private_key: a_key, addresses: ["10.9.0.1", "fd09::1"], peers: [b_is])
+    a = tunnel(private_key: a_key, addresses: ["10.9.0.1", "fd09::1"], peers: [b_is], debug: debug)
     b_peer = a_is.merge(endpoint: "127.0.0.1:#{a.listen_port}", **peer)
-    [a, tunnel(private_key: b_key, addresses: ["10.9.0.2", "fd09::2"], peers: [b_peer])]
+    [a, tunnel(private_key: b_key, addresses: ["10.9.0.2", "fd09::2"], peers: [b_peer], debug: debug)]
   end
 
   # Connects b to a listener on a, and returns the Socket at each end:

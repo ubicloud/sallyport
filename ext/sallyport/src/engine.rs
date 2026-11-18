@@ -2,9 +2,11 @@
 //! TCP stack, and serves them from one loop that never takes Ruby's GVL.
 
 use crate::config::Config;
+use crate::packet::describe;
 use crate::peers::{Dropped, Peers};
 use crate::sys;
 use crate::tcp::{status, Stack};
+use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -65,6 +67,30 @@ impl Shared {
     }
 }
 
+/// Knobs are settings for tests and for looking inside a tunnel. sp_open
+/// takes them as text, with commas between them.
+#[derive(Debug, Default, PartialEq)]
+pub struct Knobs {
+    /// `trace=N` keeps a line for each of the last N TCP packets, a
+    /// million at most, and the tunnel's description then has them.
+    pub trace: usize,
+}
+
+impl Knobs {
+    pub fn parse(text: &str) -> Result<Knobs, String> {
+        let mut knobs = Knobs::default();
+        for knob in text.split(',').map(str::trim).filter(|knob| !knob.is_empty()) {
+            let (name, value) = knob.split_once('=').unwrap_or((knob, ""));
+            let bad = || format!("bad debug knob {knob:?}");
+            match name {
+                "trace" => knobs.trace = value.parse::<usize>().map_err(|_| bad())?.min(1_000_000),
+                _ => return Err(bad()),
+            }
+        }
+        Ok(knobs)
+    }
+}
+
 pub struct Engine {
     shared: Arc<Shared>,
     udp: UdpSocket,
@@ -79,6 +105,11 @@ pub struct Engine {
     /// the stack has sent.
     datagrams: u64,
     packets: u64,
+    knobs: Knobs,
+    /// The lines of the trace, and the moment that their times count
+    /// from.
+    trace: VecDeque<String>,
+    epoch: Instant,
 }
 
 impl Engine {
@@ -87,6 +118,7 @@ impl Engine {
     /// it. An error is a fault in the configuration.
     pub fn new(
         cfg: &Config,
+        knobs: Knobs,
         (udp, udp_v6): (UdpSocket, bool),
         (wake_r, wake_w): (OwnedFd, OwnedFd),
     ) -> Result<(Engine, Arc<Shared>), String> {
@@ -113,6 +145,9 @@ impl Engine {
             buf: vec![0; 65536],
             datagrams: 0,
             packets: 0,
+            knobs,
+            trace: VecDeque::new(),
+            epoch: Instant::now(),
         };
         engine.publish();
         Ok((engine, shared))
@@ -148,6 +183,7 @@ impl Engine {
             let (udp, v6) = (&self.udp, self.udp_v6);
             let packet = self.peers.receive(&self.buf[..len], from, &mut |d, to| sys::udp_send(udp, v6, d, to));
             if let Some(packet) = packet {
+                self.trace("in ", &packet);
                 self.stack.receive(packet);
             }
         }
@@ -157,6 +193,7 @@ impl Engine {
     /// Encrypts and sends the packets that the stack has queued.
     fn flush(&mut self) {
         while let Some(packet) = self.stack.transmit() {
+            self.trace("out", &packet);
             self.packets += 1;
             let (udp, v6) = (&self.udp, self.udp_v6);
             self.peers.send(&packet, &mut |d, to| sys::udp_send(udp, v6, d, to));
@@ -216,6 +253,21 @@ impl Engine {
         }
     }
 
+    /// Keeps a line for a TCP packet that went `way`, if a trace is kept.
+    /// The line shows the packet as it is inside the tunnel, where tcpdump
+    /// cannot look.
+    fn trace(&mut self, way: &str, packet: &[u8]) {
+        if self.knobs.trace == 0 {
+            return;
+        }
+        if let Some(line) = describe(packet) {
+            if self.trace.len() == self.knobs.trace {
+                self.trace.pop_front();
+            }
+            self.trace.push_back(format!("{:10.4} {way} {line}", self.epoch.elapsed().as_secs_f64()));
+        }
+    }
+
     /// Describes the tunnel for the caller that asked, if one did. The
     /// description is for a person who wants to know why something does
     /// not move.
@@ -233,6 +285,13 @@ impl Engine {
         );
         self.peers.stats(&mut text);
         self.stack.describe(&mut text);
+        if self.knobs.trace > 0 {
+            text += "the last TCP packets, each with the seconds since the tunnel started:\n";
+            for line in &self.trace {
+                text += line;
+                text += "\n";
+            }
+        }
         *dump = Dump::Done(text);
         self.shared.dumped.notify_all();
     }
@@ -271,5 +330,21 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.refuse_commands();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knobs_are_read_from_text() {
+        assert_eq!(Knobs::parse("").unwrap(), Knobs::default());
+        assert_eq!(Knobs::parse(" trace=40 ,").unwrap(), Knobs { trace: 40 });
+        assert_eq!(Knobs::parse("trace=5000000").unwrap(), Knobs { trace: 1_000_000 });
+        for bad in ["trace", "trace=x", "trace=-1", "loud", "trace=1,loud"] {
+            let knob = bad.rsplit(',').next().unwrap();
+            assert_eq!(Knobs::parse(bad).unwrap_err(), format!("bad debug knob {knob:?}"));
+        }
     }
 }

@@ -14,7 +14,7 @@ mod peers;
 mod sys;
 mod tcp;
 
-use engine::{Cmd, Dump, Engine, Shared};
+use engine::{Cmd, Dump, Engine, Knobs, Shared};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::IpAddr;
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
@@ -79,10 +79,11 @@ unsafe fn text<'a>(p: *const c_char) -> Option<&'a str> {
 /// Starts a tunnel. A failure is an errno and a few words to go with it:
 /// EINVAL and the fault for a fault in the configuration, or the system's
 /// error and what it refused.
-fn open(conf: &str) -> Result<Handle, (c_int, String)> {
+fn open(conf: &str, debug: &str) -> Result<Handle, (c_int, String)> {
     let fault = |e: String| (libc::EINVAL, e);
     let refused = |what: &str, e: std::io::Error| (e.raw_os_error().unwrap_or(libc::EIO), what.to_string());
     let cfg = config::parse(conf).map_err(fault)?;
+    let knobs = Knobs::parse(debug).map_err(fault)?;
     let what = match cfg.listen_port {
         0 => "a UDP socket".to_string(),
         port => format!("UDP port {port}"),
@@ -90,7 +91,7 @@ fn open(conf: &str) -> Result<Handle, (c_int, String)> {
     let udp = sys::udp_socket(cfg.listen_port).map_err(|e| refused(&what, e))?;
     let port = udp.0.local_addr().map_err(|e| refused(&what, e))?.port();
     let wake = sys::pipe().map_err(|e| refused("a pipe", e))?;
-    let (engine, shared) = Engine::new(&cfg, udp, wake).map_err(fault)?;
+    let (engine, shared) = Engine::new(&cfg, knobs, udp, wake).map_err(fault)?;
     let thread = std::thread::Builder::new().name("sallyport".into()).spawn(move || engine.run());
     Ok(Handle { shared, thread: Some(thread.map_err(|e| refused("a thread", e))?), port })
 }
@@ -102,18 +103,26 @@ pub extern "C" fn sp_version() -> *const c_char {
 }
 
 /// Starts a tunnel from a configuration in wg-quick's format, and returns
-/// a handle to it. If the tunnel cannot be started, returns NULL, sets
-/// errno and writes the reason into `err`. errno is EINVAL for a fault in
-/// the configuration.
+/// a handle to it. `debug` is NULL, or the knobs that engine.rs lists. If
+/// the tunnel cannot be started, returns NULL, sets errno and writes the
+/// reason into `err`. errno is EINVAL for a fault in the configuration or
+/// in the knobs.
 ///
 /// # Safety
-/// `conf` is a C string, and `err` has room for `errlen` bytes.
+/// `conf` is a C string, and `debug` is one or NULL. `err` has room for
+/// `errlen` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn sp_open(conf: *const c_char, err: *mut c_char, errlen: usize) -> *mut c_void {
+pub unsafe extern "C" fn sp_open(
+    conf: *const c_char,
+    debug: *const c_char,
+    err: *mut c_char,
+    errlen: usize,
+) -> *mut c_void {
     let conf = text(conf);
-    let opened = catch_unwind(|| match conf {
-        Some(conf) => open(conf),
-        None => Err((libc::EINVAL, "the configuration is not UTF-8".into())),
+    let debug = if debug.is_null() { Some("") } else { text(debug) };
+    let opened = catch_unwind(|| match (conf, debug) {
+        (Some(conf), Some(debug)) => open(conf, debug),
+        _ => Err((libc::EINVAL, "the configuration is not UTF-8".into())),
     });
     let (errno, reason) = match opened {
         Ok(Ok(handle)) => return Box::into_raw(Box::new(handle)).cast(),

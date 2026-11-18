@@ -41,17 +41,24 @@ module Sallyport
     # name is resolved now, and not again. Nothing can interrupt the call
     # while it resolves a name.
     #
+    # +debug+ is for looking inside a tunnel: settings with commas between
+    # them, which the environment gives as SALLYPORT_DEBUG if the caller
+    # gives none. "trace=N" keeps a line for each of the last N TCP
+    # packets, and Tunnel#dump then returns them.
+    #
     # Raises ArgumentError for a fault in the configuration, and the
     # system's error, such as Errno::EADDRINUSE, if the tunnel cannot be
     # started.
-    def initialize(config = nil, **parts)
+    def initialize(config = nil, debug: ENV["SALLYPORT_DEBUG"], **parts)
       @lock = Mutex.new
       raise ArgumentError, "a tunnel takes a configuration or its parts, and not both" if config && !parts.empty?
 
       config ||= self.class.config(**parts)
-      raise TypeError, "the configuration is not a String" unless config.is_a?(String)
-      # The library takes a C string, which would end at the NUL.
-      raise ArgumentError, "the configuration holds a NUL" if config.include?("\0")
+      # The library takes C strings, and one would end at a NUL.
+      [config, debug || ""].each do |text|
+        raise TypeError, "the configuration is not a String" unless text.is_a?(String)
+        raise ArgumentError, "the configuration holds a NUL" if text.include?("\0")
+      end
 
       reason = Fiddle::Pointer.malloc(256, Fiddle::RUBY_FREE)
       @pid = Process.pid
@@ -61,7 +68,7 @@ module Sallyport
       # the exception of a signal wait, so Ctrl-C at that moment still does
       # that.
       code = Thread.handle_interrupt(Object => :never) do
-        handle = Native::OPEN.call(config, reason, 256)
+        handle = Native::OPEN.call(config, debug, reason, 256)
         next Fiddle.last_error if handle.null?
 
         # Tunnel#close and the finalizer each take the handle out of this

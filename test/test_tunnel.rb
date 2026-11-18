@@ -84,6 +84,8 @@ class TestTunnel < Minitest::Test
     assert_match(/line break/, fault(private_key: key, addresses: ["10.9.0.1\nMTU = 1"]))
     assert_match(/NUL/, fault("#{text}\0"))
     assert_raises(TypeError) { Sallyport::Tunnel.new(51_820) }
+    assert_equal 'bad debug knob "loud"', fault(text.sub(/\nColour.*/, ""), debug: "trace=5,loud")
+    assert_raises(TypeError) { Sallyport::Tunnel.new(text, debug: 5) }
     assert_raises(ArgumentError) { Sallyport::Tunnel.new(text, private_key: key, addresses: ["10.9.0.1"]) }
   end
 

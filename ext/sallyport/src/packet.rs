@@ -52,6 +52,63 @@ pub fn rst(p: &[u8]) -> bool {
     tcp(p).is_some_and(|t| t[13] & RST != 0)
 }
 
+const SACK: u8 = 5;
+
+/// Calls `f` with the kind of each TCP option that has a length, where
+/// the option starts in the segment, and how long it is. An option that
+/// is malformed ends the walk.
+fn options(t: &[u8], mut f: impl FnMut(u8, usize, usize)) {
+    let end = ((t[12] >> 4) as usize) * 4;
+    let mut i = 20;
+    while i < end {
+        match t[i] {
+            // These two are the end of the options and a byte of padding.
+            0 => break,
+            1 => i += 1,
+            kind => {
+                let Some(&len) = t.get(i + 1) else { break };
+                let len = len as usize;
+                if len < 2 || i + len > end {
+                    break;
+                }
+                f(kind, i, len);
+                i += len;
+            }
+        }
+    }
+}
+
+/// Describes a TCP packet in one line, much as tcpdump would: its ports,
+/// its flags with a dot for ACK, and its numbers.
+pub fn describe(p: &[u8]) -> Option<String> {
+    let t = tcp(p)?;
+    let word = |i: usize| u32::from_be_bytes([t[i], t[i + 1], t[i + 2], t[i + 3]]);
+    let flags: String = [(SYN, 'S'), (0x01, 'F'), (0x04, 'R'), (0x08, 'P'), (ACK, '.')]
+        .iter()
+        .filter(|(bit, _)| t[13] & bit != 0)
+        .map(|(_, letter)| *letter)
+        .collect();
+    let header = ((t[12] >> 4) as usize) * 4;
+    let mut line = format!(
+        "{}>{} {flags} seq {} ack {} win {} len {}",
+        u16::from_be_bytes([t[0], t[1]]),
+        u16::from_be_bytes([t[2], t[3]]),
+        word(4),
+        word(8),
+        u16::from_be_bytes([t[14], t[15]]),
+        t.len() - header
+    );
+    options(t, |kind, i, len| {
+        if kind == SACK {
+            for block in t[i + 2..i + len].as_chunks::<8>().0 {
+                let edge = |k: usize| u32::from_be_bytes([block[k], block[k + 1], block[k + 2], block[k + 3]]);
+                line += &format!(" sack {}-{}", edge(0), edge(4));
+            }
+        }
+    });
+    Some(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +189,23 @@ mod tests {
         let mut extended = packet(6, SYN, &MSS, &[]);
         extended[6] = 60;
         assert_eq!(syn(&extended), None);
+    }
+
+    #[test]
+    fn a_packet_is_described_much_as_tcpdump_would() {
+        let acked = packet(4, ACK | 0x08, &[1, 1, 5, 10, 0, 0, 0, 100, 0, 0, 0, 200], b"abc");
+        assert_eq!(describe(&acked).unwrap(), "51000>7000 P. seq 16909060 ack 168496141 win 4096 len 3 sack 100-200");
+        assert_eq!(
+            describe(&packet(6, SYN, &MSS, &[])).unwrap(),
+            "51000>7000 S seq 16909060 ack 168496141 win 4096 len 0"
+        );
+        assert_eq!(
+            describe(&packet(4, 0x04 | ACK, &[], &[])).unwrap(),
+            "51000>7000 R. seq 16909060 ack 168496141 win 4096 len 0"
+        );
+        assert_eq!(describe(&acked[..25]), None);
+        // An option that claims more than the header holds ends the walk.
+        let cut = packet(4, ACK, &[5, 18, 0, 0, 0, 100, 0, 0, 0, 200, 1, 1], &[]);
+        assert_eq!(describe(&cut).unwrap(), "51000>7000 . seq 16909060 ack 168496141 win 4096 len 0");
     }
 }
