@@ -269,9 +269,9 @@ impl Conn {
 //
 // The model "conn" is of one connection from the time that it is open: how
 // carry moves bytes between Ruby's descriptor and smoltcp's socket, what
-// poll is asked about the descriptor, and how the connection ends. It
-// leaves out a Ruby that shuts down its reading. The lines of the model
-// are beside the code that they describe, and `rake tla` checks them.
+// poll is asked about the descriptor, and how the connection ends. The
+// lines of the model are beside the code that they describe, and
+// `rake tla` checks them.
 //
 // TLA-conn@0> EXTENDS Naturals
 // TLA-conn@0> CONSTANTS Budget,   \* how many bytes each side may write
@@ -287,6 +287,8 @@ impl Conn {
 // TLA-conn@0>   r2u     |-> 0,        \* the bytes that Ruby wrote and carry has not read
 // TLA-conn@0>   u2r     |-> 0,        \* the bytes that carry wrote and Ruby has not read
 // TLA-conn@0>   rerr    |-> FALSE,    \* Ruby closed with bytes unread, and a read of the pair will fail
+// TLA-conn@0>   rdShut  |-> FALSE,    \* Ruby has shut down its reading, and a write to the pair will fail
+// TLA-conn@0>   deaf    |-> FALSE,    \* Conn.deaf: carry has found that out
 // TLA-conn@0>   wleft   |-> Budget,   \* the bytes that Ruby may still write
 // TLA-conn@0>   up      |-> "open",   \* Sock::up: "open", "ending" (our FIN is queued) or "ended"
 // TLA-conn@0>   down    |-> TRUE,     \* Sock::down_open: the peer may still send
@@ -327,13 +329,16 @@ impl Conn {
 // TLA-conn@10> \* the pair would take such bytes, and nothing would send them.
 // TLA-conn@10> RubyWrite == /\ s.ruby = "open" /\ s.phase = "open" /\ ~s.orphan /\ s.wleft > 0 /\ s.r2u < PairCap
 // TLA-conn@10>              /\ s' = [s EXCEPT !.r2u = @ + 1, !.wleft = @ - 1]
-// TLA-conn@10> RubyRead == /\ s.ruby # "closed" /\ s.u2r > 0 /\ s' = [s EXCEPT !.u2r = @ - 1]
+// TLA-conn@10> RubyRead == /\ s.ruby # "closed" /\ ~s.rdShut /\ s.u2r > 0 /\ s' = [s EXCEPT !.u2r = @ - 1]
 // TLA-conn@10> RubyShutWr == /\ s.ruby = "open" /\ s' = [s EXCEPT !.ruby = "shutwr"]
 // TLA-conn@10> \* What Ruby wrote stays for carry to read. What carry wrote and Ruby did
 // TLA-conn@10> \* not read is lost, and the kernel says so once, as an error.
 // TLA-conn@10> RubyClose == /\ s.ruby # "closed"
 // TLA-conn@10>              /\ s' = [s EXCEPT !.ruby = "closed", !.rerr = s.u2r > 0 /\ s.phase = "open", !.u2r = 0]
-// TLA-conn@10> Ruby == RubyWrite \/ RubyRead \/ RubyShutWr \/ RubyClose
+// TLA-conn@10> \* Ruby may shut down its reading and go on writing. The kernel drops
+// TLA-conn@10> \* what Ruby had yet to read, and poll reports no hangup for it.
+// TLA-conn@10> RubyShutRd == /\ s.ruby # "closed" /\ ~s.rdShut /\ s' = [s EXCEPT !.rdShut = TRUE, !.u2r = 0]
+// TLA-conn@10> Ruby == RubyWrite \/ RubyRead \/ RubyShutWr \/ RubyShutRd \/ RubyClose
 // TLA-conn@10>
 // TLA-conn@10> \* The peer may send, acknowledge, end its stream, reset the connection,
 // TLA-conn@10> \* go silent and hold its window shut. A packet from it wakes the loop.
@@ -862,7 +867,7 @@ impl Stack {
     // TLA-conn> \* pair left to read.
     // TLA-conn> FdReady(t) == /\ t.phase = "open" /\ Watched(t)
     // TLA-conn>               /\ \/ Reads(t) /\ (t.r2u > 0 \/ t.ruby # "open")
-    // TLA-conn>                  \/ Writes(t) /\ (4 * t.u2r <= PairCap \/ t.ruby = "closed")
+    // TLA-conn>                  \/ Writes(t) /\ (4 * t.u2r <= PairCap \/ t.ruby = "closed" \/ t.rdShut)
     // TLA-conn>                  \/ HungUp(t)
     /// Adds to `fds` each descriptor that poll should watch for the
     /// connections and the listeners.
@@ -1051,6 +1056,10 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration) -> (bool, Fate) {
     // TLA-conn> Give(t) == LET n == Min(t.rx, PairCap - t.u2r)
     // TLA-conn>            IN IF t.rx = 0 THEN t
     // TLA-conn>               ELSE IF t.ruby = "closed" \/ t.orphan THEN [t EXCEPT !.fate = "abort"]
+    // TLA-conn>               \* The first write that the pair refuses is only noted, and the
+    // TLA-conn>               \* next pass drops what a Ruby that will not read is sent.
+    // TLA-conn>               ELSE IF t.deaf THEN [t EXCEPT !.rx = 0, !.moved = TRUE]
+    // TLA-conn>               ELSE IF t.rdShut THEN [t EXCEPT !.deaf = TRUE, !.moved = TRUE]
     // TLA-conn>               ELSE [t EXCEPT !.rx = @ - n, !.u2r = @ + n, !.moved = @ \/ n > 0]
     // A write to the pair fails when Ruby has closed its end, and also
     // when Ruby has only shut down its reading. poll reports a hangup for
@@ -1151,9 +1160,13 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration) -> (bool, Fate) {
 // TLA-conn@90> \* something. So the loop does not spin on the descriptor.
 // TLA-conn@90> NoSpin == s.phase = "open" /\ FdReady(s) => Pass(s) # s
 // TLA-conn@90> \* A pass that follows another at once moves nothing. So the loop does
-// TLA-conn@90> \* not spin on what carry returns either.
+// TLA-conn@90> \* not spin on what carry returns either. There is one more pass when
+// TLA-conn@90> \* the first has found that Ruby will not read: the second drops the
+// TLA-conn@90> \* bytes that the first left.
 // TLA-conn@90> Settles == s.phase = "open" =>
-// TLA-conn@90>              \A p \in {Pass(s)} : p.fate = "keep" => ~Pass([p EXCEPT !.moved = FALSE]).moved
+// TLA-conn@90>              \A p \in {Pass(s)} : p.fate = "keep" =>
+// TLA-conn@90>                \/ ~Pass([p EXCEPT !.moved = FALSE]).moved
+// TLA-conn@90>                \/ p.deaf /\ ~s.deaf
 // TLA-conn@90> \* A state that the loop has seen owes none of these: the end of the
 // TLA-conn@90> \* peer's stream to Ruby, our FIN to the peer, the close, and the read
 // TLA-conn@90> \* that finds the end of what Ruby wrote to a tunnel that is closing.
@@ -1168,7 +1181,7 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration) -> (bool, Fate) {
 // TLA-conn@90>          dq    |-> s.u2r,
 // TLA-conn@90>          dOpen |-> s.phase = "open" /\ ~s.rxShut /\ ~s.orphan,
 // TLA-conn@90>          dDone |-> ~s.down,
-// TLA-conn@90>          rGone |-> s.ruby = "closed" \/ s.orphan,
+// TLA-conn@90>          rGone |-> s.ruby = "closed" \/ s.orphan \/ s.rdShut,
 // TLA-conn@90>          un    |-> s.r2u,
 // TLA-conn@90>          uq    |-> s.tx,
 // TLA-conn@90>          uOpen |-> s.phase = "open" /\ s.up = "open",
