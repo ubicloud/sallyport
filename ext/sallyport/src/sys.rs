@@ -47,6 +47,12 @@ pub fn shutdown_write(fd: RawFd) {
     unsafe { libc::shutdown(fd, libc::SHUT_WR) };
 }
 
+/// Ends what the other end of a socket pair can write: a write to it
+/// fails from now on. What it wrote already can still be read here.
+pub fn shutdown_read(fd: RawFd) {
+    unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+}
+
 /// Says whether poll(2) reports a hangup on an end of a socket pair,
 /// which it does whatever events it is asked about. It reports one when
 /// the other end is closed, and when each end has shut down its writing.

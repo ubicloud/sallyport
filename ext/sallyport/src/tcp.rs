@@ -172,8 +172,10 @@ struct Conn {
     theirs: Option<OwnedFd>,
     /// The local port that an outbound connection took.
     local_port: Option<u16>,
-    /// Ruby has written all that it will: a read of our end returned 0,
-    /// and our FIN follows the data.
+    /// Nothing more comes from the pair. A read of our end returned 0,
+    /// which says that Ruby has written all that it will, and our FIN
+    /// follows the data. Or the peer cut the connection, and carry shut
+    /// down the reading of our end.
     fd_eof: bool,
     /// The peer's FIN has been passed on to Ruby, as a shutdown of our
     /// end.
@@ -316,18 +318,22 @@ impl Conn {
 // TLA-conn@0> \* The socket is the one that sock.rs describes, and no more of smoltcp
 // TLA-conn@0> \* shows here than that file lets carry see.
 // TLA-conn@0> \* sys::hung_up. poll reports a hangup on our end when Ruby has closed its
-// TLA-conn@0> \* end, and when each end has shut down its writing. carry shuts ours down
-// TLA-conn@0> \* to pass on the peer's FIN, and orphan shuts it down when the tunnel
-// TLA-conn@0> \* closes.
-// TLA-conn@0> HungUp(t) == t.ruby = "closed" \/ (t.ruby = "shutwr" /\ (t.rxShut \/ t.orphan))
+// TLA-conn@0> \* end, and when no more can go either way. carry shuts down the writing
+// TLA-conn@0> \* of our end to pass on the peer's FIN, and orphan shuts it down when the
+// TLA-conn@0> \* tunnel closes. Nothing comes the other way once Ruby has shut down its
+// TLA-conn@0> \* writing, or carry the reading of our end.
+// TLA-conn@0> HungUp(t) == t.ruby = "closed" \/ ((t.ruby = "shutwr" \/ t.fdEof) /\ (t.rxShut \/ t.orphan))
 //
 // The model takes this much of Ruby, of the peer and of smoltcp.
 //
 // TLA-conn@10> \* Ruby may write, read, shut down its writing and close, in any order
 // TLA-conn@10> \* and at any time. The model takes it that Ruby writes nothing to a
 // TLA-conn@10> \* tunnel that it has closed. Nothing in the kernel holds Ruby to that:
-// TLA-conn@10> \* the pair would take such bytes, and nothing would send them.
-// TLA-conn@10> RubyWrite == /\ s.ruby = "open" /\ s.phase = "open" /\ ~s.orphan /\ s.wleft > 0 /\ s.r2u < PairCap
+// TLA-conn@10> \* the pair would take such bytes, and nothing would send them. The
+// TLA-conn@10> \* kernel does refuse a write once carry has shut down the reading of
+// TLA-conn@10> \* our end.
+// TLA-conn@10> RubyWrite == /\ s.ruby = "open" /\ s.phase = "open" /\ ~s.orphan /\ ~s.fdEof
+// TLA-conn@10>              /\ s.wleft > 0 /\ s.r2u < PairCap
 // TLA-conn@10>              /\ s' = [s EXCEPT !.r2u = @ + 1, !.wleft = @ - 1]
 // TLA-conn@10> RubyRead == /\ s.ruby # "closed" /\ ~s.rdShut /\ s.u2r > 0 /\ s' = [s EXCEPT !.u2r = @ - 1]
 // TLA-conn@10> RubyShutWr == /\ s.ruby = "open" /\ s' = [s EXCEPT !.ruby = "shutwr"]
@@ -1098,18 +1104,24 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration) -> (bool, Fate) {
     // TLA-conn> \* The pair is read into the socket while the socket has room. If the
     // TLA-conn> \* loop reads once more than there are bytes, that read says why there
     // TLA-conn> \* are none: an error, the end of what Ruby will write, or nothing yet.
-    // TLA-conn> \* An orphan's pair is read until it is empty, and no more.
+    // TLA-conn> \* An orphan's pair is read until it is empty, and no more. Once the
+    // TLA-conn> \* stream to the peer has ended, carry reads no more, and shuts down the
+    // TLA-conn> \* reading of the pair if Ruby has not ended its stream.
     // TLA-conn> Read(t) == LET eof == t.fdEof \/ t.up # "open"
     // TLA-conn>                n == IF eof THEN 0 ELSE Min(t.r2u, TxCap - t.tx)
     // TLA-conn>                more == ~eof /\ t.tx + n < TxCap
     // TLA-conn>                end == more /\ ~t.rerr /\ (t.ruby # "open" \/ t.orphan)
     // TLA-conn>            IN [t EXCEPT !.fdEof = eof \/ end, !.tx = @ + n, !.r2u = @ - n,
     // TLA-conn>                         !.moved = n > 0 \/ end, !.fate = IF more /\ t.rerr THEN "abort" ELSE "keep"]
+    let fd = c.raw();
     if !c.fd_eof && s.up() != Up::Open {
-        // The peer reset the connection, or it timed out.
+        // The peer reset the connection, or it timed out, and nothing
+        // that Ruby writes from now on can be sent. So the reading of
+        // the pair is shut down, and a write by Ruby fails, as a write to
+        // a TCP socket does once it is reset.
+        sys::shutdown_read(fd);
         c.fd_eof = true;
     }
-    let fd = c.raw();
     while !c.fd_eof && s.has_room() {
         match s.fill(|buf| sys::read(fd, buf)) {
             n if n > 0 => moved = true,
@@ -1986,6 +1998,35 @@ mod tests {
         assert_eq!(read(&mut server), (vec![], true));
         assert!(server.write(b"more").is_err());
         assert!(a.conns.is_empty() && b.conns.is_empty());
+    }
+
+    #[test]
+    fn a_write_fails_once_the_peer_has_reset() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // The server reads nothing, so its pair fills, and then its socket.
+        let (mut at, mut before) = (0, usize::MAX);
+        while at != before {
+            before = at;
+            at = write_from(&mut client, at, 1 << 20);
+            settle(&mut a, &mut b);
+        }
+        a.sockets.get_mut::<tcp::Socket>(a.conns[0].handle).abort();
+        settle(&mut a, &mut b);
+        assert!(b.conns.len() == 1 && held(&b) > 0, "B has bytes that the server can still read");
+        assert_eq!(server.write(b"more").unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        let mut got = Vec::new();
+        loop {
+            let (bytes, ended) = read(&mut server);
+            got.extend(bytes);
+            if ended {
+                break;
+            }
+            settle(&mut a, &mut b);
+        }
+        assert!(!got.is_empty() && got.iter().enumerate().all(|(i, b)| *b == byte(i)));
+        settle(&mut a, &mut b);
+        assert!(b.conns.is_empty());
     }
 
     #[test]
