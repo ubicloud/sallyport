@@ -51,6 +51,24 @@ jobs:
       - run: bundle exec rake test TEST=test/test_ring.rb
       # The kernel's ring is in a network namespace, which takes root.
       - run: sudo env "PATH=$PATH" SALLYPORT_NO_SKIP=1 ruby -w -Ilib -Itest test/test_kernel.rb
+  # VPP is a third WireGuard and a fourth TCP. It is fetched as packages,
+  # and it takes root too.
+  vpp:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubicloud-standard-2-ubuntu-2404, ubicloud-standard-2-arm-ubuntu-2404]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ethtool libunwind8
+      - run: bundle exec rake compile vpp
+      - run: sudo env "PATH=$PATH" SALLYPORT_NO_SKIP=1 ruby -w -Ilib -Itest test/test_vpp.rb
   # These are the tests that wait for a timer of WireGuard or of TCP to
   # run out.
   slow:
