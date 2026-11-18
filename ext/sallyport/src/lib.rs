@@ -218,14 +218,18 @@ pub unsafe extern "C" fn sp_listen(h: *mut c_void, port: c_int, backlog: c_int) 
 }
 
 /// Returns how many connections the tunnel has: those that it is making,
-/// and those that are made and have not ended.
+/// and those that are made and have not ended. Returns -1 if the tunnel's
+/// thread has ended.
 ///
 /// # Safety
 /// `h` came from sp_open.
 #[no_mangle]
-pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> usize {
+pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> isize {
     let h = &*h.cast::<Handle>();
-    h.shared.connections.load(Ordering::Relaxed)
+    if h.shared.dead.load(Ordering::Acquire) {
+        return -1;
+    }
+    h.shared.connections.load(Ordering::Relaxed) as isize
 }
 
 /// Writes a description of the tunnel into `buf`, for a person to read:
@@ -233,7 +237,8 @@ pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> usize {
 /// gives it, then two lines for each connection. The tunnel's thread
 /// writes the description at the next turn of its loop, and the call
 /// waits for that. Returns how many bytes the whole of it needs, as
-/// sp_stats does, or 0 if the thread did not answer within a second.
+/// sp_stats does, or 0 if the thread has ended or did not answer within
+/// a second.
 ///
 /// # Safety
 /// `h` came from sp_open, and `buf` has room for `len` bytes.
@@ -243,7 +248,8 @@ pub unsafe extern "C" fn sp_dump(h: *mut c_void, buf: *mut c_char, len: usize) -
     let mut dump = h.shared.dump.lock().unwrap_or_else(|e| e.into_inner());
     *dump = Dump::Asked;
     h.shared.wake();
-    let unanswered = |dump: &mut Dump| !matches!(dump, Dump::Done(_));
+    let ended = || h.shared.dead.load(Ordering::Acquire);
+    let unanswered = |dump: &mut Dump| !matches!(dump, Dump::Done(_)) && !ended();
     let waited = h.shared.dumped.wait_timeout_while(dump, Duration::from_secs(1), unanswered);
     let mut dump = waited.unwrap_or_else(|e| e.into_inner()).0;
     match std::mem::take(&mut *dump) {
@@ -268,13 +274,17 @@ pub unsafe extern "C" fn sp_port(h: *mut c_void) -> c_int {
 /// Writes the state of the peers, as Peers::stats gives it and as it was
 /// at most a quarter of a second ago, into `buf`. Returns how many bytes
 /// the whole of it needs. If that is more than `len`, what was written
-/// is cut short.
+/// is cut short. Returns 0 if the tunnel's thread has ended, and with it
+/// the sessions that the state was of.
 ///
 /// # Safety
 /// `h` came from sp_open, and `buf` has room for `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sp_stats(h: *mut c_void, buf: *mut c_char, len: usize) -> usize {
     let h = &*h.cast::<Handle>();
+    if h.shared.dead.load(Ordering::Acquire) {
+        return 0;
+    }
     let stats = h.shared.stats.lock().unwrap_or_else(|e| e.into_inner());
     put(buf, len, &stats);
     stats.len() + 1

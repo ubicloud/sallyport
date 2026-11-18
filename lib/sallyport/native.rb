@@ -21,6 +21,7 @@ module Sallyport
     P = Fiddle::TYPE_VOIDP
     I = Fiddle::TYPE_INT
     Z = Fiddle::TYPE_SIZE_T
+    S = Fiddle::TYPE_SSIZE_T
 
     # Binds a function of the library. Ruby keeps the GVL for a call
     # unless the function +waits+. A thread that lets the GVL go has to
@@ -35,7 +36,7 @@ module Sallyport
     CLOSE = bind("sp_close", [P, I], Fiddle::TYPE_VOID, waits: true)
     CONNECT = bind("sp_connect", [P, P, I], I)
     LISTEN = bind("sp_listen", [P, I, I], I)
-    CONNECTIONS = bind("sp_connections", [P], Z)
+    CONNECTIONS = bind("sp_connections", [P], S)
     DUMP = bind("sp_dump", [P, P, Z], Z, waits: true)
     PORT = bind("sp_port", [P], I)
     STATS = bind("sp_stats", [P, P, Z], Z)

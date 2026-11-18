@@ -195,6 +195,24 @@ class TestTCP < Minitest::Test
     refute_match(/the last TCP packets/, pair.first.dump)
   end
 
+  # The setting has the thread panic when it is asked to describe the
+  # tunnel, which a fault in the library might do at any time.
+  def test_a_tunnel_whose_thread_has_failed
+    a, b = pair(debug: "fail")
+    _, server = connection(a, b)
+    _, panic = capture_subprocess_io { assert_raises(Errno::ENETDOWN) { a.dump } }
+    assert_match(/thread 'sallyport' .*panicked/, panic)
+    assert_nil server.read(1)
+    [-> { a.connect("10.9.0.2", 7) }, -> { a.listen(8) }, -> { a.peers }, -> { a.connections }, -> { a.dump }].each do |call|
+      assert_raises(Errno::ENETDOWN, &call)
+    end
+    refute a.closed?
+    a.close
+    assert_raises(IOError) { a.peers }
+    # a has told b nothing, and b would wait for it.
+    b.close(linger: 0)
+  end
+
   def test_each_direction_ends_on_its_own
     client, server = connection(*pair)
     client.write("question")

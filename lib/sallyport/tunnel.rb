@@ -185,7 +185,8 @@ module Sallyport
     # was written to it and has ended its own stream too, or until it is
     # reset.
     def connections
-      synchronize { Native::CONNECTIONS.call(handle) }
+      count = synchronize { Native::CONNECTIONS.call(handle) }
+      count.negative? ? failed : count
     end
 
     # Returns a description of the tunnel for a person to read: what it
@@ -197,7 +198,7 @@ module Sallyport
       loop do
         text = Fiddle::Pointer.malloc(size, Fiddle::RUBY_FREE)
         need = synchronize { Native::DUMP.call(handle, text, size) }
-        raise Errno::ENETDOWN, "the tunnel's thread does not answer" if need.zero?
+        failed if need.zero?
         return text.to_s.force_encoding(Encoding::UTF_8) if need <= size
 
         size = need
@@ -311,11 +312,19 @@ module Sallyport
       raise Native::STATUS.fetch(status.ord), what unless status.ord.zero?
     end
 
+    # A tunnel's thread ends before the tunnel is closed only by a fault
+    # in the library. The tunnel's sockets have reached end of file, and
+    # what is asked of the tunnel from then on raises this.
+    def failed
+      raise Errno::ENETDOWN, "the tunnel's thread has failed"
+    end
+
     def stats
       size = 4096
       loop do
         text = Fiddle::Pointer.malloc(size, Fiddle::RUBY_FREE)
         need = synchronize { Native::STATS.call(handle, text, size) }
+        failed if need.zero?
         return text.to_s.force_encoding(Encoding::UTF_8) if need <= size
 
         size = need * 2

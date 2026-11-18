@@ -74,6 +74,9 @@ pub struct Knobs {
     /// `trace=N` keeps a line for each of the last N TCP packets, a
     /// million at most, and the tunnel's description then has them.
     pub trace: usize,
+    /// `fail` has the thread panic when it is next asked to describe the
+    /// tunnel. The tests use it to see what a failed tunnel does.
+    pub fail: bool,
 }
 
 impl Knobs {
@@ -84,6 +87,7 @@ impl Knobs {
             let bad = || format!("bad debug knob {knob:?}");
             match name {
                 "trace" => knobs.trace = value.parse::<usize>().map_err(|_| bad())?.min(1_000_000),
+                "fail" if value.is_empty() => knobs.fail = true,
                 _ => return Err(bad()),
             }
         }
@@ -276,6 +280,7 @@ impl Engine {
         if !matches!(*dump, Dump::Asked) {
             return;
         }
+        assert!(!self.knobs.fail, "the tunnel's thread was told to fail");
         let Dropped { unknown, refused, disallowed } = self.peers.dropped;
         let mut text = format!(
             "{} datagrams in: {unknown} from no peer, {refused} refused, {disallowed} from a source not allowed\n\
@@ -330,6 +335,9 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.refuse_commands();
+        // A caller that waits for a description will get none.
+        drop(self.shared.dump.lock());
+        self.shared.dumped.notify_all();
     }
 }
 
@@ -340,9 +348,9 @@ mod tests {
     #[test]
     fn knobs_are_read_from_text() {
         assert_eq!(Knobs::parse("").unwrap(), Knobs::default());
-        assert_eq!(Knobs::parse(" trace=40 ,").unwrap(), Knobs { trace: 40 });
-        assert_eq!(Knobs::parse("trace=5000000").unwrap(), Knobs { trace: 1_000_000 });
-        for bad in ["trace", "trace=x", "trace=-1", "loud", "trace=1,loud"] {
+        assert_eq!(Knobs::parse(" trace=40 ,").unwrap(), Knobs { trace: 40, fail: false });
+        assert_eq!(Knobs::parse("fail,trace=5000000").unwrap(), Knobs { trace: 1_000_000, fail: true });
+        for bad in ["trace", "trace=x", "trace=-1", "loud", "trace=1,loud", "fail=1"] {
             let knob = bad.rsplit(',').next().unwrap();
             assert_eq!(Knobs::parse(bad).unwrap_err(), format!("bad debug knob {knob:?}"));
         }
