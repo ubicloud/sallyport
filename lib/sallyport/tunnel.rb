@@ -190,9 +190,9 @@ module Sallyport
     # sent, and then the end of its stream. The call waits for that for up
     # to +linger+ seconds, and resets a connection that has not ended by
     # then. Every socket and listener of the tunnel then reaches end of
-    # file. If another thread writes to a socket while the tunnel closes,
-    # those bytes are not sent. A signal handler cannot call this, because
-    # it takes a lock.
+    # file. A write to one of the sockets raises Errno::EPIPE once the
+    # tunnel has begun to close. A signal handler cannot call this,
+    # because it takes a lock.
     def close(linger: LINGER)
       # The linger is made a number before the handle is taken. One that
       # is no number then leaves the tunnel as it was.

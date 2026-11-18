@@ -53,9 +53,16 @@ pub fn shutdown_read(fd: RawFd) {
     unsafe { libc::shutdown(fd, libc::SHUT_RD) };
 }
 
+/// Shuts an end of a socket pair down both ways. The other end reads what
+/// was sent already and then the end, and a write to it fails.
+pub fn shutdown(fd: RawFd) {
+    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+}
+
 /// Says whether poll(2) reports a hangup on an end of a socket pair,
 /// which it does whatever events it is asked about. It reports one when
-/// the other end is closed, and when each end has shut down its writing.
+/// no more can go either way: the other end is closed, or this end is
+/// shut down both ways, or each end has shut down its writing.
 pub fn hung_up(fd: RawFd) -> bool {
     let mut p = libc::pollfd { fd, events: 0, revents: 0 };
     unsafe { libc::poll(&mut p, 1, 0) };

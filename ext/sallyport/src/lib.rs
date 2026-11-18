@@ -153,9 +153,10 @@ pub unsafe extern "C" fn sp_open(
 // TLA-wake>          /\ s' = [s EXCEPT !.rOpen = FALSE, !.wOpen = FALSE, !.freed = TRUE, !.kpc = "return"]
 /// Stops a tunnel. Its listeners stop at once. Each connection is ended
 /// as if its descriptor had been closed: what was written to it is sent,
-/// and then the end of the stream. The call waits for that for up to
-/// `linger_ms` milliseconds, and a connection that has not ended by then
-/// is reset. Every descriptor of the tunnel then reaches end of file.
+/// and then the end of the stream, and a write to it fails from then on.
+/// The call waits for that for up to `linger_ms` milliseconds, and a
+/// connection that has not ended by then is reset. Every descriptor of
+/// the tunnel then reaches end of file.
 ///
 /// # Safety
 /// `h` came from sp_open, and is not used again.
