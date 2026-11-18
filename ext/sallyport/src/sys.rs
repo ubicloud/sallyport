@@ -105,18 +105,9 @@ pub fn socketpair(kind: libc::c_int) -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) })
 }
 
-/// What became of a message that send_fd was given.
-pub enum Sent {
-    Ok,
-    /// The socket's buffer has no room for it.
-    Full,
-    /// The other end is closed.
-    Gone,
-}
-
 /// Sends a message on a socket without waiting, and a descriptor with it
-/// (SCM_RIGHTS).
-pub fn send_fd(socket: RawFd, message: &[u8], fd: RawFd) -> Sent {
+/// (SCM_RIGHTS). Returns what `send` returns.
+pub fn send_fd(socket: RawFd, message: &[u8], fd: RawFd) -> isize {
     // The buffer is of u64 so that it is aligned for a cmsghdr, and it is
     // longer than CMSG_SPACE(4).
     let mut control = [0u64; 4];
@@ -134,11 +125,7 @@ pub fn send_fd(socket: RawFd, message: &[u8], fd: RawFd) -> Sent {
         libc::CMSG_DATA(header).cast::<RawFd>().write_unaligned(fd);
         libc::sendmsg(socket, &raw const msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT)
     };
-    match result(sent) {
-        AGAIN => Sent::Full,
-        n if n >= 0 => Sent::Ok,
-        _ => Sent::Gone,
-    }
+    result(sent)
 }
 
 /// Makes a UDP socket that does not block, bound to the port, or to any

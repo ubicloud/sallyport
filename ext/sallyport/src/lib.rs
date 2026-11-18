@@ -7,6 +7,7 @@
 //! where it waits for everything else and can be interrupted.
 
 mod config;
+mod ctl;
 mod engine;
 mod keys;
 mod packet;
@@ -25,11 +26,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-
-/// A listener's backlog is no more than this. A listener's pair holds
-/// that many messages each way with room to spare, so neither side waits
-/// to send one.
-const MAX_BACKLOG: c_int = 128;
 
 pub struct Handle {
     shared: Arc<Shared>,
@@ -225,7 +221,7 @@ pub unsafe extern "C" fn sp_connect(h: *mut c_void, addr: *const c_char, port: c
 #[no_mangle]
 pub unsafe extern "C" fn sp_listen(h: *mut c_void, port: c_int, backlog: c_int) -> c_int {
     let h = &*h.cast::<Handle>();
-    let backlog = backlog.clamp(1, MAX_BACKLOG) as usize;
+    let backlog = (backlog.max(1) as usize).min(ctl::MAX_BACKLOG);
     let begun = match u16::try_from(port).ok().filter(|port| *port != 0) {
         Some(port) => h.pair(libc::SOCK_SEQPACKET, |fd| Cmd::Listen { fd, port, backlog }),
         None => Err(libc::EINVAL),

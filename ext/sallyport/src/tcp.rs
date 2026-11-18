@@ -6,10 +6,11 @@
 //! control from end to end.
 
 use crate::config::Config;
+use crate::ctl::{Ctl, Sent};
 use crate::packet::{rst, split_fin, syn, without_sack};
 use crate::pair::{Gave, Hangup, Pair, Took};
 use crate::sock::{Opening, Sock, Socket, Up, ACK_DELAY, TCP_TIMEOUT};
-use crate::sys::{self, Sent};
+use crate::sys;
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant as SInstant;
@@ -17,7 +18,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
 /// A closed connection's socket stays this long to acknowledge the
@@ -339,7 +340,7 @@ struct Listener {
     id: u64,
     port: u16,
     /// Our end of the pair on which Ruby is sent each connection.
-    ctl: OwnedFd,
+    ctl: Ctl,
     backlog: usize,
     /// How many connections Ruby has been sent and has not yet accepted.
     unaccepted: usize,
@@ -352,9 +353,7 @@ impl Listener {
     /// Counts the connections that Ruby has accepted since the last call.
     /// Ruby answers each with a message.
     fn credit(&mut self) {
-        while sys::read(self.ctl.as_raw_fd(), &mut [0; 16]) > 0 {
-            self.unaccepted = self.unaccepted.saturating_sub(1);
-        }
+        self.unaccepted = self.unaccepted.saturating_sub(self.ctl.answers());
     }
 }
 
@@ -458,7 +457,7 @@ impl Stack {
     /// Tells Ruby, on its descriptor, why a connection was not begun, and
     /// closes our end.
     pub fn refuse(fd: OwnedFd, code: u8) {
-        sys::send(fd.as_raw_fd(), &[code]);
+        Pair::new(fd).say(code);
     }
 
     /// Begins a connection to a TCP port for the socket pair whose end is
@@ -492,10 +491,11 @@ impl Stack {
     pub fn listen(&mut self, ctl: OwnedFd, port: u16, backlog: usize) {
         // Ruby may have closed a listener on this port a moment ago.
         self.reap();
+        let ctl = Ctl::new(ctl);
         if self.listeners.iter().any(|l| l.port == port) {
-            return Stack::refuse(ctl, status::IN_USE);
+            return ctl.say(status::IN_USE);
         }
-        sys::send(ctl.as_raw_fd(), &[status::OK]);
+        ctl.say(status::OK);
         self.listened += 1;
         self.listeners.push(Listener { id: self.listened, port, ctl, backlog, unaccepted: 0 });
     }
@@ -504,7 +504,7 @@ impl Stack {
     /// connection that Ruby was not sent then finds no listener, and is
     /// reset at its next step.
     fn reap(&mut self) {
-        self.listeners.retain(|l| !sys::ended(l.ctl.as_raw_fd()));
+        self.listeners.retain(|l| !l.ctl.ended());
     }
 
     // TLA-listen> \* welcome says one of these for a SYN whose connection no socket has. A
@@ -522,7 +522,7 @@ impl Stack {
     fn welcome(&mut self, port: u16) -> Welcome {
         let Some(l) = self.listeners.iter_mut().find(|l| l.port == port) else { return Welcome::Nobody };
         // Ruby may have closed the listener a moment ago.
-        if sys::ended(l.ctl.as_raw_fd()) {
+        if l.ctl.ended() {
             return Welcome::Nobody;
         }
         l.credit();
@@ -848,7 +848,7 @@ impl Stack {
         // A listener is watched for Ruby accepting a connection and for
         // Ruby closing it.
         for l in &self.listeners {
-            fds.push(libc::pollfd { fd: l.ctl.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            fds.push(libc::pollfd { fd: l.ctl.raw(), events: libc::POLLIN, revents: 0 });
         }
         for c in &self.conns {
             // poll reports a hangup whether asked or not. So a descriptor
@@ -954,7 +954,7 @@ fn step(mut phase: Phase, s: &mut Socket, listeners: &mut [Listener], now: Durat
                 let l = listeners.iter_mut().find(|l| l.id == listener);
                 let (Some(l), Some(from)) = (l, Sock::peer(s)) else { return Fate::Abort };
                 let message = format!("{} {}", from.addr, from.port);
-                match sys::send_fd(l.ctl.as_raw_fd(), message.as_bytes(), theirs.as_raw_fd()) {
+                match l.ctl.send(&message, &theirs) {
                     Sent::Ok => {
                         l.unaccepted += 1;
                         Phase::open(pair)
@@ -1360,7 +1360,7 @@ mod tests {
     use smoltcp::time::Duration as SDuration;
     use std::io::{Read, Write};
     use std::net::Shutdown;
-    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
     const A: &str = "10.9.0.1";
