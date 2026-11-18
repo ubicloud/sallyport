@@ -25,7 +25,8 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
       - run: bundle exec rake test
-  # These are the tests that wait for a timer of WireGuard to run out.
+  # These are the tests that wait for a timer of WireGuard or of TCP to
+  # run out.
   slow:
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 20

@@ -1,12 +1,14 @@
 //! The TCP side of a tunnel is smoltcp's stack and, for each connection,
 //! a Unix socket pair. Ruby holds one end of the pair, which is a
 //! descriptor that it can select on and give to OpenSSL. The stack holds
-//! the other end.
+//! the other end, and moves bytes between it and the buffers of the TCP
+//! socket. The buffers of both are bounded, so each direction has flow
+//! control from end to end.
 
 use crate::config::Config;
 use crate::packet::{rst, syn};
 use crate::sys::{self, Sent};
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration as SDuration, Instant as SInstant};
@@ -26,6 +28,12 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(300);
 /// A connection asks its peer for an ACK when the peer has been quiet for
 /// this long.
 const KEEP_ALIVE: Duration = Duration::from_secs(75);
+/// A closed connection's socket stays this long to acknowledge the
+/// peer's FIN. smoltcp delays an ACK by 10 ms at most.
+const LINGER: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 500 });
+/// One turn of the loop has the sockets send this many rounds of packets
+/// at the most, with a packet from each socket in a round.
+const EGRESS_ROUNDS: usize = 1024;
 /// An outbound connection takes one of this many local ports, of which
 /// this is the first. They are the ports that IANA leaves for the purpose.
 const FIRST_PORT: u16 = 49152;
@@ -101,7 +109,7 @@ enum Phase {
     Open,
     /// The connection is closed to Ruby and has no descriptor. Its socket
     /// stays until it has sent what it owes the peer.
-    Dead,
+    Dead(Instant),
 }
 
 /// A step decides one of these for its connection.
@@ -127,11 +135,36 @@ struct Conn {
     theirs: Option<OwnedFd>,
     /// The local port that an outbound connection took.
     local_port: Option<u16>,
+    /// Ruby has written all that it will: a read of our end returned 0,
+    /// and our FIN follows the data.
+    fd_eof: bool,
+    /// The peer's FIN has been passed on to Ruby, as a shutdown of our
+    /// end.
+    rx_shut: bool,
+    /// poll reports a hangup on our end. Either Ruby has closed its end,
+    /// or each side has shut down its writing, which poll does not tell
+    /// apart. In both cases Ruby has no more to say, and has been told
+    /// all that it will be.
+    app_gone: bool,
+    /// The tail holds what the peer sent last and Ruby has yet to be
+    /// given, once that is taken out of the socket's buffer.
+    tail: VecDeque<u8>,
 }
 
 impl Conn {
     fn new(handle: SocketHandle, fd: Option<OwnedFd>, phase: Phase) -> Conn {
-        Conn { handle, fd, phase, listener: None, theirs: None, local_port: None }
+        Conn {
+            handle,
+            fd,
+            phase,
+            listener: None,
+            theirs: None,
+            local_port: None,
+            fd_eof: false,
+            rx_shut: false,
+            app_gone: false,
+            tail: VecDeque::new(),
+        }
     }
 
     /// Returns our end of the pair as a system call takes it, or -1 if
@@ -175,6 +208,9 @@ fn socket() -> tcp::Socket<'static> {
     let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUF]), tcp::SocketBuffer::new(vec![0; TCP_BUF]));
     s.set_timeout(Some(SDuration::from_millis(TCP_TIMEOUT.as_millis() as u64)));
     s.set_keep_alive(Some(SDuration::from_millis(KEEP_ALIVE.as_millis() as u64)));
+    // The socket pair has already gathered what Ruby wrote, and a key
+    // typed into an interactive session must not wait for an ACK.
+    s.set_nagle_enabled(false);
     s
 }
 
@@ -367,7 +403,14 @@ impl Stack {
     pub fn turn(&mut self) -> bool {
         self.ingress();
         let now = self.now();
-        self.iface.poll(now, &mut self.link, &mut self.sockets);
+        // smoltcp's poll sends until no socket has more to send. A socket
+        // whose timer did not move would keep it there for ever, so the
+        // rounds are counted. What is left goes at the next turn.
+        for _ in 0..EGRESS_ROUNDS {
+            if self.iface.poll_egress(now, &mut self.link, &mut self.sockets) == PollResult::None {
+                break;
+            }
+        }
         self.pump()
     }
 
@@ -389,15 +432,15 @@ impl Stack {
             match fate {
                 Fate::Keep => {}
                 Fate::Close | Fate::Abort => {
-                    // Ruby's part is over. An aborted socket has a reset
-                    // to send, and must stay until it has sent it.
+                    // Ruby's part is over. The socket has a reset or a
+                    // last ACK to send, and must stay until it has sent it.
                     if matches!(fate, Fate::Abort) {
                         s.abort();
                     }
                     c.fd = None;
                     c.theirs = None;
                     c.listener = None;
-                    c.phase = Phase::Dead;
+                    c.phase = Phase::Dead(Instant::now());
                     moved = true;
                 }
                 Fate::Remove => {
@@ -425,11 +468,31 @@ impl Stack {
         for l in &self.listeners {
             fds.push(libc::pollfd { fd: l.ctl.as_raw_fd(), events: libc::POLLIN, revents: 0 });
         }
-        // poll reports a hangup whether asked or not. So a descriptor with
-        // no events asked of it is watched for Ruby closing its end, and
-        // for nothing else.
-        for c in self.conns.iter().filter(|c| matches!(c.phase, Phase::Connecting(_) | Phase::Open)) {
-            fds.push(libc::pollfd { fd: c.raw(), events: 0, revents: 0 });
+        for c in &self.conns {
+            let s = self.sockets.get::<tcp::Socket>(c.handle);
+            // poll reports a hangup whether asked or not. So a descriptor
+            // with no events asked of it is watched for Ruby closing its
+            // end, and for nothing else.
+            let events = match c.phase {
+                Phase::Listening | Phase::Accepting | Phase::Dead(_) => continue,
+                // Ruby may write before it has the status, and nothing
+                // reads that yet. So poll is not asked whether there is
+                // anything to read, for which it would return for ever.
+                Phase::Connecting(_) => 0,
+                Phase::Open => {
+                    // The pair is read while the socket has room, and
+                    // written while the socket has bytes for Ruby.
+                    let read = if !c.fd_eof && s.can_send() { libc::POLLIN } else { 0 };
+                    let write = if s.can_recv() || !c.tail.is_empty() { libc::POLLOUT } else { 0 };
+                    // Once the hangup has been seen, poll would return
+                    // for it for ever.
+                    if read | write == 0 && c.app_gone {
+                        continue;
+                    }
+                    read | write
+                }
+            };
+            fds.push(libc::pollfd { fd: c.raw(), events, revents: 0 });
         }
     }
 }
@@ -438,13 +501,17 @@ impl Stack {
 /// and what becomes of it.
 fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener]) -> (bool, Fate) {
     match c.phase {
-        Phase::Dead => {
-            // smoltcp forgets the peer once it has no more to send it.
-            let sent = s.state() == tcp::State::Closed && s.remote_endpoint().is_none();
+        Phase::Dead(since) => {
+            let sent = match s.state() {
+                // smoltcp forgets the peer once it has no more to send it.
+                tcp::State::Closed => s.remote_endpoint().is_none(),
+                // The peer's FIN is owed an ACK.
+                _ => since.elapsed() >= LINGER,
+            };
             (false, if sent { Fate::Remove } else { Fate::Keep })
         }
-        // Ruby closed its end. In Phase::Connecting, it gave up waiting.
-        Phase::Connecting(_) | Phase::Open if sys::hung_up(c.raw()) => (true, Fate::Abort),
+        // Ruby gave up waiting, and closed its end.
+        Phase::Connecting(_) if sys::hung_up(c.raw()) => (true, Fate::Abort),
         // Ruby closed the listener.
         Phase::Listening | Phase::Accepting if c.listener.is_none() => (true, Fate::Abort),
         Phase::Listening => match s.state() {
@@ -500,17 +567,111 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener]) -> (bool,
                 (true, Fate::Keep)
             }
         },
-        // Nothing carries the connection's bytes yet.
-        Phase::Open if s.state() == tcp::State::Closed => (true, Fate::Close),
-        Phase::Open => (false, Fate::Keep),
+        Phase::Open => carry(c, s),
     }
+}
+
+/// Moves bytes each way for an open connection, and passes on the end of
+/// each direction.
+fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
+    let mut moved = false;
+
+    if !c.fd_eof && !s.may_send() {
+        // The peer reset the connection, or it timed out.
+        c.fd_eof = true;
+    }
+    let fd = c.raw();
+    while !c.fd_eof && s.can_send() {
+        // The bytes are read from the pair into the socket's buffer.
+        match s.send(|buf| {
+            let n = sys::read(fd, buf);
+            (n.max(0) as usize, n)
+        }) {
+            Ok(n) if n > 0 => moved = true,
+            Ok(0) => {
+                c.fd_eof = true;
+                moved = true;
+            }
+            Ok(sys::AGAIN) => break,
+            // Ruby closed its end with bytes from us unread.
+            _ => return (true, Fate::Abort),
+        }
+    }
+    // Our FIN follows what Ruby wrote, and it waits until the peer has
+    // taken all of that. smoltcp does not send a FIN well behind data that
+    // a shut window holds back. Its probe of the window can carry the FIN
+    // with the last byte, and the timer of the probe then outlives the
+    // data: smoltcp sends an ACK each time that it is asked, and its poll
+    // never ends. And in LAST-ACK it passes over an ACK that acknowledges
+    // nothing new, and so would learn that the window was open again only
+    // when its next probe was answered.
+    let fin_due = matches!(s.state(), tcp::State::Established | tcp::State::CloseWait);
+    if fin_due && c.fd_eof && s.send_queue() == 0 {
+        s.close();
+        moved = true;
+    }
+    if !c.app_gone && sys::hung_up(fd) {
+        c.app_gone = true;
+    }
+
+    // smoltcp clears a socket when it has been in TIME-WAIT for ten
+    // seconds, and its receive buffer with it. So what Ruby has not been
+    // given by then is taken out of the buffer as soon as the peer's FIN
+    // has arrived, and Ruby is given it from here.
+    if s.state() == tcp::State::TimeWait {
+        while s.can_recv() {
+            let tail = &mut c.tail;
+            let _ = s.recv(|buf| {
+                tail.extend(buf.iter());
+                (buf.len(), ())
+            });
+        }
+    }
+    while !c.tail.is_empty() {
+        match sys::send(fd, c.tail.as_slices().0) {
+            n if n > 0 => {
+                c.tail.drain(..n as usize);
+                moved = true;
+            }
+            sys::AGAIN => break,
+            _ => return (true, Fate::Abort),
+        }
+    }
+    while s.can_recv() {
+        match s.recv(|buf| {
+            let n = sys::send(fd, buf);
+            (n.max(0) as usize, n)
+        }) {
+            Ok(n) if n > 0 => moved = true,
+            Ok(sys::AGAIN) => break,
+            // Ruby closed its end with bytes still to come.
+            _ => return (true, Fate::Abort),
+        }
+    }
+    if !c.rx_shut && !s.may_recv() && !s.can_recv() && c.tail.is_empty() {
+        // The peer will send no more, and Ruby has been given all of it.
+        sys::shutdown_write(fd);
+        c.rx_shut = true;
+        moved = true;
+    }
+
+    let fate = match s.state() {
+        tcp::State::Closed | tcp::State::TimeWait if c.fd_eof && c.rx_shut => Fate::Close,
+        // Our FIN is acknowledged and the peer may have more to say, but
+        // nobody is left to hear it.
+        tcp::State::FinWait2 if c.app_gone => Fate::Abort,
+        _ => Fate::Keep,
+    };
+    (moved, fate)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config;
-    use std::io::Read;
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::os::fd::FromRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
     const A: &str = "10.9.0.1";
@@ -561,9 +722,11 @@ mod tests {
         }
     }
 
-    /// Carries packets between two stacks until neither has more to do.
+    /// Carries packets between two stacks until neither has more to do,
+    /// and then for as long as smoltcp may delay an ACK.
     fn settle(a: &mut Stack, b: &mut Stack) {
-        loop {
+        let mut quiet = 0;
+        while quiet < 2 {
             let mut moved = a.turn() | b.turn();
             while let Some(packet) = a.transmit() {
                 b.receive(packet);
@@ -573,15 +736,77 @@ mod tests {
                 a.receive(packet);
                 moved = true;
             }
-            if !moved {
-                return;
+            if moved {
+                quiet = 0;
+            } else {
+                quiet += 1;
+                std::thread::sleep(Duration::from_millis(12));
             }
         }
+    }
+
+    /// Takes the next connection from a listener's pair, and returns
+    /// Ruby's end of it.
+    fn accept(listener: &UnixDatagram) -> UnixStream {
+        let (mut from, mut control) = ([0u8; 64], [0u64; 4]);
+        let mut iov = libc::iovec { iov_base: from.as_mut_ptr().cast(), iov_len: from.len() };
+        let fd = unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &raw mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = std::mem::size_of_val(&control) as _;
+            assert!(libc::recvmsg(listener.as_raw_fd(), &raw mut msg, 0) > 0);
+            let header = libc::CMSG_FIRSTHDR(&raw const msg);
+            assert!(!header.is_null() && (*header).cmsg_type == libc::SCM_RIGHTS);
+            libc::CMSG_DATA(header).cast::<RawFd>().read_unaligned()
+        };
+        listener.send(&[0]).unwrap();
+        let ruby = unsafe { UnixStream::from_raw_fd(fd) };
+        ruby.set_nonblocking(true).unwrap();
+        ruby
+    }
+
+    /// Makes a connection from A to a listener on B, and returns Ruby's
+    /// end of it on each side.
+    fn connected(a: &mut Stack, b: &mut Stack) -> (UnixStream, UnixStream) {
+        let listener = listen(b, 7, 4);
+        assert_eq!(message(&listener), Some(vec![status::OK]));
+        let mut client = connect(a, B, 7);
+        settle(a, b);
+        assert_eq!(read(&mut client), (vec![status::OK], false));
+        (client, accept(&listener))
+    }
+
+    /// Returns the byte at a place in the stream that the tests send.
+    fn byte(at: usize) -> u8 {
+        (at % 251) as u8
+    }
+
+    /// Writes as much more of the stream as Ruby's end takes now, up to
+    /// `end`, and returns where it stopped.
+    fn write_from(ruby: &mut UnixStream, mut at: usize, end: usize) -> usize {
+        while at < end {
+            let chunk: Vec<u8> = (at..end.min(at + 65536)).map(byte).collect();
+            match ruby.write(&chunk) {
+                Ok(n) => at += n,
+                Err(_) => break,
+            }
+        }
+        at
     }
 
     /// Says whether an IPv4 packet is a TCP reset.
     fn is_reset(packet: &[u8]) -> bool {
         packet[9] == 6 && packet[20 + 13] & 0x04 != 0
+    }
+
+    #[test]
+    fn a_socket_has_the_settings_that_the_stack_gives() {
+        let mut a = stack(A);
+        let _ruby = connect(&mut a, B, 7);
+        let s = a.sockets.get::<tcp::Socket>(a.conns[0].handle);
+        assert!(!s.nagle_enabled());
     }
 
     #[test]
@@ -707,6 +932,83 @@ mod tests {
     }
 
     #[test]
+    fn bytes_cross_each_way_and_each_way_ends_alone() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        client.write_all(b"ping").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (b"ping".to_vec(), true));
+        // The other way is still open.
+        server.write_all(b"pong").unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut client), (b"pong".to_vec(), false));
+        server.shutdown(Shutdown::Write).unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut client), (vec![], true));
+        // The socket that owes the last ACK stays a while, and then goes.
+        std::thread::sleep(LINGER);
+        settle(&mut a, &mut b);
+        assert!(a.conns.is_empty() && b.conns.is_empty());
+    }
+
+    #[test]
+    fn a_reader_that_stops_holds_the_writer_and_loses_nothing() {
+        const END: usize = 4 << 20;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        let mut at = 0;
+        loop {
+            let before = at;
+            at = write_from(&mut client, at, END);
+            settle(&mut a, &mut b);
+            if at == before {
+                break;
+            }
+        }
+        // Nobody reads, so the two pairs and the two sockets are full.
+        assert!((2 * TCP_BUF..END).contains(&at), "the writer waits after {at} bytes");
+        let mut got = Vec::new();
+        for _ in 0..1000 {
+            at = write_from(&mut client, at, END);
+            settle(&mut a, &mut b);
+            got.extend(read(&mut server).0);
+            if got.len() == END {
+                break;
+            }
+        }
+        assert_eq!(got.len(), END);
+        assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
+    }
+
+    #[test]
+    fn an_end_closed_with_bytes_unread_resets_the_connection() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (client, mut server) = connected(&mut a, &mut b);
+        server.write_all(b"unread").unwrap();
+        settle(&mut a, &mut b);
+        drop(client);
+        settle(&mut a, &mut b);
+        // A reset reads as the end of the stream, and a write fails.
+        assert_eq!(read(&mut server), (vec![], true));
+        assert!(server.write(b"more").is_err());
+        assert!(a.conns.is_empty() && b.conns.is_empty());
+    }
+
+    #[test]
+    fn an_end_closed_with_nothing_unread_delivers_what_it_wrote() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        client.write_all(b"last words").unwrap();
+        drop(client);
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (b"last words".to_vec(), true));
+        // B acknowledged the FIN, and nobody was left on A's side to hear
+        // more, so A reset the connection.
+        assert!(a.conns.is_empty() && b.conns.is_empty());
+    }
+
+    #[test]
     fn a_syn_that_arrives_twice_makes_one_connection() {
         let (mut a, mut b) = (stack(A), stack(B));
         let _listener = listen(&mut b, 7, 4);
@@ -783,5 +1085,161 @@ mod tests {
         settle(&mut a, &mut b);
         assert_eq!(read(&mut ruby), (vec![status::OK], false));
         assert!(b.conns.len() == 1 && b.conns[0].phase == Phase::Open);
+    }
+
+    #[test]
+    fn a_quiet_connection_stays_open_until_its_peer_is_gone() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // The timers of the two sockets are made to run 150 times as fast,
+        // which gives them a timeout of two seconds.
+        for stack in [&mut a, &mut b] {
+            let s = stack.sockets.get_mut::<tcp::Socket>(stack.conns[0].handle);
+            s.set_timeout(s.timeout().map(|timeout| timeout / 150));
+            // An interval takes effect at once only when none was set.
+            let interval = s.keep_alive().map(|interval| interval / 150);
+            s.set_keep_alive(None);
+            s.set_keep_alive(interval);
+        }
+        let quiet = Instant::now();
+        while quiet.elapsed() < Duration::from_secs(3) {
+            settle(&mut a, &mut b);
+        }
+        client.write_all(b"still here").unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (b"still here".to_vec(), false));
+        // B is gone, and nothing answers what A sends.
+        let gone = Instant::now();
+        while gone.elapsed() < Duration::from_secs(3) {
+            a.turn();
+            while a.transmit().is_some() {}
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(read(&mut client), (vec![], true));
+        assert!(a.conns.is_empty());
+    }
+
+    /// smoltcp clears a socket ten seconds after both sides have ended
+    /// their streams. This test waits for that, so it runs only when
+    /// asked for, as "rake slow" asks.
+    #[test]
+    #[ignore]
+    fn what_ruby_has_not_read_outlasts_time_wait() {
+        const END: usize = 400 << 10;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // Ruby ends its writing. The peer answers with more than the pair
+        // holds, and ends too.
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut at = 0;
+        while at < END {
+            at = write_from(&mut server, at, END);
+            settle(&mut a, &mut b);
+        }
+        drop(server);
+        let ended = Instant::now();
+        while ended.elapsed() < Duration::from_secs(11) {
+            settle(&mut a, &mut b);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut got = Vec::new();
+        loop {
+            let (bytes, end) = read(&mut client);
+            got.extend(bytes);
+            if end {
+                break;
+            }
+            settle(&mut a, &mut b);
+        }
+        assert_eq!(got.len(), END);
+        assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
+    }
+
+    #[test]
+    fn a_fin_waits_for_a_peer_that_ended_first_to_take_the_data() {
+        const END: usize = 700 << 10;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        client.shutdown(Shutdown::Write).unwrap();
+        // The answer is more than the client holds unread, so its window
+        // shuts with part of the answer still to send.
+        let mut at = 0;
+        while at < END {
+            at = write_from(&mut server, at, END);
+            settle(&mut a, &mut b);
+        }
+        drop(server);
+        settle(&mut a, &mut b);
+        let s = b.sockets.get::<tcp::Socket>(b.conns[0].handle);
+        assert!(s.state() == tcp::State::CloseWait && s.send_queue() > 0, "{} with {}", s.state(), s.send_queue());
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            let (bytes, end) = read(&mut client);
+            got.extend(bytes);
+            if end {
+                break;
+            }
+            settle(&mut a, &mut b);
+        }
+        assert_eq!(got.len(), END);
+        assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
+    }
+
+    /// Shuts the window that an IPv4 TCP packet advertises, and corrects
+    /// the checksum as RFC 1624 has it.
+    fn shut_window(packet: &mut [u8]) {
+        let t = &mut packet[20..];
+        let old = u16::from_be_bytes([t[14], t[15]]);
+        let mut sum = u32::from(!u16::from_be_bytes([t[16], t[17]])) + u32::from(!old);
+        sum = (sum & 0xffff) + (sum >> 16);
+        sum = (sum & 0xffff) + (sum >> 16);
+        t[14..16].copy_from_slice(&[0, 0]);
+        t[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    }
+
+    // The test waits for smoltcp to probe a window, which takes seconds.
+    // It runs when the tests that were passed over are asked for, as
+    // "rake slow" asks.
+    #[test]
+    #[ignore]
+    fn a_fin_does_not_ride_on_the_probe_of_a_shut_window() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // What B sends says that its window is shut, though B takes what
+        // it is sent, as a peer may that takes the byte of a probe.
+        let shuttle = |a: &mut Stack, b: &mut Stack| {
+            a.turn();
+            b.turn();
+            while let Some(packet) = a.transmit() {
+                b.receive(packet);
+            }
+            while let Some(mut packet) = b.transmit() {
+                shut_window(&mut packet);
+                a.receive(packet);
+            }
+        };
+        server.write_all(b"x").unwrap();
+        for _ in 0..10 {
+            shuttle(&mut a, &mut b);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(read(&mut client).0, b"x");
+        client.write_all(b"ab").unwrap();
+        drop(client);
+        let state = |a: &Stack| a.sockets.get::<tcp::Socket>(a.conns[0].handle).state();
+        let begun = Instant::now();
+        while state(&a) != tcp::State::FinWait2 {
+            assert!(begun.elapsed() < Duration::from_secs(20), "the socket is in {}", state(&a));
+            shuttle(&mut a, &mut b);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(read(&mut server), (b"ab".to_vec(), true));
+        // Were the timer of the probe still set, smoltcp would now send an
+        // ACK at every round, and a turn would send as many as it has
+        // rounds.
+        std::thread::sleep(Duration::from_millis(1500));
+        while a.transmit().is_some() {}
+        a.turn();
+        assert!(std::iter::from_fn(|| a.transmit()).count() < 2);
     }
 }

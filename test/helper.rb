@@ -4,8 +4,15 @@ $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 require "sallyport"
 require "minitest/autorun"
 require "socket"
+require "timeout"
 
 module Helper
+  # A test that hangs fails here, and does not hold the run until CI
+  # gives it up.
+  def run
+    Timeout.timeout(60) { super }
+  end
+
   def setup
     @closers = []
   end
@@ -44,6 +51,17 @@ module Helper
     a = tunnel(private_key: a_key, addresses: ["10.9.0.1", "fd09::1"], peers: [b_is])
     b_peer = a_is.merge(endpoint: "127.0.0.1:#{a.listen_port}", **peer)
     [a, tunnel(private_key: b_key, addresses: ["10.9.0.2", "fd09::2"], peers: [b_peer])]
+  end
+
+  # Connects b to a listener on a, and returns the Socket at each end:
+  # b's first.
+  def connection(a, b, to: "10.9.0.1")
+    listener = a.listen(7)
+    client = b.connect(to, 7)
+    server = listener.accept(timeout: 5)
+    listener.close
+    @closers << -> { [client, server].each(&:close) }
+    [client, server]
   end
 
   # Waits until the block returns a true value, and returns it. Fails the

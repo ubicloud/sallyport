@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "helper"
+require "digest"
 require "rbconfig"
 
 class TestTCP < Minitest::Test
@@ -144,15 +145,86 @@ class TestTCP < Minitest::Test
     end
   end
 
-  # Nothing carries bytes yet, so all that a connection can do is end.
-  def test_a_connection_ends_when_either_side_closes_it
+  def test_bytes_cross_each_way
     a, b = pair
-    listener = a.listen(7)
-    [0, 1].each do |closer|
-      ends = [b.connect("10.9.0.1", 7), listener.accept(timeout: 5)]
-      ends[closer].close
-      assert ends[1 - closer].wait_readable(5)
-      assert_nil ends[1 - closer].read(1)
+    ["10.9.0.1", "fd09::1"].each do |to|
+      client, server = connection(a, b, to: to)
+      client.write("ping")
+      assert_equal "ping", server.readpartial(16)
+      server.write("pong")
+      assert_equal "pong", client.readpartial(16)
     end
+  end
+
+  def test_each_direction_ends_on_its_own
+    client, server = connection(*pair)
+    client.write("question")
+    client.close_write
+    assert_equal "question", server.read
+    server.write("answer")
+    server.close
+    assert_equal "answer", client.read
+  end
+
+  # The writer has more to send than the buffers along the way hold, so
+  # it must wait for the reader, and the reader must get every byte.
+  def test_a_reader_that_stops_holds_the_writer_and_loses_nothing
+    data = Random.new(1).bytes(8 << 20)
+    connection(*pair).permutation do |from, to|
+      writer = Thread.new do
+        from.write(data)
+        :written
+      end
+      sleep 0.2
+      assert writer.alive?
+      got = +""
+      got << to.readpartial(1 << 20) while got.bytesize < data.bytesize
+      assert_equal Digest::SHA256.hexdigest(data), Digest::SHA256.hexdigest(got)
+      assert_equal :written, writer.value
+    end
+  end
+
+  def test_many_connections_at_once
+    a, b = pair
+    listener = a.listen(7, backlog: 32)
+    servers = Thread.new do
+      Array.new(24) do
+        Thread.new(listener.accept(timeout: 10)) do |server|
+          server.write(server.read.upcase)
+          server.close
+        end
+      end.each(&:join)
+    end
+    clients = Array.new(24) do |i|
+      Thread.new do
+        client = b.connect("10.9.0.1", 7)
+        client.write("stream #{i} " * 2000)
+        client.close_write
+        client.read.tap { client.close }
+      end
+    end
+    clients.each_with_index { |client, i| assert_equal "STREAM #{i} " * 2000, client.value }
+    servers.join
+  end
+
+  # A Unix socket has no way to tell of a reset, so the end of the stream
+  # has to.
+  def test_closing_with_bytes_unread_resets_the_connection
+    client, server = connection(*pair)
+    server.write("unread")
+    assert client.wait_readable(5)
+    client.close
+    assert_nil server.read(1)
+    # The tunnel's thread ends the stream and then closes its end. A
+    # write may fall between the two, and the next one then finds that
+    # what it wrote was never read.
+    assert_raises(Errno::EPIPE, Errno::ECONNRESET) { loop { server.write("more") } }
+  end
+
+  def test_closing_a_tunnel_ends_its_connections
+    a, b = pair
+    _, server = connection(a, b)
+    a.close
+    assert_nil server.read(1)
   end
 end

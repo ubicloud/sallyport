@@ -30,8 +30,15 @@ pub fn send(fd: RawFd, buf: &[u8]) -> isize {
     result(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) })
 }
 
-/// Says whether the other end of a socket pair is closed. poll(2)
-/// reports a hangup whatever events it is asked about.
+/// Ends what the other end of a socket pair can read, after what was
+/// sent already.
+pub fn shutdown_write(fd: RawFd) {
+    unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+}
+
+/// Says whether poll(2) reports a hangup on an end of a socket pair,
+/// which it does whatever events it is asked about. It reports one when
+/// the other end is closed, and when each end has shut down its writing.
 pub fn hung_up(fd: RawFd) -> bool {
     let mut p = libc::pollfd { fd, events: 0, revents: 0 };
     unsafe { libc::poll(&mut p, 1, 0) };

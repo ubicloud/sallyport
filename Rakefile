@@ -12,7 +12,7 @@ task :unit do
   sh "cargo", "test", "--release", "--locked", "--manifest-path", "ext/sallyport/Cargo.toml"
 end
 
-desc "Run the unit tests that wait for a timer of WireGuard to run out"
+desc "Run the unit tests that wait for a timer of WireGuard or of TCP to run out"
 task :slow do
   sh "cargo", "test", "--release", "--locked", "--manifest-path", "ext/sallyport/Cargo.toml", "--", "--ignored"
 end
