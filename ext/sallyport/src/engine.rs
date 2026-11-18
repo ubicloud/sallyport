@@ -77,6 +77,9 @@ pub struct Knobs {
     /// `fail` has the thread panic when it is next asked to describe the
     /// tunnel. The tests use it to see what a failed tunnel does.
     pub fail: bool,
+    /// `drop=PASS:MS` makes an outage. Once PASS datagrams have arrived,
+    /// the thread drops those that arrive in the next MS milliseconds.
+    pub drop: Option<(u64, Duration)>,
 }
 
 impl Knobs {
@@ -88,6 +91,11 @@ impl Knobs {
             match name {
                 "trace" => knobs.trace = value.parse::<usize>().map_err(|_| bad())?.min(1_000_000),
                 "fail" if value.is_empty() => knobs.fail = true,
+                "drop" => {
+                    let (pass, ms) = value.split_once(':').ok_or_else(bad)?;
+                    let ms = Duration::from_millis(ms.parse().map_err(|_| bad())?);
+                    knobs.drop = Some((pass.parse().map_err(|_| bad())?, ms));
+                }
                 _ => return Err(bad()),
             }
         }
@@ -114,6 +122,8 @@ pub struct Engine {
     /// from.
     trace: VecDeque<String>,
     epoch: Instant,
+    /// When the outage that the `drop` knob makes is over.
+    drop_until: Option<Instant>,
 }
 
 impl Engine {
@@ -152,6 +162,7 @@ impl Engine {
             knobs,
             trace: VecDeque::new(),
             epoch: Instant::now(),
+            drop_until: None,
         };
         engine.publish();
         Ok((engine, shared))
@@ -183,6 +194,9 @@ impl Engine {
         for _ in 0..UDP_BATCH {
             let Ok((len, from)) = self.udp.recv_from(&mut self.buf) else { return false };
             self.datagrams += 1;
+            if self.dropping() {
+                continue;
+            }
             let from = SocketAddr::new(from.ip().to_canonical(), from.port());
             let (udp, v6) = (&self.udp, self.udp_v6);
             let packet = self.peers.receive(&self.buf[..len], from, &mut |d, to| sys::udp_send(udp, v6, d, to));
@@ -255,6 +269,16 @@ impl Engine {
         if fds[0].revents != 0 {
             sys::drain(self.shared.wake_r.as_raw_fd());
         }
+    }
+
+    /// Says whether the `drop` knob has the datagram that just arrived
+    /// dropped.
+    fn dropping(&mut self) -> bool {
+        let Some((pass, span)) = self.knobs.drop else { return false };
+        if self.datagrams <= pass {
+            return false;
+        }
+        Instant::now() < *self.drop_until.get_or_insert_with(|| Instant::now() + span)
     }
 
     /// Keeps a line for a TCP packet that went `way`, if a trace is kept.
@@ -348,9 +372,10 @@ mod tests {
     #[test]
     fn knobs_are_read_from_text() {
         assert_eq!(Knobs::parse("").unwrap(), Knobs::default());
-        assert_eq!(Knobs::parse(" trace=40 ,").unwrap(), Knobs { trace: 40, fail: false });
-        assert_eq!(Knobs::parse("fail,trace=5000000").unwrap(), Knobs { trace: 1_000_000, fail: true });
-        for bad in ["trace", "trace=x", "trace=-1", "loud", "trace=1,loud", "fail=1"] {
+        assert_eq!(Knobs::parse(" trace=40 ,").unwrap(), Knobs { trace: 40, ..Knobs::default() });
+        let all = Knobs { trace: 1_000_000, fail: true, drop: Some((1500, Duration::from_millis(30))) };
+        assert_eq!(Knobs::parse("fail,trace=5000000,drop=1500:30").unwrap(), all);
+        for bad in ["trace", "trace=x", "trace=-1", "loud", "trace=1,loud", "fail=1", "drop=5", "drop=a:b"] {
             let knob = bad.rsplit(',').next().unwrap();
             assert_eq!(Knobs::parse(bad).unwrap_err(), format!("bad debug knob {knob:?}"));
         }

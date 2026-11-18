@@ -213,6 +213,19 @@ class TestTCP < Minitest::Test
     b.close(linger: 0)
   end
 
+  # Both tunnels take the setting. The one that receives the data drops
+  # what arrives for 30 ms, part of the way through. The one that sends
+  # it gets only the ACKs, which are too few to begin its outage.
+  def test_a_transfer_gets_past_an_outage
+    data = Random.new(3).bytes(6 << 20)
+    client, server = connection(*pair(debug: "drop=1500:30"))
+    writer = Thread.new { client.write(data) }
+    got = +""
+    got << server.readpartial(1 << 20) while got.bytesize < data.bytesize
+    assert_equal Digest::SHA256.hexdigest(data), Digest::SHA256.hexdigest(got)
+    writer.join
+  end
+
   def test_each_direction_ends_on_its_own
     client, server = connection(*pair)
     client.write("question")
