@@ -6,10 +6,12 @@ use crate::config::{contains, Config, Net};
 use crate::keys::{self, Key};
 use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::handshake::parse_handshake_anon;
+use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use std::fmt::Write;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 /// A Sender is how a datagram leaves. A tunnel gives one that writes to its
 /// UDP socket, and a test gives one that keeps the datagram.
@@ -18,6 +20,12 @@ pub type Sender<'a> = &'a mut dyn FnMut(&[u8], SocketAddr);
 /// The first byte of a cookie reply, which is the one message that
 /// boringtun sends to a peer that has proved nothing.
 const COOKIE_REPLY: u8 = 3;
+/// A cookie reply is this long.
+const COOKIE_REPLY_LEN: usize = 64;
+/// A tunnel takes this many handshake messages from its peers in a
+/// second before it asks each sender for a cookie. The device that
+/// boringtun has takes as many.
+const HANDSHAKES_PER_SECOND: u64 = 100;
 
 /// The kinds of message that WireGuard has.
 #[derive(Clone, Copy, PartialEq)]
@@ -49,6 +57,10 @@ pub struct Peers {
     secret: StaticSecret,
     public: PublicKey,
     list: Vec<Peer>,
+    /// The limiter checks the MACs of a handshake message, and counts the
+    /// messages. Every session has it too, so that all of them check a
+    /// cookie against the one secret.
+    limiter: Arc<RateLimiter>,
     buf: Vec<u8>,
     pub dropped: Dropped,
 }
@@ -56,6 +68,12 @@ pub struct Peers {
 impl Peers {
     pub fn new(cfg: &Config) -> Result<Peers, String> {
         let secret = StaticSecret::from(cfg.private);
+        let public = PublicKey::from(&secret);
+        // A handshake message from a peer is counted twice, once in
+        // receive and once by its session, so the limit is twice what is
+        // meant. A message that names no peer reaches no session and is
+        // counted once, so twice as many of those are taken.
+        let limiter = Arc::new(RateLimiter::new(&public, 2 * HANDSHAKES_PER_SECOND));
         let mut list: Vec<Peer> = Vec::new();
         for (i, p) in cfg.peers.iter().enumerate() {
             if list.iter().any(|q| q.public == p.public) {
@@ -63,11 +81,12 @@ impl Peers {
             }
             // boringtun puts the index in the high 24 bits of each session
             // index that it gives this peer, and peer_of reads it back.
-            let tunn = Tunn::new(secret.clone(), PublicKey::from(p.public), p.psk, p.keepalive, i as u32, None);
+            let (theirs, limiter) = (PublicKey::from(p.public), Some(limiter.clone()));
+            let tunn = Tunn::new(secret.clone(), theirs, p.psk, p.keepalive, i as u32, limiter);
             let (allowed, keepalive) = (p.allowed.clone(), p.keepalive.is_some());
             list.push(Peer { tunn, public: p.public, allowed, endpoint: p.endpoint, keepalive });
         }
-        Ok(Peers { public: PublicKey::from(&secret), secret, list, buf: vec![0; 65536], dropped: Dropped::default() })
+        Ok(Peers { secret, public, list, limiter, buf: vec![0; 65536], dropped: Dropped::default() })
     }
 
     /// Begins a handshake with each peer that has a keepalive and a known
@@ -82,13 +101,14 @@ impl Peers {
         }
     }
 
-    /// Finds the peer that a datagram is from, and the kind of message
+    /// Finds the peer that a message is from, and the kind of message
     /// that it is. A handshake initiation names its sender by static key,
-    /// and every other message carries a session index of ours.
-    fn peer_of(&self, datagram: &[u8]) -> Option<(usize, Kind)> {
-        let (index, kind) = match Tunn::parse_incoming_packet(datagram).ok()? {
+    /// which takes a key exchange to read. Every other message carries a
+    /// session index of ours.
+    fn peer_of(&self, message: &Packet) -> Option<(usize, Kind)> {
+        let (index, kind) = match message {
             Packet::HandshakeInit(p) => {
-                let half = parse_handshake_anon(&self.secret, &self.public, &p).ok()?;
+                let half = parse_handshake_anon(&self.secret, &self.public, p).ok()?;
                 let i = self.list.iter().position(|q| q.public == half.peer_static_public)?;
                 return Some((i, Kind::Initiation));
             }
@@ -102,7 +122,21 @@ impl Peers {
     /// Takes a datagram that arrived from `from`, and returns the IP
     /// packet that it carried, if it carried one that its peer may send.
     pub fn receive(&mut self, datagram: &[u8], from: SocketAddr, send: Sender) -> Option<Vec<u8>> {
-        let Some((i, kind)) = self.peer_of(datagram) else {
+        // A handshake message is checked before a key exchange is spent
+        // on it. Its first MAC shows that the sender knows our public
+        // key. When more handshake messages arrive than a second should
+        // bring, the second MAC must show that the sender had a cookie
+        // of us at the address that it gives, and it is sent one if not.
+        let mut cookie = [0; COOKIE_REPLY_LEN];
+        let message = match self.limiter.verify_packet(Some(from.ip()), datagram, &mut cookie) {
+            Ok(message) => Some(message),
+            Err(TunnResult::WriteToNetwork(reply)) => {
+                send(reply, from);
+                None
+            }
+            Err(_) => None,
+        };
+        let Some((i, kind)) = message.and_then(|message| self.peer_of(&message)) else {
             self.dropped.unknown += 1;
             return None;
         };
@@ -187,6 +221,8 @@ impl Peers {
     /// Runs boringtun's timers, which rekey, keep alive and retry
     /// handshakes.
     pub fn tick(&mut self, send: Sender) {
+        // The limiter begins a new count once a second has passed.
+        self.limiter.reset_count();
         for peer in &mut self.list {
             let mut due = peer.tunn.update_timers(&mut self.buf);
             // boringtun gives a handshake up when it has had no answer for
@@ -360,6 +396,52 @@ mod tests {
             });
         }
         assert!(sent.iter().filter(|at| **at > 95).count() >= 2, "initiations left at {sent:?}");
+    }
+
+    #[test]
+    fn a_handshake_with_a_bad_mac_is_dropped() {
+        let (mut a, mut b) = pair();
+        let mut datagrams = sent(&mut b, &ip(B, A));
+        let good = datagrams.pop_front().unwrap();
+        // The first MAC is the 16 bytes before the last 16.
+        let mut bad = good.clone();
+        bad[good.len() - 32] ^= 1;
+        assert_eq!(a.receive(&bad, at(2), &mut |_, _| panic!("a bad MAC gets no answer")), None);
+        assert_eq!(a.dropped, Dropped { unknown: 1, refused: 0, disallowed: 0 });
+        let mut answers = 0;
+        a.receive(&good, at(2), &mut |_, _| answers += 1);
+        assert_eq!(answers, 1);
+    }
+
+    #[test]
+    fn a_flood_of_handshakes_is_asked_for_cookies() {
+        let (mut a, _) = pair();
+        // A session of B makes the initiations, each newer than the last.
+        let theirs = PublicKey::from(keys::public(&[1; 32]));
+        let mut b = Tunn::new(StaticSecret::from([2; 32]), theirs, None, None, 0, None);
+        let mut buf = [0; 256];
+        let mut answer = |a: &mut Peers, b: &mut Tunn| {
+            let TunnResult::WriteToNetwork(initiation) = b.format_handshake_initiation(&mut buf, true) else {
+                panic!("no initiation");
+            };
+            let mut answer = Vec::new();
+            a.receive(initiation, at(2), &mut |d, _| answer = d.to_vec());
+            answer
+        };
+        for _ in 0..HANDSHAKES_PER_SECOND {
+            assert_eq!(answer(&mut a, &mut b)[0], 2, "a response");
+        }
+        let reply = answer(&mut a, &mut b);
+        assert_eq!(reply[0], COOKIE_REPLY);
+        // B takes the cookie, and its next initiation carries the MAC
+        // that the cookie makes.
+        assert!(matches!(b.decapsulate(None, &reply, &mut [0; 256]), TunnResult::Done));
+        assert_eq!(answer(&mut a, &mut b)[0], 2);
+        // A second later A counts afresh.
+        std::thread::sleep(std::time::Duration::from_millis(1001));
+        a.tick(&mut |_, _| ());
+        let mut fresh = Tunn::new(StaticSecret::from([2; 32]), theirs, None, None, 0, None);
+        assert_eq!(answer(&mut a, &mut fresh)[0], 2);
     }
 
     #[test]
