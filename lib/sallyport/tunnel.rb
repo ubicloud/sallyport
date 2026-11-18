@@ -171,6 +171,16 @@ module Sallyport
       @holder.empty?
     end
 
+    # Returns how many connections the tunnel has: those that it is
+    # making, and those that are made and have not ended. A connection
+    # that a peer makes to a listener counts once its handshake is done.
+    # One that was closed on this side counts until the peer has all that
+    # was written to it and has ended its own stream too, or until it is
+    # reset.
+    def connections
+      synchronize { Native::CONNECTIONS.call(handle) }
+    end
+
     # Returns a Peer for each peer, in the order of the configuration.
     # What it says is a quarter of a second old at most.
     def peers

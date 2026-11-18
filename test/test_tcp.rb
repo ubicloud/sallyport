@@ -159,6 +159,19 @@ class TestTCP < Minitest::Test
     end
   end
 
+  def test_a_tunnel_counts_its_connections
+    a, b = pair
+    assert_equal [0, 0], [a, b].map(&:connections)
+    ends = connection(a, b)
+    eventually { [a, b].map(&:connections) == [1, 1] }
+    ends.each(&:close)
+    eventually { [a, b].map(&:connections) == [0, 0] }
+    # An attempt counts while it lasts. Nothing listens here for the SYN
+    # to find, and the peer's answer ends the attempt.
+    assert_raises(Errno::ECONNREFUSED) { b.connect("10.9.0.1", 8) }
+    eventually { b.connections.zero? }
+  end
+
   def test_each_direction_ends_on_its_own
     client, server = connection(*pair)
     client.write("question")

@@ -434,6 +434,12 @@ impl Stack {
         });
     }
 
+    /// Returns how many connections there are: those that the stack is
+    /// making, and those that are made and have not ended.
+    pub fn connections(&self) -> usize {
+        self.conns.iter().filter(|c| !matches!(c.phase, Phase::Listening | Phase::Dead(_))).count()
+    }
+
     /// Has every socket send what it has to send.
     pub fn poll(&mut self) {
         let now = self.now();

@@ -35,6 +35,7 @@ module Sallyport
     CLOSE = bind("sp_close", [P, I], Fiddle::TYPE_VOID, waits: true)
     CONNECT = bind("sp_connect", [P, P, I], I)
     LISTEN = bind("sp_listen", [P, I, I], I)
+    CONNECTIONS = bind("sp_connections", [P], Z)
     PORT = bind("sp_port", [P], I)
     STATS = bind("sp_stats", [P, P, Z], Z)
     PRIVATE_KEY = bind("sp_private_key", [P], I)

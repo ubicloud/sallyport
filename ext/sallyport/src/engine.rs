@@ -7,7 +7,7 @@ use crate::sys;
 use crate::tcp::{status, Stack};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,8 @@ pub struct Shared {
     /// The state of the peers as Peers::stats writes it, and as it was
     /// when the timers last ran.
     pub stats: Mutex<String>,
+    /// How many connections the stack had when the loop last turned.
+    pub connections: AtomicUsize,
 }
 
 impl Shared {
@@ -80,6 +82,7 @@ impl Engine {
             stop: AtomicBool::new(false),
             linger: AtomicU32::new(0),
             stats: Mutex::default(),
+            connections: AtomicUsize::new(0),
         });
         let engine = Engine {
             shared: shared.clone(),
@@ -165,6 +168,7 @@ impl Engine {
         }
         let moved = self.stack.turn();
         self.flush();
+        self.shared.connections.store(self.stack.connections(), Ordering::Relaxed);
 
         let mut wait = self.next_tick.saturating_duration_since(Instant::now()).min(most);
         if let Some(delay) = self.stack.poll_delay() {

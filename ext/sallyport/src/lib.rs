@@ -207,6 +207,17 @@ pub unsafe extern "C" fn sp_listen(h: *mut c_void, port: c_int, backlog: c_int) 
     })
 }
 
+/// Returns how many connections the tunnel has: those that it is making,
+/// and those that are made and have not ended.
+///
+/// # Safety
+/// `h` came from sp_open.
+#[no_mangle]
+pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> usize {
+    let h = &*h.cast::<Handle>();
+    h.shared.connections.load(Ordering::Relaxed)
+}
+
 /// Returns the tunnel's UDP port.
 ///
 /// # Safety
