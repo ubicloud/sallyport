@@ -12,6 +12,43 @@ use crate::sock::Moved;
 use crate::sys;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
+// The module "pair" is this contract as the model "conn" has it. The
+// lines of the module are here and beside the calls below.
+//
+// TLA-pair> \* This is a connection's socket pair as the kernel keeps it, with what
+// TLA-pair> \* Ruby may do with its end. A state of the pair is a record with these
+// TLA-pair> \* fields.
+// TLA-pair> \*   fromRuby  the bytes that Ruby wrote and the stack has not read
+// TLA-pair> \*   forRuby   the bytes that the stack wrote and Ruby has not read
+// TLA-pair> \*   fromShut  no more goes from Ruby to the stack, because Ruby has shut
+// TLA-pair> \*             down its writing or the stack its reading
+// TLA-pair> \*   forShut   no more goes from the stack to Ruby
+// TLA-pair> \*   gone      Ruby's end is not closed ("no"), is being closed ("going")
+// TLA-pair> \*             or is closed ("yes")
+// TLA-pair> \*   err       Ruby closed its end with bytes unread, and the stack has yet
+// TLA-pair> \*             to be told
+// TLA-pair> \*   quota     the bytes that Ruby may still write
+// TLA-pair> EXTENDS Naturals
+// TLA-pair> CONSTANTS PairCap, Budget
+// TLA-pair> When(cond, x) == IF cond THEN {x} ELSE {}
+// TLA-pair> New == [fromRuby |-> 0, forRuby |-> 0, fromShut |-> FALSE, forShut |-> FALSE,
+// TLA-pair>         gone |-> "no", err |-> FALSE, quota |-> Budget]
+// TLA-pair> \* Ruby may write, read, shut down either way and close, in any order and
+// TLA-pair> \* at any time. Each of these is the set of the states that a move of
+// TLA-pair> \* Ruby leads to, and it is empty when Ruby cannot make the move.
+// TLA-pair> Writes(p) == When(p.gone = "no" /\ ~p.fromShut /\ p.fromRuby < PairCap /\ p.quota > 0,
+// TLA-pair>                   [p EXCEPT !.fromRuby = @ + 1, !.quota = @ - 1])
+// TLA-pair> Reads(p) == When(p.gone = "no" /\ p.forRuby > 0, [p EXCEPT !.forRuby = @ - 1])
+// TLA-pair> Shuts(p) == When(p.gone = "no" /\ ~p.fromShut, [p EXCEPT !.fromShut = TRUE])
+// TLA-pair>        \cup When(p.gone = "no" /\ ~p.forShut, [p EXCEPT !.forShut = TRUE])
+// TLA-pair> \* Linux closes an end in two steps. It first shuts that end down, and a
+// TLA-pair> \* write to the other end fails from then on. It then tells the other end:
+// TLA-pair> \* poll reports the hangup, and the error if bytes were left unread.
+// TLA-pair> Closes(p) == When(p.gone = "no", [p EXCEPT !.gone = "going"])
+// TLA-pair>         \cup When(p.gone = "going", [p EXCEPT !.gone = "yes", !.fromShut = TRUE, !.forShut = TRUE,
+// TLA-pair>                                               !.err = p.forRuby > 0, !.forRuby = 0])
+// TLA-pair> Ruby(p) == Writes(p) \cup Reads(p) \cup Shuts(p) \cup Closes(p)
+
 /// What a read of our end found.
 #[derive(Debug, PartialEq)]
 pub enum Took {
@@ -81,6 +118,12 @@ impl Pair {
         Pair { fd, done: false, deaf: false, told: false }
     }
 
+    // TLA-pair> \* Pair::read says one of these, and takes bytes if there are some. It
+    // TLA-pair> \* tells once of bytes that Ruby left unread.
+    // TLA-pair> Read(p) == IF p.fromRuby > 0 THEN "bytes" ELSE IF p.err THEN "reset"
+    // TLA-pair>            ELSE IF p.fromShut THEN "end" ELSE "nothing"
+    // TLA-pair> Took(p, n) == [p EXCEPT !.fromRuby = @ - n]
+    // TLA-pair> Heard(p) == [p EXCEPT !.err = FALSE]
     /// Reads bytes that Ruby wrote, the oldest first. A read that finds
     /// none says why. It tells once of bytes that Ruby left unread when it
     /// closed its end. After that it gives the end, if Ruby has closed its
@@ -104,6 +147,8 @@ impl Pair {
         self.done
     }
 
+    // TLA-pair> \* Pair::stop
+    // TLA-pair> Stop(p) == [p EXCEPT !.fromShut = TRUE]
     /// Ends what Ruby may write: a write by Ruby fails from now on. Ruby
     /// can still read what it is given
     /// (`a_pair_whose_reading_we_stop_refuses_what_ruby_writes`).
@@ -112,6 +157,10 @@ impl Pair {
         self.done = true;
     }
 
+    // TLA-pair> \* Pair::write says one of these, and gives bytes if the pair takes them.
+    // TLA-pair> Write(p) == IF p.forShut \/ p.gone # "no" THEN "refused"
+    // TLA-pair>             ELSE IF p.forRuby < PairCap THEN "bytes" ELSE "full"
+    // TLA-pair> Gave(p, n) == [p EXCEPT !.forRuby = @ + n]
     /// Writes bytes for Ruby. The pair refuses them once Ruby has closed
     /// its end or shut down its reading, and from then on
     /// (`a_write_is_refused_once_ruby_reads_no_more`). While Ruby closes
@@ -134,6 +183,8 @@ impl Pair {
         self.deaf
     }
 
+    // TLA-pair> \* Pair::end
+    // TLA-pair> End(p) == [p EXCEPT !.forShut = TRUE]
     /// Ends what Ruby reads, after the bytes that were written already
     /// (`ruby_reads_the_end_after_what_it_was_given`).
     pub fn end(&mut self) {
@@ -146,6 +197,8 @@ impl Pair {
         self.told
     }
 
+    // TLA-pair> \* Pair::shut
+    // TLA-pair> Shut(p) == [p EXCEPT !.fromShut = TRUE, !.forShut = TRUE]
     /// Shuts our end down both ways. To our end, the pair is then what a
     /// pair is whose other end Ruby has closed: a read gives what Ruby had
     /// written and then the end, a write is refused, and poll reports a
@@ -155,6 +208,10 @@ impl Pair {
         sys::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR);
     }
 
+    // TLA-pair> \* Pair::hangup. poll reports a hangup when no more can go either way,
+    // TLA-pair> \* and it tells of bytes that Ruby left unread until a read has.
+    // TLA-pair> HungUp(p) == p.fromShut /\ p.forShut
+    // TLA-pair> Unread(p) == p.err
     /// Says what poll reports of our end. It reports a hangup when no
     /// more can go either way: Ruby has closed its end, or each way is
     /// shut down, by either end. It reports no hangup for a Ruby that has
@@ -176,6 +233,11 @@ impl Pair {
         sys::send(self.fd.as_raw_fd(), &[status]);
     }
 
+    // TLA-pair> \* poll reports that there is something to read when a read would not say
+    // TLA-pair> \* "nothing". It reports room for a write later than a write would find
+    // TLA-pair> \* it, and it does not report a pair that would refuse a write.
+    // TLA-pair> Readable(p) == p.fromRuby > 0 \/ p.fromShut
+    // TLA-pair> Writable(p) == 4 * p.forRuby <= PairCap
     /// Returns our end as poll takes it. poll reports that there is
     /// something to read when a read would give bytes or the end. It
     /// reports room for a write later than a write would find it: only

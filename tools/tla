@@ -26,6 +26,12 @@
 #                       that the model can find the fault. It must violate
 #                       P, and nothing else is checked of it. A variant
 #                       can also have no constant to change.
+#   TLA-NAME.cfg/V> KEYWORD TEXT
+#                       A line of a variant that begins with a keyword of
+#                       TLC's configuration is a statement. It takes the
+#                       place of the model's statement of that kind. A
+#                       large variant can so leave out the properties
+#                       that TLC takes long to check.
 #
 # A module that has no configuration is not checked alone. Another model
 # has to name it, as "INSTANCE NAME", and is checked with it.
@@ -61,7 +67,7 @@ KEYWORDS = %w[SPECIFICATION INIT NEXT CONSTANT CONSTANTS INVARIANT INVARIANTS PR
 CHECKS = %w[INVARIANT INVARIANTS PROPERTY PROPERTIES].freeze
 
 Model = Struct.new(:name, :lines, :cfg, :variants)
-Variant = Struct.new(:name, :fails, :changes)
+Variant = Struct.new(:name, :fails, :changes, :statements)
 
 # Reads every pragma of the sources. A line that is nearly a pragma stops
 # the tool, since a model that has lost a line may still pass, and it
@@ -78,9 +84,12 @@ def gather
 
       model, text = models[pragma[:model]], pragma[:text].to_s
       if pragma[:variant]
-        variant = (model.variants[pragma[:variant]] ||= Variant.new(pragma[:variant], pragma[:fails], []))
+        variant = (model.variants[pragma[:variant]] ||= Variant.new(pragma[:variant], pragma[:fails], [], []))
         abort "#{here}: the variant #{variant.name} is said to fail in two ways" unless variant.fails == pragma[:fails]
         next if text.strip.empty?
+
+        keyword, rest = text.strip.split(/\s+/, 2)
+        next variant.statements << [keyword, [rest.to_s]] if KEYWORDS.include?(keyword)
 
         change = text.match(/\A\s*(\w+)\s*=\s*(\S.*?)\s*\z/) or abort "#{here}: a variant changes a constant, as in N = 2"
         # A second change on the line would be taken for part of the value.
@@ -134,6 +143,12 @@ def vary(model, variant)
     abort "#{model.name}/#{variant.name}: the configuration has no constant #{constant}" unless line
     line.replace("#{constant} = #{value}")
   end
+  # INVARIANT and INVARIANTS are one kind of statement, and so on.
+  kind = ->(keyword) { keyword.sub(/(?:IES|Y|S)\z/, "") }
+  variant.statements.each do |statement|
+    all.reject! { |keyword, _| kind.(keyword) == kind.(statement[0]) }
+    all << statement
+  end
   return all unless variant.fails
 
   # The property is checked as the model's configuration checks it, and
@@ -179,9 +194,12 @@ def tlc(dir, model, variant, statements)
   name = label.tr("/", ".")
   states = File.join(dir, "states", name)
   FileUtils.rm_rf(states)
+  # TLC is told to check what happens in the end once, when it has every
+  # state. It otherwise checks that again and again as the states grow,
+  # which takes most of its time.
   command = ["java", "-XX:+UseParallelGC", *ENV.fetch("JAVA_OPTS", "").split, "-cp", jar, "tlc2.TLC",
-             "-config", "#{name}.cfg", "-metadir", states, "-workers", "auto", *ENV.fetch("TLC_OPTS", "").split,
-             "#{model.name}.tla"]
+             "-config", "#{name}.cfg", "-metadir", states, "-workers", "auto", "-lncheck", "final",
+             *ENV.fetch("TLC_OPTS", "").split, "#{model.name}.tla"]
   log = File.join(dir, "#{name}.log")
   passed = system(*command, chdir: dir, out: log, err: %i[child out])
   text = File.read(log)

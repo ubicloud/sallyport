@@ -138,20 +138,24 @@ tunnels makes.
 
 ## Models
 
-Three parts of the library are easier to get wrong than to test, and
-each has a TLA+ model. The model `wake` is of what a tunnel's thread
-shares with the threads that call the library: how a call reaches the
-thread, how a caller is answered, and how the thread and its handle end.
-The model `birth` is of a connection before it is open: how Ruby is
-answered when it makes one, and how it is handed one that a peer made.
-The model `conn` is of a connection that is open: how bytes move between
-Ruby's descriptor and the TCP socket, what `poll` is asked about the
-descriptor, and how the connection ends.
+Two parts of the library are easier to get wrong than to test, and each
+has a TLA+ model. The model `wake` is of what a tunnel's thread shares
+with the threads that call the library: how a call reaches the thread,
+how a caller is answered, and how the thread and its handle end. The
+model `conn` is of one connection for the whole of its life: how Ruby is
+answered when it makes one, and how it is handed one that a peer made,
+how bytes move between Ruby's descriptor and the TCP socket, what `poll`
+is asked about the descriptor, and how the connection ends.
 
-One more module, `stream`, is what a connection promises to Ruby and to
-the peer, with no word of sockets or descriptors: no byte is lost while
-someone may read it, and a stream ends once, after its last byte. TLC
-checks that every step of `conn` is a step that `stream` allows.
+`conn` stands on three more modules. `stream` is what a connection
+promises to Ruby and to the peer, with no word of sockets or
+descriptors: no byte is lost unless the connection is cut, a stream ends
+once, after its last byte, and a connection is cut only for a cause.
+`pair` is what the library takes for granted of the kernel's socket
+pair, and `sock` is what it takes for granted of smoltcp's socket. Tests
+hold the kernel and smoltcp to those two. TLC checks that `conn` then
+keeps the promise, whatever Ruby and the peer do, and with Ruby free to
+act between any two system calls that the library makes on the pair.
 
 A model is written in the source, as comments beside the code that each
 line describes:
