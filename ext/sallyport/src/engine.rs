@@ -90,6 +90,8 @@ impl Engine {
     }
 
     pub fn run(mut self) {
+        let (udp, v6) = (&self.udp, self.udp_v6);
+        self.peers.start(&mut |d, to| sys::udp_send(udp, v6, d, to));
         while !self.shared.stop.load(Ordering::Acquire) {
             let more = self.udp_in();
             if Instant::now() >= self.next_tick {

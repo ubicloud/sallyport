@@ -44,10 +44,10 @@ class TestTunnel < Minitest::Test
     assert_raises(IOError) { t.peers }
   end
 
-  # b's keepalive has it shake hands with a, which was not told where b
-  # is and learns it from the handshake.
+  # b's keepalive has it shake hands with a at once. a was not told where
+  # b is, and learns it from the handshake.
   def test_two_tunnels_shake_hands
-    a, b = pair(persistent_keepalive: 1)
+    a, b = pair(persistent_keepalive: 25)
     assert_nil a.peers.first.endpoint
     eventually { a.peers.first.alive? && b.peers.first.alive? }
     assert_equal "127.0.0.1:#{b.listen_port}", a.peers.first.endpoint

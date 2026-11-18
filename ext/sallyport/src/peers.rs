@@ -32,6 +32,7 @@ struct Peer {
     public: Key,
     allowed: Vec<Net>,
     endpoint: Option<SocketAddr>,
+    keepalive: bool,
 }
 
 /// Dropped counts the datagrams that named no peer, those that boringtun
@@ -62,9 +63,22 @@ impl Peers {
             // boringtun puts the index in the high 24 bits of each session
             // index that it gives this peer, and peer_of reads it back.
             let tunn = Tunn::new(secret.clone(), PublicKey::from(p.public), p.psk, p.keepalive, i as u32, None);
-            list.push(Peer { tunn, public: p.public, allowed: p.allowed.clone(), endpoint: p.endpoint });
+            let (allowed, keepalive) = (p.allowed.clone(), p.keepalive.is_some());
+            list.push(Peer { tunn, public: p.public, allowed, endpoint: p.endpoint, keepalive });
         }
         Ok(Peers { public: PublicKey::from(&secret), secret, list, buf: vec![0; 65536], dropped: Dropped::default() })
+    }
+
+    /// Begins a handshake with each peer that has a keepalive and a known
+    /// endpoint, as the kernel's WireGuard does when an interface comes
+    /// up. boringtun would begin when the first keepalive fell due.
+    pub fn start(&mut self, send: Sender) {
+        for peer in self.list.iter_mut().filter(|peer| peer.keepalive) {
+            let Some(to) = peer.endpoint else { continue };
+            if let TunnResult::WriteToNetwork(b) = peer.tunn.format_handshake_initiation(&mut self.buf, false) {
+                send(b, to);
+            }
+        }
     }
 
     /// Finds the peer that a datagram is from, and the kind of message
@@ -213,11 +227,19 @@ mod tests {
     /// Builds the peers of two tunnels, A and B, each of which has the
     /// other for its only peer. Only B is told where the other is.
     fn pair() -> (Peers, Peers) {
+        pair_with("")
+    }
+
+    /// Builds the pair with another line in what each is told of its peer.
+    fn pair_with(line: &str) -> (Peers, Peers) {
         let ((ka, pa), (kb, pb)) = (key(1), key(2));
-        let a = format!("[Interface]\nPrivateKey = {ka}\nAddress = {A}\n[Peer]\nPublicKey = {pb}\nAllowedIPs = {B}/32");
+        let a = format!(
+            "[Interface]\nPrivateKey = {ka}\nAddress = {A}\n\
+             [Peer]\nPublicKey = {pb}\nAllowedIPs = {B}/32\n{line}"
+        );
         let b = format!(
             "[Interface]\nPrivateKey = {kb}\nAddress = {B}\n\
-             [Peer]\nPublicKey = {pa}\nAllowedIPs = {A}/32\nEndpoint = 192.0.2.1:1"
+             [Peer]\nPublicKey = {pa}\nAllowedIPs = {A}/32\nEndpoint = 192.0.2.1:1\n{line}"
         );
         (Peers::new(&config::parse(&a).unwrap()).unwrap(), Peers::new(&config::parse(&b).unwrap()).unwrap())
     }
@@ -288,6 +310,27 @@ mod tests {
         let mut datagrams = sent(&mut b, &ip(B, A));
         settle(&mut a, &mut b, &mut datagrams, 7);
         assert_eq!(a.list[0].endpoint, Some(at(7)));
+    }
+
+    #[test]
+    fn a_peer_with_a_keepalive_is_greeted_at_once() {
+        let (mut a, mut b) = pair_with("PersistentKeepalive = 25");
+        a.start(&mut |_, _| panic!("A does not know where B is"));
+        let mut datagrams = VecDeque::new();
+        b.start(&mut |d, to| {
+            assert_eq!(to, at(1));
+            datagrams.push_back(d.to_vec());
+        });
+        let (_, _, types) = settle(&mut a, &mut b, &mut datagrams, 2);
+        assert_eq!(types, [1, 2, 4], "an initiation, its response, and a keepalive that confirms the session");
+        // A now knows where B is, and has a session to send in.
+        let back = ip(A, B);
+        let mut datagrams = sent(&mut a, &back);
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(b.receive(&datagrams.pop_front().unwrap(), at(1), &mut |_, _| ()), Some(back));
+
+        let (_, mut b) = pair();
+        b.start(&mut |_, _| panic!("B has no keepalive"));
     }
 
     #[test]
