@@ -1,6 +1,9 @@
 //! sallyport: WireGuard and TCP in user space, behind a C ABI small
 //! enough to bind by hand.
 
+// Only the tests call this module until a tunnel reads its configuration.
+#[allow(dead_code)]
+mod config;
 mod keys;
 mod sys;
 
