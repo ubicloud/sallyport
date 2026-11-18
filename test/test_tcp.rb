@@ -2,6 +2,7 @@
 
 require_relative "helper"
 require "digest"
+require "openssl"
 require "rbconfig"
 
 class TestTCP < Minitest::Test
@@ -224,6 +225,49 @@ class TestTCP < Minitest::Test
     got << server.readpartial(1 << 20) while got.bytesize < data.bytesize
     assert_equal Digest::SHA256.hexdigest(data), Digest::SHA256.hexdigest(got)
     writer.join
+  end
+
+  def test_a_socket_answers_for_its_tcp_connection
+    client, server = connection(*pair)
+    assert_equal ["AF_INET", 7, "10.9.0.1", "10.9.0.1"], client.peeraddr
+    assert_equal "10.9.0.2", Addrinfo.new(server.getpeername).ip_address
+    assert_equal 0, client.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, 1)
+    assert_equal 0, client.setsockopt(::Socket::Option.bool(:INET, :TCP, :NODELAY, true))
+    assert_equal 0, client.setsockopt(:SOCKET, :SNDBUF, 1 << 16)
+    assert_equal 0, client.setsockopt(::Socket::Option.int(:UNIX, :SOCKET, :SNDBUF, 1 << 16))
+    refute_respond_to client, :send_io
+    assert_raises(NoMethodError) { Sallyport::Socket.pair }
+    assert_raises(NoMethodError) { Sallyport::Socket.for_fd(client.fileno) }
+    assert_match(/\A#<Sallyport::Socket 10\.9\.0\.1:7 fd=\d+>\z/, client.inspect)
+  end
+
+  # OpenSSL takes the descriptor and does its own reading and writing.
+  def test_tls_runs_on_a_socket
+    key = OpenSSL::PKey::EC.generate("prime256v1")
+    name = OpenSSL::X509::Name.parse("/CN=10.9.0.1")
+    cert = OpenSSL::X509::Certificate.new
+    cert.version, cert.serial, cert.subject, cert.issuer, cert.public_key = 2, 1, name, name, key
+    cert.not_before, cert.not_after = Time.now - 60, Time.now + 600
+    cert.add_extension(OpenSSL::X509::ExtensionFactory.new(cert, cert).create_extension("subjectAltName", "IP:10.9.0.1"))
+    cert.sign(key, "SHA256")
+    client, server = connection(*pair)
+    served = Thread.new do
+      context = OpenSSL::SSL::SSLContext.new
+      context.cert, context.key = cert, key
+      tls = OpenSSL::SSL::SSLSocket.new(server, context).accept
+      tls.write(tls.readpartial(64).upcase)
+      tls.close
+    end
+    context = OpenSSL::SSL::SSLContext.new
+    context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+    context.cert_store = OpenSSL::X509::Store.new.add_cert(cert)
+    tls = OpenSSL::SSL::SSLSocket.new(client, context).connect
+    tls.post_connection_check("10.9.0.1")
+    assert_equal ["AF_INET", 7, "10.9.0.1", "10.9.0.1"], tls.peeraddr
+    tls.write("over tls")
+    assert_equal "OVER TLS", tls.read
+    assert_match(/\ATLSv1\.[23]\z/, tls.ssl_version)
+    served.join
   end
 
   def test_each_direction_ends_on_its_own
