@@ -23,6 +23,7 @@ const UDP_BATCH: usize = 1024;
 /// dropped.
 pub enum Cmd {
     Connect { fd: OwnedFd, addr: IpAddr, port: u16 },
+    Listen { fd: OwnedFd, port: u16, backlog: usize },
 }
 
 /// A tunnel's thread shares this with its handle.
@@ -103,6 +104,7 @@ impl Engine {
             match cmd {
                 Cmd::Connect { fd, addr, port } if self.peers.reaches(&addr) => self.stack.connect(fd, addr, port),
                 Cmd::Connect { fd, .. } => Stack::refuse(fd, status::NO_ROUTE),
+                Cmd::Listen { fd, port, backlog } => self.stack.listen(fd, port, backlog),
             }
         }
     }

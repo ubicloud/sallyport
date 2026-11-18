@@ -38,6 +38,14 @@ pub fn hung_up(fd: RawFd) -> bool {
     p.revents & (libc::POLLHUP | libc::POLLERR) != 0
 }
 
+/// Says whether the other end of a socket pair will send no more: it is
+/// closed, or it has shut down its writing.
+pub fn ended(fd: RawFd) -> bool {
+    let mut p = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
+    unsafe { libc::poll(&mut p, 1, 0) };
+    p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP) != 0
+}
+
 /// Waits until a descriptor is ready or the time has passed, for a second
 /// at most.
 pub fn poll(fds: &mut [libc::pollfd], wait: Duration) {
@@ -69,16 +77,52 @@ pub fn drain(fd: RawFd) {
     while read(fd, &mut buf) > 0 {}
 }
 
-/// Makes a Unix socket pair for a connection. Returns our end, which
-/// does not block, and Ruby's end.
-pub fn socketpair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+/// Makes a Unix socket pair of a kind: SOCK_STREAM for a connection, or
+/// SOCK_SEQPACKET for a listener, whose messages must stay apart. Returns
+/// our end, which does not block, and Ruby's end.
+pub fn socketpair(kind: libc::c_int) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut ends = [0 as RawFd; 2];
-    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
-    if unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, ends.as_mut_ptr()) } != 0 {
+    if unsafe { libc::socketpair(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC, 0, ends.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     unsafe { libc::fcntl(ends[0], libc::F_SETFL, libc::O_NONBLOCK) };
     Ok(unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) })
+}
+
+/// What became of a message that send_fd was given.
+pub enum Sent {
+    Ok,
+    /// The socket's buffer has no room for it.
+    Full,
+    /// The other end is closed.
+    Gone,
+}
+
+/// Sends a message on a socket without waiting, and a descriptor with it
+/// (SCM_RIGHTS).
+pub fn send_fd(socket: RawFd, message: &[u8], fd: RawFd) -> Sent {
+    // The buffer is of u64 so that it is aligned for a cmsghdr, and it is
+    // longer than CMSG_SPACE(4).
+    let mut control = [0u64; 4];
+    let mut iov = libc::iovec { iov_base: message.as_ptr() as *mut libc::c_void, iov_len: message.len() };
+    let sent = unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
+        let header = libc::CMSG_FIRSTHDR(&raw const msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(4) as _;
+        libc::CMSG_DATA(header).cast::<RawFd>().write_unaligned(fd);
+        libc::sendmsg(socket, &raw const msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT)
+    };
+    match result(sent) {
+        AGAIN => Sent::Full,
+        n if n >= 0 => Sent::Ok,
+        _ => Sent::Gone,
+    }
 }
 
 /// Makes a UDP socket that does not block, bound to the port, or to any

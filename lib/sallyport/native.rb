@@ -34,18 +34,21 @@ module Sallyport
     OPEN = bind("sp_open", [P, P, Z], P, waits: true)
     CLOSE = bind("sp_close", [P], Fiddle::TYPE_VOID, waits: true)
     CONNECT = bind("sp_connect", [P, P, I], I)
+    LISTEN = bind("sp_listen", [P, I, I], I)
     PORT = bind("sp_port", [P], I)
     STATS = bind("sp_stats", [P, P, Z], Z)
     PRIVATE_KEY = bind("sp_private_key", [P], I)
     PUBLIC_KEY = bind("sp_public_key", [P, P], I)
 
-    # The first byte of a connection's stream is 0 once the connection is
-    # established, or it tells why none was, as one of these.
+    # The tunnel's thread first sends a status on the pair of a connection
+    # or of a listener. It is 0 if the connection is established or the
+    # port is listened on, and otherwise it is one of these.
     STATUS = {
       1 => Errno::ECONNREFUSED,
       2 => Errno::ETIMEDOUT,
       3 => Errno::ENETUNREACH,
-      4 => Errno::EADDRNOTAVAIL
+      4 => Errno::EADDRNOTAVAIL,
+      5 => Errno::EADDRINUSE
     }.freeze
 
     unless VERSION.call.to_s == Sallyport::VERSION

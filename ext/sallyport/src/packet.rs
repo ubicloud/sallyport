@@ -25,6 +25,7 @@ fn tcp(p: &[u8]) -> Option<&[u8]> {
 }
 
 const SYN: u8 = 0x02;
+const RST: u8 = 0x04;
 const ACK: u8 = 0x10;
 
 /// Returns the source and the destination address of an IP packet.
@@ -44,6 +45,11 @@ pub fn syn(p: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
     let (from, to) = addrs(p)?;
     let port = |at: usize| u16::from_be_bytes([t[at], t[at + 1]]);
     (t[13] & (SYN | ACK) == SYN).then(|| (SocketAddr::new(from, port(0)), SocketAddr::new(to, port(2))))
+}
+
+/// Says whether a packet resets a TCP connection.
+pub fn rst(p: &[u8]) -> bool {
+    tcp(p).is_some_and(|t| t[13] & RST != 0)
 }
 
 #[cfg(test)]
@@ -91,6 +97,17 @@ mod tests {
             assert_eq!(syn(&packet(version, SYN | ACK, &MSS, &[])), None);
             assert_eq!(syn(&packet(version, ACK, &[], b"data")), None);
         }
+    }
+
+    #[test]
+    fn a_reset_is_told_from_other_packets() {
+        for version in [4, 6] {
+            assert!(rst(&packet(version, RST | ACK, &[], &[])));
+            assert!(rst(&packet(version, RST, &[], &[])));
+            assert!(!rst(&packet(version, SYN, &MSS, &[])));
+            assert!(!rst(&packet(version, ACK, &[], b"data")));
+        }
+        assert!(!rst(&[]));
     }
 
     #[test]

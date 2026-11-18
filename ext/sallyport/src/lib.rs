@@ -9,8 +9,6 @@
 mod config;
 mod engine;
 mod keys;
-// Nothing calls this module yet but its tests.
-#[allow(dead_code)]
 mod packet;
 mod peers;
 mod sys;
@@ -25,6 +23,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+/// A listener's backlog is no more than this. A listener's pair holds
+/// that many messages each way with room to spare, so neither side waits
+/// to send one.
+const MAX_BACKLOG: c_int = 128;
+
 pub struct Handle {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -38,8 +41,8 @@ impl Handle {
     /// it for the tunnel's thread, and returns Ruby's end. An error is an
     /// errno, which is ENETDOWN if the thread has ended and the system's
     /// error if the system refused the pair.
-    fn pair(&self, cmd: impl FnOnce(OwnedFd) -> Cmd) -> Result<RawFd, c_int> {
-        let (ours, theirs) = sys::socketpair().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    fn pair(&self, kind: c_int, cmd: impl FnOnce(OwnedFd) -> Cmd) -> Result<RawFd, c_int> {
+        let (ours, theirs) = sys::socketpair(kind).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
         let mut cmds = self.shared.cmds.lock().unwrap_or_else(|e| e.into_inner());
         if self.shared.dead.load(Ordering::Acquire) {
             return Err(libc::ENETDOWN);
@@ -160,8 +163,38 @@ pub unsafe extern "C" fn sp_connect(h: *mut c_void, addr: *const c_char, port: c
     let addr = text(addr).and_then(|addr| addr.parse::<IpAddr>().ok());
     let port = u16::try_from(port).ok().filter(|port| *port != 0);
     let begun = match (addr, port) {
-        (Some(addr), Some(port)) => h.pair(|fd| Cmd::Connect { fd, addr, port }),
+        (Some(addr), Some(port)) => h.pair(libc::SOCK_STREAM, |fd| Cmd::Connect { fd, addr, port }),
         _ => Err(libc::EINVAL),
+    };
+    begun.unwrap_or_else(|errno| {
+        *libc::__errno_location() = errno;
+        -1
+    })
+}
+
+/// Listens on a TCP port of the tunnel's addresses, and returns a
+/// descriptor for the listener at once. The descriptor is a socket that
+/// keeps messages apart (SOCK_SEQPACKET). Its first message is a status
+/// of one byte: 0 if the tunnel now listens on the port, or 5 if it
+/// listened there already, and then the stream ends. After the status,
+/// each connection arrives as a message "ADDRESS PORT", which names the
+/// peer and carries the connection's descriptor (SCM_RIGHTS). The caller
+/// answers each with a message of one byte, and at most `backlog`
+/// connections wait for their answers. Closing the descriptor stops the
+/// listening.
+///
+/// Returns -1 and sets errno if nothing was begun: EINVAL if `port` is
+/// not a port, and otherwise as sp_connect does.
+///
+/// # Safety
+/// `h` came from sp_open.
+#[no_mangle]
+pub unsafe extern "C" fn sp_listen(h: *mut c_void, port: c_int, backlog: c_int) -> c_int {
+    let h = &*h.cast::<Handle>();
+    let backlog = backlog.clamp(1, MAX_BACKLOG) as usize;
+    let begun = match u16::try_from(port).ok().filter(|port| *port != 0) {
+        Some(port) => h.pair(libc::SOCK_SEQPACKET, |fd| Cmd::Listen { fd, port, backlog }),
+        None => Err(libc::EINVAL),
     };
     begun.unwrap_or_else(|errno| {
         *libc::__errno_location() = errno;

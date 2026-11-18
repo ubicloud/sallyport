@@ -120,8 +120,34 @@ module Sallyport
       end
     end
 
-    # Stops the tunnel. Its sockets reach end of file. A signal handler
-    # cannot call this, because it takes a lock.
+    # Listens on a TCP port of the tunnel's addresses, and returns the
+    # Listener. At most +backlog+ connections, and no more than 128, wait
+    # to be accepted, and a connection that would be one more is refused.
+    #
+    # Raises Errno::EADDRINUSE if the tunnel listens on the port already.
+    def listen(port, backlog: 32)
+      port = self.class.port(port)
+      backlog = Integer(backlog)
+      # The wait for the lock can be interrupted. From the call until the
+      # descriptor has an owner, an exception from another thread waits.
+      io = synchronize do
+        Thread.handle_interrupt(Object => :never) do
+          fd, code = Native::LISTEN.call(handle, port, backlog), Fiddle.last_error
+          raise SystemCallError.new("TCP port #{port}", code) if fd.negative?
+
+          UNIXSocket.for_fd(fd)
+        end
+      end
+      begin
+        outcome(io, "TCP port #{port}")
+        listener = Listener.new(io, port, self)
+      ensure
+        io.close unless listener
+      end
+    end
+
+    # Stops the tunnel. Its sockets and its listeners reach end of file.
+    # A signal handler cannot call this, because it takes a lock.
     def close
       synchronize { self.class.release(@holder, @pid) }
       nil
