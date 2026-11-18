@@ -1063,7 +1063,7 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration) -> (bool, Fate) {
     // TLA-conn>               ELSE IF t.ruby = "closed" \/ t.orphan THEN [t EXCEPT !.fate = "abort"]
     // TLA-conn>               \* The first write that the pair refuses is only noted, and the
     // TLA-conn>               \* next pass drops what a Ruby that will not read is sent.
-    // TLA-conn>               ELSE IF t.deaf THEN [t EXCEPT !.rx = 0, !.moved = TRUE]
+    // TLA-conn>               ELSE IF t.deaf THEN (IF Fault = "deaf keeps" THEN t ELSE [t EXCEPT !.rx = 0, !.moved = TRUE])
     // TLA-conn>               ELSE IF t.rdShut THEN [t EXCEPT !.deaf = TRUE, !.moved = TRUE]
     // TLA-conn>               ELSE [t EXCEPT !.rx = @ - n, !.u2r = @ + n, !.moved = @ \/ n > 0]
     // A write to the pair fails when Ruby has closed its end, and also
@@ -1267,6 +1267,11 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration) -> (bool, Fate) {
 // yet to be given the last bytes that the peer sent:
 //
 // TLA-conn.cfg/early-close!Kept> Fault = "early close"
+//
+// carry keeps what the peer sends for a Ruby that will not read it, and
+// poll returns for those bytes for ever:
+//
+// TLA-conn.cfg/deaf-keeps!NoSpin> Fault = "deaf keeps"
 //
 // Our FIN is queued behind data that the peer has yet to take. The
 // socket must hold more than a byte for that:
