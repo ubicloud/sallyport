@@ -311,7 +311,7 @@ impl Engine {
             self.tick();
             self.next_tick = Instant::now() + TICK;
         }
-        let moved = self.stack.turn();
+        self.stack.turn();
         self.flush();
         self.shared.connections.store(self.stack.connections(), Ordering::Relaxed);
         self.dump();
@@ -320,9 +320,10 @@ impl Engine {
         if let Some(delay) = self.stack.poll_delay() {
             wait = wait.min(delay);
         }
-        // A connection that moved may have more to move: the pair or the
-        // socket may have room again for what was left.
-        if more || moved {
+        // The turn left each connection at rest, and poll reports what
+        // moves one on. Only the datagrams that were not taken do not
+        // wait.
+        if more {
             wait = Duration::ZERO;
         }
         fds.clear();
