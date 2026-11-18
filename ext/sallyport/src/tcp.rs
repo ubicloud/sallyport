@@ -238,6 +238,9 @@ fn socket() -> tcp::Socket<'static> {
     // The socket pair has already gathered what Ruby wrote, and a key
     // typed into an interactive session must not wait for an ACK.
     s.set_nagle_enabled(false);
+    // smoltcp has no congestion control unless one is chosen: it sends
+    // as much as the peer's window takes, whatever the path can carry.
+    s.set_congestion_control(tcp::CongestionControl::Cubic);
     s
 }
 
@@ -946,6 +949,7 @@ mod tests {
         let mut a = stack(A);
         let _ruby = connect(&mut a, B, 7);
         let s = a.sockets.get::<tcp::Socket>(a.conns[0].handle);
+        assert_eq!(s.congestion_control(), tcp::CongestionControl::Cubic);
         assert!(!s.nagle_enabled());
     }
 
