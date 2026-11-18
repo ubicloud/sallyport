@@ -4,6 +4,7 @@
 
 use crate::config::{contains, Config, Net};
 use crate::keys::{self, Key};
+use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -187,7 +188,16 @@ impl Peers {
     /// handshakes.
     pub fn tick(&mut self, send: Sender) {
         for peer in &mut self.list {
-            if let (TunnResult::WriteToNetwork(b), Some(to)) = (peer.tunn.update_timers(&mut self.buf), peer.endpoint) {
+            let mut due = peer.tunn.update_timers(&mut self.buf);
+            // boringtun gives a handshake up when it has had no answer for
+            // 90 seconds, and begins another only when it has a packet to
+            // send. A peer with a keepalive is tried again at once, as
+            // WireGuard proper tries it at each keepalive, so that a peer
+            // that was away is found when it comes back.
+            if matches!(due, TunnResult::Err(WireGuardError::ConnectionExpired)) && peer.keepalive {
+                due = peer.tunn.format_handshake_initiation(&mut self.buf, false);
+            }
+            if let (TunnResult::WriteToNetwork(b), Some(to)) = (due, peer.endpoint) {
                 send(b, to);
             }
         }
@@ -331,6 +341,25 @@ mod tests {
 
         let (_, mut b) = pair();
         b.start(&mut |_, _| panic!("B has no keepalive"));
+    }
+
+    /// This test waits out the 90 seconds for which boringtun tries a
+    /// handshake, so it runs only when asked for, as "rake slow" asks.
+    #[test]
+    #[ignore]
+    fn a_peer_with_a_keepalive_is_tried_for_as_long_as_it_is_silent() {
+        let (_, mut b) = pair_with("PersistentKeepalive = 25");
+        let begun = std::time::Instant::now();
+        let mut sent = Vec::new();
+        b.start(&mut |_, _| sent.push(begun.elapsed().as_secs()));
+        while begun.elapsed().as_secs() < 110 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            b.tick(&mut |d, _| {
+                assert_eq!(d[0], 1, "nothing but an initiation is sent");
+                sent.push(begun.elapsed().as_secs());
+            });
+        }
+        assert!(sent.iter().filter(|at| **at > 95).count() >= 2, "initiations left at {sent:?}");
     }
 
     #[test]
