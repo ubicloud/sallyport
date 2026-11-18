@@ -138,14 +138,17 @@ tunnels makes.
 
 ## Models
 
-Two parts of the library are easier to get wrong than to test, and each
-has a TLA+ model. The model `wake` is of what a tunnel's thread shares
-with the threads that call the library: how a call reaches the thread,
-how a caller is answered, and how the thread and its handle end. The
-model `conn` is of one connection for the whole of its life: how Ruby is
-answered when it makes one, and how it is handed one that a peer made,
-how bytes move between Ruby's descriptor and the TCP socket, what `poll`
-is asked about the descriptor, and how the connection ends.
+Three parts of the library are easier to get wrong than to test, and
+each has a TLA+ model. The model `wake` is of what a tunnel's thread
+shares with the threads that call the library: how a call reaches the
+thread, how a caller is answered, and how the thread and its handle end.
+The model `listen` is of one listener: which SYN gets a socket, how many
+connections may wait for Ruby, and what becomes of a SYN that arrives
+twice or finds no room. The model `conn` is of one connection for the
+whole of its life: how Ruby is answered when it makes one, and how it is
+handed one that a peer made, how bytes move between Ruby's descriptor
+and the TCP socket, what `poll` is asked about the descriptor, and how
+the connection ends.
 
 `conn` stands on three more modules. `stream` is what a connection
 promises to Ruby and to the peer, with no word of sockets or

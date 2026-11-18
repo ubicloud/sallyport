@@ -335,9 +335,37 @@ enum Welcome {
     Nobody,
     /// The listener has no room for another connection.
     Full,
-    /// The listener made this socket for the SYN.
-    Socket(SocketHandle),
+    /// The listener made a socket for the SYN.
+    Socket,
 }
+
+// The model "listen" is of one listener: the sockets that are made for
+// the SYNs to its port, the peers that send them, and what Ruby has yet to
+// accept. The lines of the model are beside the code that they describe,
+// and Ruby's part is in listener.rb.
+//
+// TLA-listen@0> EXTENDS Naturals
+// TLA-listen@0> CONSTANTS Peers,    \* each peer sends SYNs to the port from one address and port
+// TLA-listen@0>           Backlog,  \* how many connections the listener lets wait
+// TLA-listen@0>           Fault     \* the fault that a variant puts in, or "none"
+// TLA-listen@0> \* The state is one record, so that a step says what it changes and no more.
+// TLA-listen@0> VARIABLE s
+// TLA-listen@0> Init == s = [
+// TLA-listen@0>   open       |-> TRUE,   \* Ruby has not closed the listener
+// TLA-listen@0>   unaccepted |-> 0,      \* Listener.unaccepted
+// TLA-listen@0>   queued     |-> 0,      \* the connections that Ruby was sent and has yet to take
+// TLA-listen@0>   answers    |-> 0,      \* the answers of Ruby that credit has yet to read
+// TLA-listen@0>   listening  |-> 0,      \* the sockets that listen, and have no connection yet
+// TLA-listen@0>   shaking    |-> [p \in Peers |-> 0],      \* the sockets that have answered a SYN of the peer
+// TLA-listen@0>   made       |-> [p \in Peers |-> 0],      \* its connections that Ruby has yet to be sent
+// TLA-listen@0>   given      |-> [p \in Peers |-> 0],      \* those that Ruby was sent
+// TLA-listen@0>   refused    |-> [p \in Peers |-> FALSE]]  \* a SYN of the peer was reset
+// TLA-listen@0> When(cond, x) == IF cond THEN {x} ELSE {}
+// TLA-listen@0> RECURSIVE Sum(_, _)
+// TLA-listen@0> Sum(f, S) == IF S = {} THEN 0 ELSE LET p == CHOOSE p \in S : TRUE IN f[p] + Sum(f, S \ {p})
+// TLA-listen@0> \* The connections that wait for the listener are those of Phase::Listening
+// TLA-listen@0> \* and of Phase::Accepting.
+// TLA-listen@0> Waiting(t) == t.listening + Sum(t.shaking, Peers) + Sum(t.made, Peers)
 
 struct Listener {
     /// A connection that waits for its listener names it by this, so that
@@ -352,6 +380,9 @@ struct Listener {
 }
 
 impl Listener {
+    // TLA-listen> \* Listener::credit counts the answers that Ruby has sent.
+    // TLA-listen> Credit(t) == IF Fault = "uncounted" THEN t
+    // TLA-listen>              ELSE [t EXCEPT !.unaccepted = @ - t.answers, !.answers = 0]
     /// Counts the connections that Ruby has accepted since the last call.
     /// Ruby answers each with a message.
     fn credit(&mut self) {
@@ -527,6 +558,13 @@ impl Stack {
         self.listeners.retain(|l| !sys::ended(l.ctl.as_raw_fd()));
     }
 
+    // TLA-listen> \* welcome says one of these for a SYN whose connection no socket has. A
+    // TLA-listen> \* listener has room until the connections that Ruby has not accepted, and
+    // TLA-listen> \* those that wait for the listener, are as many as its backlog.
+    // TLA-listen> Welcome(t) == LET waiting == IF Fault = "counts no handshakes" THEN 0 ELSE Waiting(t)
+    // TLA-listen>               IN IF ~t.open THEN "nobody"
+    // TLA-listen>                  ELSE IF Credit(t).unaccepted + waiting >= Backlog THEN "full"
+    // TLA-listen>                  ELSE "socket"
     /// Makes a socket for a SYN to a port, if the port is listened on and
     /// its listener has room. A listener has room until the connections
     /// that Ruby has not accepted, and the handshakes under way, are as
@@ -547,9 +585,11 @@ impl Stack {
         }
         let handle = self.sockets.add(s);
         self.conns.push(Conn { handle, local_port: None, phase: Phase::Listening { listener: l.id } });
-        Welcome::Socket(handle)
+        Welcome::Socket
     }
 
+    // TLA-listen> \* Stack::has
+    // TLA-listen> Has(t, p) == t.shaking[p] + t.made[p] + t.given[p] > 0
     /// Says whether a socket already has the connection between these two
     /// ends.
     fn has(&self, from: SocketAddr, to: SocketAddr) -> bool {
@@ -560,6 +600,33 @@ impl Stack {
             .any(|s| s.state() != tcp::State::Listen && s.remote_endpoint() == from && s.local_endpoint() == to)
     }
 
+    // TLA-listen> \* smoltcp gives a SYN to the first socket that will take it. A socket
+    // TLA-listen> \* that has the peer's connection takes the SYN, and stays as it is. A
+    // TLA-listen> \* socket that listens takes any SYN. The model does not say which socket
+    // TLA-listen> \* is the first. smoltcp resets a SYN that no socket takes.
+    // TLA-listen> Takes(u, p) == When(Has(u, p), u)
+    // TLA-listen>           \cup When(u.listening > 0, [u EXCEPT !.listening = @ - 1, !.shaking[p] = @ + 1])
+    // TLA-listen> Smoltcp(u, p) == IF Takes(u, p) = {} THEN {[u EXCEPT !.refused[p] = TRUE]} ELSE Takes(u, p)
+    // TLA-listen> \* A SYN arrives. If no socket has its connection, ingress asks welcome,
+    // TLA-listen> \* which makes a socket for it or has it dropped. smoltcp gives a good SYN
+    // TLA-listen> \* to a socket, and gives one that is for no address of the tunnel to
+    // TLA-listen> \* none. ingress then removes each socket that still listens.
+    // TLA-listen> Syn(p, good) ==
+    // TLA-listen>   LET fresh == ~Has(s, p) \/ Fault = "takes twice"
+    // TLA-listen>       w == IF fresh THEN Welcome(s) ELSE "none"
+    // TLA-listen>       t == IF fresh /\ s.open THEN Credit(s) ELSE s
+    // TLA-listen>       u == IF w = "socket" THEN [t EXCEPT !.listening = @ + 1] ELSE t
+    // TLA-listen>   IN IF w = "full" /\ Fault # "resets when full" THEN s' = t
+    // TLA-listen>      ELSE \E v \in (IF good THEN Smoltcp(u, p) ELSE {u}) :
+    // TLA-listen>             s' = IF w = "socket" /\ Fault # "keeps its socket" THEN Unlisten(v) ELSE v
+    // TLA-listen> \* A reset arrives. smoltcp does not close a socket that had answered the
+    // TLA-listen> \* peer's SYN: it has the socket listen again, and ingress removes it. An
+    // TLA-listen> \* established connection that Ruby was not sent is closed, and step
+    // TLA-listen> \* removes it.
+    // TLA-listen> Rst(p) == \E v \in When(s.shaking[p] > 0, [s EXCEPT !.shaking[p] = @ - 1, !.listening = @ + 1])
+    // TLA-listen>                    \cup When(s.made[p] > 0, [s EXCEPT !.made[p] = @ - 1])
+    // TLA-listen>                    \cup When(s.given[p] > 0 \/ ~Has(s, p), s) :
+    // TLA-listen>             s' = IF Fault = "keeps listeners" THEN v ELSE Unlisten(v)
     /// Gives the stack the packets that arrived. They go in one at a
     /// time, so that each SYN of a burst finds a socket of its own
     /// listening.
@@ -580,8 +647,8 @@ impl Stack {
                     self.link.rx.pop_front();
                     continue;
                 }
-                Some(Welcome::Socket(handle)) => Some(handle),
-                Some(Welcome::Nobody) | None => None,
+                Some(Welcome::Socket) => true,
+                Some(Welcome::Nobody) | None => false,
             };
             let now = self.now();
             self.iface.poll_ingress_single(now, &mut self.link, &mut self.sockets);
@@ -592,12 +659,13 @@ impl Stack {
             // packet reset a handshake that the socket had answered:
             // smoltcp does not close such a socket, and has it listen
             // again.
-            if made.is_some() || reset {
+            if made || reset {
                 self.unlisten();
             }
         }
     }
 
+    // TLA-listen@40> Unlisten(u) == [u EXCEPT !.listening = 0]
     /// Removes each socket that listens, and its connection.
     fn unlisten(&mut self) {
         let sockets = &mut self.sockets;
@@ -610,6 +678,24 @@ impl Stack {
             !listens
         });
     }
+
+    // TLA-listen@60> \* The peer finishes the handshake, or smoltcp gives the handshake up
+    // TLA-listen@60> \* after TCP_TIMEOUT.
+    // TLA-listen@60> Ack(p) == s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1, !.made[p] = @ + 1]
+    // TLA-listen@60> GivesUp(p) == s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
+    // TLA-listen@60> \* step sends Ruby a connection that is established, and counts it. It
+    // TLA-listen@60> \* resets what waits for a listener that Ruby has closed.
+    // TLA-listen@60> Hand(p) == \/ /\ s.open /\ s.made[p] > 0
+    // TLA-listen@60>               /\ s' = [s EXCEPT !.made[p] = @ - 1, !.given[p] = @ + 1,
+    // TLA-listen@60>                                 !.unaccepted = @ + 1, !.queued = @ + 1]
+    // TLA-listen@60>            \/ ~s.open /\ s.made[p] > 0 /\ s' = [s EXCEPT !.made[p] = @ - 1]
+    // TLA-listen@60>            \/ ~s.open /\ s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
+    // TLA-listen@60> \* A connection that Ruby was sent ends, and its socket goes.
+    // TLA-listen@60> Ends(p) == s.given[p] > 0 /\ s' = [s EXCEPT !.given[p] = @ - 1]
+    // TLA-listen@60> \* pump counts Ruby's answers at each turn. Ruby may close the listener
+    // TLA-listen@60> \* at any time.
+    // TLA-listen@60> Counts == s.open /\ s.answers > 0 /\ Credit(s) # s /\ s' = Credit(s)
+    // TLA-listen@60> Close == s.open /\ s' = [s EXCEPT !.open = FALSE]
 
     /// Returns how many connections there are: those that the stack is
     /// making, and those that are made and have not ended.
@@ -1261,6 +1347,75 @@ fn carry(mut open: Open, s: &mut tcp::Socket, now: Duration, closing: bool) -> F
 // the comment at CleanEof describes.
 //
 // TLA-conn.cfg/eof-hides-reset!CleanEof>
+//
+// The model "listen" has two peers, and a backlog of one connection.
+//
+// TLA-listen@90> Next == \/ \E p \in Peers : Syn(p, TRUE) \/ Syn(p, FALSE) \/ Rst(p) \/ Ack(p) \/ GivesUp(p)
+// TLA-listen@90>         \/ \E p \in Peers : Hand(p) \/ Ends(p)
+// TLA-listen@90>         \/ Accept \/ Counts \/ Close
+// TLA-listen@90> \* The stack counts and steps when it can, and smoltcp gives up each
+// TLA-listen@90> \* handshake that its peer leaves. The peers and Ruby owe nothing.
+// TLA-listen@90> Spec == Init /\ [][Next]_s /\ WF_s(Counts) /\ \A p \in Peers : WF_s(Hand(p)) /\ WF_s(GivesUp(p))
+// TLA-listen@90>
+// TLA-listen@90> \* No more than the backlog are pending: the connections that Ruby has not
+// TLA-listen@90> \* accepted, and those that wait for the listener.
+// TLA-listen@90> Bounded == s.unaccepted + Waiting(s) <= Backlog
+// TLA-listen@90> \* The listener's count is of the connections that Ruby has yet to take,
+// TLA-listen@90> \* and of those that it has taken and credit has yet to count.
+// TLA-listen@90> Exact == s.unaccepted = s.queued + s.answers
+// TLA-listen@90> \* No socket listens between two packets. One that did would take the
+// TLA-listen@90> \* next SYN to the port, whatever connection that SYN belonged to.
+// TLA-listen@90> NoStray == s.listening = 0
+// TLA-listen@90> \* A peer has one socket for its connection, however often its SYN arrives.
+// TLA-listen@90> OnePerPeer == \A p \in Peers : s.shaking[p] + s.made[p] + s.given[p] <= 1
+// TLA-listen@90> \* A SYN is reset only when nothing listens. One that the backlog has no
+// TLA-listen@90> \* room for gets no answer, and its sender tries again.
+// TLA-listen@90> FullIsSilent == [][\A p \in Peers : s'.refused[p] /\ ~s.refused[p] => ~s.open]_s
+// TLA-listen@90> \* No place in the backlog is held for ever. A handshake ends, a
+// TLA-listen@90> \* connection that is established is sent to Ruby, and Ruby's answers are
+// TLA-listen@90> \* counted.
+// TLA-listen@90> Shaken == \A p \in Peers : s.shaking[p] > 0 ~> s.shaking[p] = 0
+// TLA-listen@90> Handed == \A p \in Peers : s.made[p] > 0 ~> s.made[p] = 0
+// TLA-listen@90> Counted == s.answers > 0 ~> s.answers = 0 \/ ~s.open
+//
+// TLA-listen.cfg> SPECIFICATION Spec
+// TLA-listen.cfg> CONSTANTS Peers = {p1, p2}
+// TLA-listen.cfg>   Backlog = 1
+// TLA-listen.cfg>   Fault = "none"
+// TLA-listen.cfg> INVARIANTS Bounded Exact NoStray OnePerPeer
+// TLA-listen.cfg> PROPERTIES FullIsSilent Shaken Handed Counted
+// TLA-listen.cfg> CHECK_DEADLOCK FALSE
+//
+// It is checked with room for two connections too, and with a third peer.
+//
+// TLA-listen.cfg/two> Backlog = 2
+// TLA-listen.cfg/three> Peers = {p1, p2, p3}
+// TLA-listen.cfg/three> Backlog = 2
+//
+// Each of these variants has a fault that the code avoids, and the model
+// finds each. A SYN is given a socket though a socket has its connection:
+//
+// TLA-listen.cfg/takes-twice!OnePerPeer> Fault = "takes twice"
+//
+// A socket that listens again after a reset is kept:
+//
+// TLA-listen.cfg/keeps-listeners!OnePerPeer> Fault = "keeps listeners"
+//
+// A socket is kept though smoltcp gave it no SYN:
+//
+// TLA-listen.cfg/keeps-its-socket!OnePerPeer> Fault = "keeps its socket"
+//
+// A SYN that the backlog has no room for goes to smoltcp, which resets it:
+//
+// TLA-listen.cfg/resets-when-full!FullIsSilent> Fault = "resets when full"
+//
+// The handshakes under way are not counted against the backlog:
+//
+// TLA-listen.cfg/counts-no-handshakes!Bounded> Fault = "counts no handshakes"
+//
+// Ruby's answers are not counted:
+//
+// TLA-listen.cfg/uncounted!Counted> Fault = "uncounted"
 
 #[cfg(test)]
 mod tests {
@@ -2087,6 +2242,19 @@ mod tests {
         drop(ruby);
         settle(&mut a, &mut b);
         assert!(a.conns.is_empty() && b.conns.is_empty());
+    }
+
+    #[test]
+    fn a_syn_that_smoltcp_gives_to_no_socket_leaves_none_listening() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let _listener = listen(&mut b, 7, 4);
+        // The SYN is to the port that B listens on, at an address that B
+        // does not have.
+        let _ruby = connect(&mut a, "10.9.0.3", 7);
+        a.turn();
+        b.receive(a.transmit().unwrap());
+        b.turn();
+        assert!(b.conns.is_empty() && b.transmit().is_none());
     }
 
     #[test]
