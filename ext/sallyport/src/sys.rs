@@ -30,6 +30,14 @@ pub fn send(fd: RawFd, buf: &[u8]) -> isize {
     result(unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) })
 }
 
+/// Returns how many bytes wait to be read from a descriptor, or 0 if
+/// that cannot be told.
+pub fn readable(fd: RawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut n) };
+    n.max(0) as usize
+}
+
 /// Ends what the other end of a socket pair can read, after what was
 /// sent already.
 pub fn shutdown_write(fd: RawFd) {

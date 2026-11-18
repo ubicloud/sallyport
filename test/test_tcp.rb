@@ -172,6 +172,17 @@ class TestTCP < Minitest::Test
     eventually { b.connections.zero? }
   end
 
+  def test_a_tunnel_describes_itself
+    a, b = pair
+    connection(a, b)
+    text = a.dump
+    assert_match(/^\d+ datagrams in: 0 from no peer, 0 refused, 0 from a source not allowed$/, text)
+    assert_match(/^#{Regexp.escape(a.peers.first.public_key)} 127\.0\.0\.1:#{b.listen_port} \d+ \d+ \d+$/, text)
+    assert_match(/^open 10\.9\.0\.1:7 to 10\.9\.0\.2:\d+: ESTABLISHED, 0 bytes to send and 0 to give Ruby, /, text)
+    assert_match(/^  Socket \{ state: Established, /, text)
+    assert_equal Encoding::UTF_8, text.encoding
+  end
+
   def test_each_direction_ends_on_its_own
     client, server = connection(*pair)
     client.write("question")

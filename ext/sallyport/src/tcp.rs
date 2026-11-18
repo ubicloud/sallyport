@@ -14,6 +14,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::{Duration as SDuration, Instant as SInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -438,6 +439,42 @@ impl Stack {
     /// making, and those that are made and have not ended.
     pub fn connections(&self) -> usize {
         self.conns.iter().filter(|c| !matches!(c.phase, Phase::Listening | Phase::Dead(_))).count()
+    }
+
+    /// Describes every connection, each in two lines. The first is what
+    /// the stack knows of it. The second is smoltcp's account of the
+    /// socket, without the bytes in its buffers.
+    pub fn describe(&self, text: &mut String) {
+        for c in &self.conns {
+            let phase = match c.phase {
+                Phase::Connecting(_) => "connecting",
+                Phase::Listening => "listening",
+                Phase::Accepting => "accepting",
+                Phase::Open => "open",
+                Phase::Dead(_) => "dead",
+            };
+            let s = self.sockets.get::<tcp::Socket>(c.handle);
+            let end = |end: Option<IpEndpoint>| end.map_or("-".into(), |end| end.to_string());
+            let _ = writeln!(
+                text,
+                "{phase} {} to {}: {}, {} bytes to send and {} to give Ruby, {} waiting in the pair{}{}{}",
+                end(s.local_endpoint()),
+                end(s.remote_endpoint()),
+                s.state(),
+                s.send_queue(),
+                s.recv_queue() + c.tail.len(),
+                sys::readable(c.raw()),
+                if c.fd_eof { ", Ruby has ended its stream" } else { "" },
+                if c.rx_shut { ", the peer has ended its stream" } else { "" },
+                if c.app_gone.is_some() { ", Ruby is gone" } else { "" },
+            );
+            let mut detail = format!("{s:?}");
+            while let Some(from) = detail.find("Owned([") {
+                let to = detail[from..].find("])").map_or(detail.len(), |to| from + to + 2);
+                detail.replace_range(from..to, "..");
+            }
+            let _ = writeln!(text, "  {detail}");
+        }
     }
 
     /// Has every socket send what it has to send.

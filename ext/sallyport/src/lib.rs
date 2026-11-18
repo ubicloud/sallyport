@@ -14,7 +14,7 @@ mod peers;
 mod sys;
 mod tcp;
 
-use engine::{Cmd, Engine, Shared};
+use engine::{Cmd, Dump, Engine, Shared};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::IpAddr;
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
@@ -22,6 +22,7 @@ use std::panic::catch_unwind;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// A listener's backlog is no more than this. A listener's pair holds
 /// that many messages each way with room to spare, so neither side waits
@@ -216,6 +217,33 @@ pub unsafe extern "C" fn sp_listen(h: *mut c_void, port: c_int, backlog: c_int) 
 pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> usize {
     let h = &*h.cast::<Handle>();
     h.shared.connections.load(Ordering::Relaxed)
+}
+
+/// Writes a description of the tunnel into `buf`, for a person to read:
+/// what the tunnel has counted, then a line for each peer as sp_stats
+/// gives it, then two lines for each connection. The tunnel's thread
+/// writes the description at the next turn of its loop, and the call
+/// waits for that. Returns how many bytes the whole of it needs, as
+/// sp_stats does, or 0 if the thread did not answer within a second.
+///
+/// # Safety
+/// `h` came from sp_open, and `buf` has room for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sp_dump(h: *mut c_void, buf: *mut c_char, len: usize) -> usize {
+    let h = &*h.cast::<Handle>();
+    let mut dump = h.shared.dump.lock().unwrap_or_else(|e| e.into_inner());
+    *dump = Dump::Asked;
+    h.shared.wake();
+    let unanswered = |dump: &mut Dump| !matches!(dump, Dump::Done(_));
+    let waited = h.shared.dumped.wait_timeout_while(dump, Duration::from_secs(1), unanswered);
+    let mut dump = waited.unwrap_or_else(|e| e.into_inner()).0;
+    match std::mem::take(&mut *dump) {
+        Dump::Done(text) => {
+            put(buf, len, &text);
+            text.len() + 1
+        }
+        _ => 0,
+    }
 }
 
 /// Returns the tunnel's UDP port.

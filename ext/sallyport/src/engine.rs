@@ -2,13 +2,13 @@
 //! TCP stack, and serves them from one loop that never takes Ruby's GVL.
 
 use crate::config::Config;
-use crate::peers::Peers;
+use crate::peers::{Dropped, Peers};
 use crate::sys;
 use crate::tcp::{status, Stack};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// boringtun's timers run this often.
@@ -24,6 +24,16 @@ const UDP_BATCH: usize = 1024;
 pub enum Cmd {
     Connect { fd: OwnedFd, addr: IpAddr, port: u16 },
     Listen { fd: OwnedFd, port: u16, backlog: usize },
+}
+
+/// A caller asks the thread to describe the tunnel, and the thread
+/// answers at the next turn of its loop.
+#[derive(Default)]
+pub enum Dump {
+    #[default]
+    None,
+    Asked,
+    Done(String),
 }
 
 /// A tunnel's thread shares this with its handle.
@@ -44,6 +54,9 @@ pub struct Shared {
     pub stats: Mutex<String>,
     /// How many connections the stack had when the loop last turned.
     pub connections: AtomicUsize,
+    /// A caller waits on `dumped` while `dump` is asked for.
+    pub dump: Mutex<Dump>,
+    pub dumped: Condvar,
 }
 
 impl Shared {
@@ -62,6 +75,10 @@ pub struct Engine {
     stack: Stack,
     next_tick: Instant,
     buf: Vec<u8>,
+    /// These count the datagrams that have arrived, and the packets that
+    /// the stack has sent.
+    datagrams: u64,
+    packets: u64,
 }
 
 impl Engine {
@@ -83,6 +100,8 @@ impl Engine {
             linger: AtomicU32::new(0),
             stats: Mutex::default(),
             connections: AtomicUsize::new(0),
+            dump: Mutex::default(),
+            dumped: Condvar::new(),
         });
         let engine = Engine {
             shared: shared.clone(),
@@ -92,6 +111,8 @@ impl Engine {
             stack: Stack::new(cfg),
             next_tick: Instant::now(),
             buf: vec![0; 65536],
+            datagrams: 0,
+            packets: 0,
         };
         engine.publish();
         Ok((engine, shared))
@@ -122,6 +143,7 @@ impl Engine {
     fn udp_in(&mut self) -> bool {
         for _ in 0..UDP_BATCH {
             let Ok((len, from)) = self.udp.recv_from(&mut self.buf) else { return false };
+            self.datagrams += 1;
             let from = SocketAddr::new(from.ip().to_canonical(), from.port());
             let (udp, v6) = (&self.udp, self.udp_v6);
             let packet = self.peers.receive(&self.buf[..len], from, &mut |d, to| sys::udp_send(udp, v6, d, to));
@@ -135,6 +157,7 @@ impl Engine {
     /// Encrypts and sends the packets that the stack has queued.
     fn flush(&mut self) {
         while let Some(packet) = self.stack.transmit() {
+            self.packets += 1;
             let (udp, v6) = (&self.udp, self.udp_v6);
             self.peers.send(&packet, &mut |d, to| sys::udp_send(udp, v6, d, to));
         }
@@ -169,6 +192,7 @@ impl Engine {
         let moved = self.stack.turn();
         self.flush();
         self.shared.connections.store(self.stack.connections(), Ordering::Relaxed);
+        self.dump();
 
         let mut wait = self.next_tick.saturating_duration_since(Instant::now()).min(most);
         if let Some(delay) = self.stack.poll_delay() {
@@ -190,6 +214,27 @@ impl Engine {
         if fds[0].revents != 0 {
             sys::drain(self.shared.wake_r.as_raw_fd());
         }
+    }
+
+    /// Describes the tunnel for the caller that asked, if one did. The
+    /// description is for a person who wants to know why something does
+    /// not move.
+    fn dump(&self) {
+        let mut dump = self.shared.dump.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*dump, Dump::Asked) {
+            return;
+        }
+        let Dropped { unknown, refused, disallowed } = self.peers.dropped;
+        let mut text = format!(
+            "{} datagrams in: {unknown} from no peer, {refused} refused, {disallowed} from a source not allowed\n\
+             {} packets out\n\
+             peers, each with its endpoint, the milliseconds since its handshake, and the bytes sent and received:\n",
+            self.datagrams, self.packets
+        );
+        self.peers.stats(&mut text);
+        self.stack.describe(&mut text);
+        *dump = Dump::Done(text);
+        self.shared.dumped.notify_all();
     }
 
     /// Ends the connections in order, when Ruby has closed the tunnel.

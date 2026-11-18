@@ -181,6 +181,22 @@ module Sallyport
       synchronize { Native::CONNECTIONS.call(handle) }
     end
 
+    # Returns a description of the tunnel for a person to read: what it
+    # has counted, a line for each peer, and two lines for each connection,
+    # of which the second is the TCP socket as smoltcp prints it. It is
+    # there to show why something does not move, and its form may change.
+    def dump
+      size = 1 << 16
+      loop do
+        text = Fiddle::Pointer.malloc(size, Fiddle::RUBY_FREE)
+        need = synchronize { Native::DUMP.call(handle, text, size) }
+        raise Errno::ENETDOWN, "the tunnel's thread does not answer" if need.zero?
+        return text.to_s.force_encoding(Encoding::UTF_8) if need <= size
+
+        size = need
+      end
+    end
+
     # Returns a Peer for each peer, in the order of the configuration.
     # What it says is a quarter of a second old at most.
     def peers
