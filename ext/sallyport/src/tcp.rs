@@ -45,6 +45,10 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// A connection that has ended is given this long to send its last ACK
 /// when the tunnel is closing, which is twice smoltcp's longest delay.
 const LAST_ACK: Duration = Duration::from_millis(20);
+/// The stack's clock goes on by no more than this from one reading to the
+/// next. The tunnel's thread reads it several times a second, so a longer
+/// time is one in which the thread stood still.
+const STEP: Duration = Duration::from_secs(1);
 /// One turn of the loop has the sockets send this many rounds of packets
 /// at the most, with a packet from each socket in a round.
 const EGRESS_ROUNDS: usize = 1024;
@@ -112,8 +116,10 @@ impl Device for Link {
 
 #[derive(PartialEq)]
 enum Phase {
-    /// The SYN is sent, and Ruby waits on its end for the status.
-    Connecting(Instant),
+    /// The SYN is sent, and Ruby waits on its end for the status. The time
+    /// is read from the stack's clock, as is every time that a connection
+    /// keeps.
+    Connecting(Duration),
     /// The socket waits for a SYN, or for the handshake that the SYN
     /// began. There is no socket pair yet.
     Listening,
@@ -123,7 +129,7 @@ enum Phase {
     Open,
     /// The connection is closed to Ruby and has no descriptor. Its socket
     /// stays until it has sent what it owes the peer.
-    Dead(Instant),
+    Dead(Duration),
 }
 
 /// A step decides one of these for its connection.
@@ -159,10 +165,10 @@ struct Conn {
     /// closed its end, or each side has shut down its writing, which poll
     /// does not tell apart. In both cases Ruby has no more to say, and
     /// has been told all that it will be.
-    app_gone: Option<Instant>,
+    app_gone: Option<Duration>,
     /// Since when the connection has waited for nothing but the peer's
     /// FIN: Ruby has left, and the peer has acknowledged our FIN.
-    fin_wait: Option<Instant>,
+    fin_wait: Option<Duration>,
     /// The tail holds what the peer sent last and Ruby has yet to be
     /// given, once that is taken out of the socket's buffer.
     tail: VecDeque<u8>,
@@ -302,7 +308,8 @@ impl Conn {
 // TLA-conn@10> \* TCP_TIMEOUT, and resets the peer. It counts the silence whether or not
 // TLA-conn@10> \* anything waits for an answer. So the socket asks a quiet peer to
 // TLA-conn@10> \* answer, with set_keep_alive, and the model takes it that the socket
-// TLA-conn@10> \* hears a peer that is there.
+// TLA-conn@10> \* hears a peer that is there. The stack's clock does not count the time
+// TLA-conn@10> \* that the thread stood still, so the socket has asked by then.
 // TLA-conn@10> TcpTimeout == /\ s.st \notin {"Closed", "TimeWait"} /\ s.phase # "removed"
 // TLA-conn@10>               /\ (s.peer = "gone" \/ Fault = "no keep-alive")
 // TLA-conn@10>               /\ s' = [s EXCEPT !.st = "Closed", !.owed = "rst", !.tx = 0, !.kick = TRUE]
@@ -359,7 +366,9 @@ pub struct Stack {
     listeners: Vec<Listener>,
     local_ports: HashSet<u16>,
     addrs: Vec<IpAddr>,
-    epoch: Instant,
+    /// The stack's time, and when it was last read.
+    clock: Duration,
+    read_at: Instant,
     /// Selective acknowledgement is left on offer in the SYNs.
     sack: bool,
 }
@@ -403,13 +412,25 @@ impl Stack {
             listeners: Vec::new(),
             local_ports: HashSet::new(),
             addrs: cfg.addrs.clone(),
-            epoch: Instant::now(),
+            clock: Duration::ZERO,
+            read_at: Instant::now(),
             sack,
         }
     }
 
-    fn now(&self) -> SInstant {
-        SInstant::from_micros(self.epoch.elapsed().as_micros() as i64)
+    fn now(&mut self) -> SInstant {
+        self.time_at(Instant::now())
+    }
+
+    /// Returns the stack's time at a moment of the system's clock. Ctrl-Z
+    /// stops a process, and the tunnel's thread with it, for minutes at a
+    /// time. The stack's clock does not count those minutes. smoltcp would
+    /// count them as silence, and would take every peer that was quiet to
+    /// be gone.
+    fn time_at(&mut self, real: Instant) -> SInstant {
+        self.clock += real.saturating_duration_since(self.read_at).min(STEP);
+        self.read_at = real;
+        SInstant::from_micros(self.clock.as_micros() as i64)
     }
 
     /// Queues an IP packet that arrived for the stack.
@@ -459,7 +480,7 @@ impl Stack {
             return Stack::refuse(fd, status::NO_ROUTE);
         }
         let handle = self.sockets.add(s);
-        let phase = Phase::Connecting(Instant::now());
+        let phase = Phase::Connecting(self.clock);
         self.conns.push(Conn { local_port: Some(local), ..Conn::new(handle, Some(fd), phase) });
     }
 
@@ -664,7 +685,7 @@ impl Stack {
                 // Ruby reads the end of its stream, and what the peer
                 // sends from now on has nobody to read it.
                 sys::shutdown_write(c.raw());
-                c.app_gone = c.app_gone.or(Some(Instant::now()));
+                c.app_gone = c.app_gone.or(Some(self.clock));
             }
         }
     }
@@ -672,7 +693,7 @@ impl Stack {
     /// Says whether every connection has ended, and has had the time to
     /// send its last ACK.
     pub fn finished(&self) -> bool {
-        self.conns.iter().all(|c| matches!(c.phase, Phase::Dead(since) if since.elapsed() >= LAST_ACK))
+        self.conns.iter().all(|c| matches!(c.phase, Phase::Dead(since) if self.clock - since >= LAST_ACK))
     }
 
     // TLA-conn> \* The linger is over. abort resets a connection that has not ended. The
@@ -689,7 +710,7 @@ impl Stack {
         // A socket that has just taken the peer's FIN may still delay its
         // ACK, and the next poll is the last. So the stack's clock is put
         // on by the delay, and the ACK leaves with the resets.
-        self.epoch -= ACK_DELAY;
+        self.clock += ACK_DELAY;
     }
 
     /// Returns how long the stack can wait before its next timer.
@@ -717,7 +738,7 @@ impl Stack {
         while i < self.conns.len() {
             let c = &mut self.conns[i];
             let s = self.sockets.get_mut::<tcp::Socket>(c.handle);
-            let (m, fate) = step(c, s, &mut self.listeners);
+            let (m, fate) = step(c, s, &mut self.listeners, self.clock);
             moved |= m;
             match fate {
                 Fate::Keep => {}
@@ -730,7 +751,7 @@ impl Stack {
                     c.fd = None;
                     c.theirs = None;
                     c.listener = None;
-                    c.phase = Phase::Dead(Instant::now());
+                    c.phase = Phase::Dead(self.clock);
                     moved = true;
                 }
                 Fate::Remove => {
@@ -810,14 +831,14 @@ impl Stack {
 // TLA-conn>             /\ s' = [s EXCEPT !.phase = "removed"]
 /// Moves one connection as far as it will go. Returns whether it moved,
 /// and what becomes of it.
-fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener]) -> (bool, Fate) {
+fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Duration) -> (bool, Fate) {
     match c.phase {
         Phase::Dead(since) => {
             let sent = match s.state() {
                 // smoltcp forgets the peer once it has no more to send it.
                 tcp::State::Closed => s.remote_endpoint().is_none(),
                 // The peer's FIN is owed an ACK.
-                _ => since.elapsed() >= LINGER,
+                _ => now - since >= LINGER,
             };
             (false, if sent { Fate::Remove } else { Fate::Keep })
         }
@@ -868,7 +889,7 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener]) -> (bool,
             tcp::State::Closed => {
                 // smoltcp does not say whether a reset or its timeout
                 // closed the socket, so the time taken has to.
-                let late = since.elapsed() + Duration::from_secs(1) >= TCP_TIMEOUT;
+                let late = now - since + Duration::from_secs(1) >= TCP_TIMEOUT;
                 sys::send(c.raw(), &[if late { status::TIMED_OUT } else { status::REFUSED }]);
                 (true, Fate::Close)
             }
@@ -878,13 +899,13 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener]) -> (bool,
                 (true, Fate::Keep)
             }
         },
-        Phase::Open => carry(c, s),
+        Phase::Open => carry(c, s, now),
     }
 }
 
 /// Moves bytes each way for an open connection, and passes on the end of
 /// each direction.
-fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
+fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
     let mut moved = false;
     let was_deaf = c.deaf;
 
@@ -945,13 +966,13 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
     }
     // TLA-conn> Hung(t) == IF t.gone = "no" /\ HungUp(t) THEN [t EXCEPT !.gone = "yes"] ELSE t
     if c.app_gone.is_none() && sys::hung_up(fd) {
-        c.app_gone = Some(Instant::now());
+        c.app_gone = Some(now);
     }
     // TLA-conn> Waits(t) == IF t.wait = "no" /\ t.gone # "no" /\ t.st = "FinWait2" THEN [t EXCEPT !.wait = "yes"] ELSE t
     // The peer's time to end its stream begins when Ruby has left and the
     // peer has acknowledged our FIN, whichever comes later.
     if c.fin_wait.is_none() && c.app_gone.is_some() && s.state() == tcp::State::FinWait2 {
-        c.fin_wait = Some(Instant::now());
+        c.fin_wait = Some(now);
     }
 
     // TLA-conn> Tail(t) == IF t.st = "TimeWait" /\ Fault # "no tail"
@@ -1036,8 +1057,8 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
     // TLA-conn>     ELSE IF t.gone = "timeout" /\ Fault # "no deadline" THEN "abort"
     // TLA-conn>     ELSE "keep"]
     // An orphan is a connection that nobody is left to use on Ruby's side.
-    let orphaned = c.app_gone.map(|since| since.elapsed());
-    let waited = c.fin_wait.map(|since| since.elapsed());
+    let orphaned = c.app_gone.map(|since| now - since);
+    let waited = c.fin_wait.map(|since| now - since);
     let fate = match s.state() {
         tcp::State::Closed | tcp::State::TimeWait if c.fd_eof && c.rx_shut => Fate::Close,
         // The peer has all that Ruby wrote, and is given a while to end
@@ -1377,6 +1398,26 @@ mod tests {
     }
 
     #[test]
+    fn an_attempt_that_nobody_answers_times_out() {
+        let mut a = stack(A);
+        let mut ruby = connect(&mut a, B, 7);
+        // Nothing takes what A sends, and A's clock is put on a second at
+        // a time.
+        let mut status = Vec::new();
+        for _ in 0..2 * TCP_TIMEOUT.as_secs() {
+            age(&mut a, Duration::from_secs(1));
+            a.turn();
+            while a.transmit().is_some() {}
+            let (bytes, end) = read(&mut ruby);
+            status.extend(bytes);
+            if end {
+                break;
+            }
+        }
+        assert_eq!(status, [status::TIMED_OUT]);
+    }
+
+    #[test]
     fn an_attempt_that_ruby_gives_up_is_reset() {
         let mut a = stack(A);
         let ruby = connect(&mut a, B, 7);
@@ -1598,11 +1639,10 @@ mod tests {
         assert!(a.conns.is_empty() && b.conns.is_empty());
     }
 
-    /// Makes an orphan as old as it would be after this long.
+    /// Puts a stack's clock on, which makes its connections that much
+    /// older.
     fn age(stack: &mut Stack, by: Duration) {
-        let c = &mut stack.conns[0];
-        c.app_gone = Some(c.app_gone.unwrap() - by);
-        c.fin_wait = c.fin_wait.map(|since| since - by);
+        stack.clock += by;
     }
 
     #[test]
@@ -1790,22 +1830,40 @@ mod tests {
             s.set_keep_alive(None);
             s.set_keep_alive(interval);
         }
-        let quiet = Instant::now();
-        while quiet.elapsed() < Duration::from_secs(3) {
+        // The waits go by A's clock, which a stop of this process does not
+        // use up.
+        let quiet = a.clock;
+        while a.clock - quiet < Duration::from_secs(3) {
             settle(&mut a, &mut b);
         }
         client.write_all(b"still here").unwrap();
         settle(&mut a, &mut b);
         assert_eq!(read(&mut server), (b"still here".to_vec(), false));
         // B is gone, and nothing answers what A sends.
-        let gone = Instant::now();
-        while gone.elapsed() < Duration::from_secs(3) {
+        let gone = a.clock;
+        while a.clock - gone < Duration::from_secs(3) {
             a.turn();
             while a.transmit().is_some() {}
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(read(&mut client), (vec![], true));
         assert!(a.conns.is_empty());
+    }
+
+    #[test]
+    fn a_thread_that_stood_still_finds_its_connections_open() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // A's thread finds the system's clock twice the timeout further
+        // on, and its own clock goes on by one step.
+        let before = a.clock;
+        a.time_at(Instant::now() + 2 * TCP_TIMEOUT);
+        a.read_at = Instant::now();
+        assert_eq!(a.clock, before + STEP);
+        settle(&mut a, &mut b);
+        client.write_all(b"still here").unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (b"still here".to_vec(), false));
     }
 
     /// smoltcp clears a socket ten seconds after both sides have ended
@@ -1826,8 +1884,8 @@ mod tests {
             settle(&mut a, &mut b);
         }
         drop(server);
-        let ended = Instant::now();
-        while ended.elapsed() < Duration::from_secs(11) {
+        let ended = a.clock;
+        while a.clock - ended < Duration::from_secs(11) {
             settle(&mut a, &mut b);
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1988,6 +2046,7 @@ mod tests {
         a.receive(last);
         while a.turn() {}
         assert!(matches!(a.conns[0].phase, Phase::Dead(_)) && a.transmit().is_none(), "the ACK is delayed");
+        assert!(!a.finished(), "the dead connection has the time for its last ACK");
         assert_eq!(read(&mut client), (b"bye".to_vec(), true));
         // The tunnel closes with no linger, as Engine::finish has it.
         a.orphan();
@@ -1995,6 +2054,8 @@ mod tests {
         a.poll();
         let ack = a.transmit().expect("the ACK of the peer's FIN");
         assert!(!is_reset(&ack));
+        age(&mut a, LAST_ACK);
+        assert!(a.finished());
     }
 
     #[test]
