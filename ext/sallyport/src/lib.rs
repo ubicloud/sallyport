@@ -9,6 +9,9 @@
 mod config;
 mod engine;
 mod keys;
+// Nothing calls this module yet but its tests.
+#[allow(dead_code)]
+mod packet;
 mod peers;
 mod sys;
 mod tcp;
