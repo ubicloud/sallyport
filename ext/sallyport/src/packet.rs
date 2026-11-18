@@ -3,8 +3,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 /// Returns where the TCP header starts in an IP packet. A later fragment
-/// has no TCP header, and an IPv6 packet with extension headers is not
-/// looked into, so both count as not TCP.
+/// has no TCP header. Of the extension headers of IPv6, smoltcp looks
+/// behind one hop-by-hop header and behind no other, and so does this.
 fn tcp_offset(p: &[u8]) -> Option<usize> {
     match p.first()? >> 4 {
         4 => {
@@ -12,7 +12,14 @@ fn tcp_offset(p: &[u8]) -> Option<usize> {
             let fragment = u16::from_be_bytes([*p.get(6)?, *p.get(7)?]) & 0x1fff;
             (header >= 20 && *p.get(9)? == 6 && fragment == 0).then_some(header)
         }
-        6 => (*p.get(6)? == 6).then_some(40),
+        6 => match *p.get(6)? {
+            6 => Some(40),
+            0 => {
+                let header = (usize::from(*p.get(41)?) + 1) * 8;
+                (*p.get(40)? == 6).then_some(40 + header)
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -204,6 +211,17 @@ mod tests {
 
     const MSS: [u8; 4] = [2, 4, 5, 0x50];
 
+    /// Puts a hop-by-hop header before the TCP header of an IPv6 packet.
+    /// It is 8 bytes long, and has one option of padding.
+    fn behind_hop_by_hop(mut p: Vec<u8>) -> Vec<u8> {
+        assert_eq!((p[0] >> 4, p[6]), (6, 6));
+        p[6] = 0;
+        let length = u16::from_be_bytes([p[4], p[5]]) + 8;
+        p[4..6].copy_from_slice(&length.to_be_bytes());
+        p.splice(40..40, [6, 0, 1, 4, 0, 0, 0, 0]);
+        p
+    }
+
     #[test]
     fn a_syn_names_both_its_ends() {
         let ends = [(4, "10.9.0.1:51000", "10.9.0.2:7000"), (6, "[fd09::1]:51000", "[fd09::2]:7000")];
@@ -213,6 +231,9 @@ mod tests {
             assert_eq!(syn(&packet(version, SYN, &[], &[])), both);
             assert_eq!(syn(&packet(version, SYN | ACK, &MSS, &[])), None);
             assert_eq!(syn(&packet(version, ACK, &[], b"data")), None);
+            if version == 6 {
+                assert_eq!(syn(&behind_hop_by_hop(packet(version, SYN, &MSS, &[]))), both);
+            }
         }
     }
 
@@ -245,10 +266,19 @@ mod tests {
         let mut short = whole;
         short[20 + 12] = 4 << 4;
         assert_eq!(syn(&short), None, "the header claims 16 bytes");
-        // An extension header comes before the TCP header.
+        // An extension header that smoltcp does not look behind comes
+        // before the TCP header.
         let mut extended = packet(6, SYN, &MSS, &[]);
         extended[6] = 60;
         assert_eq!(syn(&extended), None);
+        // A hop-by-hop header gives a length that the packet does not
+        // have, or something other than TCP follows it.
+        let mut long = behind_hop_by_hop(packet(6, SYN, &MSS, &[]));
+        long[41] = 200;
+        assert_eq!(syn(&long), None);
+        let mut udp = behind_hop_by_hop(packet(6, SYN, &MSS, &[]));
+        udp[40] = 17;
+        assert_eq!(syn(&udp), None);
     }
 
     #[test]
@@ -296,6 +326,13 @@ mod tests {
                 }
             }
         }
+        // The offer behind a hop-by-hop header goes too.
+        let mut after = behind_hop_by_hop(packet(6, SYN, layouts[0], &[]));
+        without_sack(&mut after);
+        let at = tcp_offset(&after).unwrap();
+        assert_eq!(at, 48);
+        assert_eq!(u16::from_be_bytes([after[at + 16], after[at + 17]]), checksum(&after));
+        assert!(!after[at + 20..].windows(2).any(|w| w == OFFER));
     }
 
     #[test]
