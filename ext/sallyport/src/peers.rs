@@ -33,12 +33,13 @@ struct Peer {
     endpoint: Option<SocketAddr>,
 }
 
-/// Dropped counts the datagrams that named no peer, and those that
-/// boringtun refused.
+/// Dropped counts the datagrams that named no peer, those that boringtun
+/// refused, and the packets from a source that their peer may not use.
 #[derive(Debug, Default, PartialEq)]
 pub struct Dropped {
     pub unknown: u64,
     pub refused: u64,
+    pub disallowed: u64,
 }
 
 pub struct Peers {
@@ -83,7 +84,7 @@ impl Peers {
     }
 
     /// Takes a datagram that arrived from `from`, and returns the IP
-    /// packet that it carried, if it carried one.
+    /// packet that it carried, if it carried one that its peer may send.
     pub fn receive(&mut self, datagram: &[u8], from: SocketAddr, send: Sender) -> Option<Vec<u8>> {
         let Some((i, kind)) = self.peer_of(datagram) else {
             self.dropped.unknown += 1;
@@ -111,9 +112,13 @@ impl Peers {
                 }
                 peer.endpoint = Some(from);
             }
-            TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
+            TunnResult::WriteToTunnelV4(p, src) => {
                 peer.endpoint = Some(from);
-                packet = Some(p.to_vec());
+                packet = Some((p.to_vec(), IpAddr::V4(src)));
+            }
+            TunnResult::WriteToTunnelV6(p, src) => {
+                peer.endpoint = Some(from);
+                packet = Some((p.to_vec(), IpAddr::V6(src)));
             }
         }
         // boringtun holds the packets that it was given while no session
@@ -127,7 +132,16 @@ impl Peers {
                 send(b, to);
             }
         }
-        packet
+        // A peer speaks only for the addresses that its AllowedIPs give it,
+        // so the source address of a packet that gets this far is one that
+        // the peer's key vouches for.
+        let (packet, src) = packet?;
+        if peer.allowed.iter().any(|net| contains(net, &src)) {
+            Some(packet)
+        } else {
+            self.dropped.disallowed += 1;
+            None
+        }
     }
 
     /// Finds the peer whose AllowedIPs hold the address. Where several
@@ -267,6 +281,19 @@ mod tests {
     }
 
     #[test]
+    fn a_source_outside_allowed_ips_is_dropped() {
+        let (mut a, mut b) = pair();
+        let mut datagrams = sent(&mut b, &ip("10.9.0.3", A));
+        let (out_a, _, types) = settle(&mut a, &mut b, &mut datagrams, 2);
+        assert!(out_a.is_empty());
+        assert_eq!(types, [1, 2, 4, 4], "the session is good, and only the packet is refused");
+        assert_eq!(a.dropped, Dropped { unknown: 0, refused: 0, disallowed: 1 });
+        // The same peer is heard when it sends from its own address.
+        let mut datagrams = sent(&mut b, &ip(B, A));
+        assert_eq!(settle(&mut a, &mut b, &mut datagrams, 2).0, [ip(B, A)]);
+    }
+
+    #[test]
     fn what_no_peer_sent_is_dropped() {
         let (mut a, mut b) = pair();
         let mut datagrams = sent(&mut b, &ip(B, A));
@@ -281,7 +308,7 @@ mod tests {
         let mut damaged = sent(&mut b, &ip(B, A)).pop_front().unwrap();
         *damaged.last_mut().unwrap() ^= 1;
         assert_eq!(a.receive(&damaged, at(9), &mut |_, _| replies += 1), None);
-        assert_eq!((&a.dropped, replies), (&Dropped { unknown: 2, refused: 1 }, 0));
+        assert_eq!((&a.dropped, replies), (&Dropped { unknown: 2, refused: 1, disallowed: 0 }, 0));
         assert_eq!(a.list[0].endpoint, Some(at(2)), "none of the three moved the endpoint");
     }
 
