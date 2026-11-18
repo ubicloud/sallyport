@@ -28,6 +28,8 @@ task :fixtures do
   sh({"GOBIN" => bin}, "go", "install", WIREPROXY)
   # An SSH server, for Net::SSH to reach through a tunnel.
   sh "go", "build", "-C", "test/support/sshd", "-o", File.join(bin, "sshd"), "."
+  # A peer that has the Linux kernel for its TCP. Its tests take root.
+  sh "go", "build", "-C", "test/support/kernelpeer", "-o", File.join(bin, "kernelpeer"), "."
 end
 
 Rake::TestTask.new(test: %i[compile unit]) do |t|
