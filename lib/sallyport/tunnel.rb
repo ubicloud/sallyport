@@ -131,6 +131,13 @@ module Sallyport
       end
     end
 
+    # Connects as Net::SSH asks its proxy to, so that a tunnel can be
+    # given to Net::SSH.start as the proxy. Net::SSH passes on the options
+    # that it was started with, and the timeout among them is used here.
+    def open(host, port, connection_options = nil)
+      connect(host, port, timeout: connection_options&.[](:timeout) || 30)
+    end
+
     # Listens on a TCP port of the tunnel's addresses, and returns the
     # Listener. At most +backlog+ connections, and no more than 128, wait
     # to be accepted. One that would be one more gets no answer, and its

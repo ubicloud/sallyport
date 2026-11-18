@@ -2,6 +2,7 @@
 
 require_relative "helper"
 require "digest"
+require "net/ssh"
 require "openssl"
 require "tempfile"
 
@@ -21,6 +22,7 @@ class TestRing < Minitest::Test
   include Helper
 
   WIREPROXY = Helper.fixture("wireproxy")
+  SSHD = Helper.fixture("sshd")
 
   def setup
     super
@@ -196,5 +198,22 @@ class TestRing < Minitest::Test
     tls.write("over tls")
     assert_equal "slt revo", tls.read
     served.join
+  end
+
+  # Net::SSH takes the tunnel for its proxy, and reaches an SSH server
+  # that Wireproxy forwards to.
+  def test_net_ssh_through_a_tunnel
+    skip "there is no SSH server: run `rake fixtures`" unless SSHD
+    port = free_tcp_port
+    spawn_fixture(SSHD, "127.0.0.1:#{port}")
+    wait_for_tcp(port)
+    t = ring("[TCPServerTunnel]\nListenPort = 22\nTarget = 127.0.0.1:#{port}\n")
+    options = {
+      proxy: t, password: "sallyport", auth_methods: ["password"], timeout: 5, non_interactive: true,
+      verify_host_key: :never, config: false, user_known_hosts_file: File::NULL, global_known_hosts_file: File::NULL
+    }
+    said = Net::SSH.start("fd07::2", "anyone", **options) { |ssh| ssh.exec!("uname -a") }
+    assert_equal "ran: uname -a\n", said
+    eventually { t.connections.zero? }
   end
 end

@@ -5,4 +5,5 @@ source "https://rubygems.org"
 gemspec
 
 gem "minitest"
+gem "net-ssh"
 gem "rake"

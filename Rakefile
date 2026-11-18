@@ -26,6 +26,8 @@ task :fixtures do
   bin = File.expand_path("tmp/bin", __dir__)
   mkdir_p bin
   sh({"GOBIN" => bin}, "go", "install", WIREPROXY)
+  # An SSH server, for Net::SSH to reach through a tunnel.
+  sh "go", "build", "-C", "test/support/sshd", "-o", File.join(bin, "sshd"), "."
 end
 
 Rake::TestTask.new(test: %i[compile unit]) do |t|
