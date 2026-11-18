@@ -17,6 +17,17 @@ task :slow do
   sh "cargo", "test", "--release", "--locked", "--manifest-path", "ext/sallyport/Cargo.toml", "--", "--ignored"
 end
 
+# Wireproxy is the second implementation that the tests talk to. It is a
+# Go program, and its go.mod asks for Go 1.26.
+WIREPROXY = "github.com/windtf/wireproxy/cmd/wireproxy@v1.1.3"
+
+desc "Build the programs that the tests run against into tmp/bin (needs Go)"
+task :fixtures do
+  bin = File.expand_path("tmp/bin", __dir__)
+  mkdir_p bin
+  sh({"GOBIN" => bin}, "go", "install", WIREPROXY)
+end
+
 Rake::TestTask.new(test: %i[compile unit]) do |t|
   t.libs << "lib"
   t.test_files = FileList["test/test_*.rb"]

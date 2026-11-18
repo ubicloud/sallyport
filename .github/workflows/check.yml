@@ -25,6 +25,29 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
       - run: bundle exec rake test
+  # These tests have Wireproxy at the other end, which is built here. A
+  # test that cannot run fails in this job, where every one should.
+  ring:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubicloud-standard-2-ubuntu-2404, ubicloud-standard-2-arm-ubuntu-2404]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      SALLYPORT_NO_SKIP: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+      - run: bundle exec rake fixtures
+      - run: bundle exec rake test TEST=test/test_ring.rb
   # These are the tests that wait for a timer of WireGuard or of TCP to
   # run out.
   slow:

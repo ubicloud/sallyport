@@ -3,10 +3,24 @@
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 require "sallyport"
 require "minitest/autorun"
+require "io/nonblock"
 require "socket"
 require "timeout"
 
 module Helper
+  # Returns the path of a fixture, which is a program that "rake fixtures"
+  # builds, or nil if it is not built.
+  def self.fixture(name)
+    path = File.expand_path("../tmp/bin/#{name}", __dir__)
+    path if File.executable?(path)
+  end
+
+  # A test is skipped for want of a fixture, but not where every test is
+  # meant to run. CI says so with this variable, and a skip fails there.
+  def skip(message = nil, *)
+    ENV["SALLYPORT_NO_SKIP"] ? flunk("not run: #{message}") : super
+  end
+
   # A test that hangs fails here, and does not hold the run until CI
   # gives it up.
   def run
@@ -74,6 +88,56 @@ module Helper
       sleep 0.02
     end
     value
+  end
+
+  # A fixture runs under a shell that holds the reading end of a pipe
+  # from this process, and that kills the fixture when the pipe closes.
+  # So a run of the tests that is killed leaves no fixture behind.
+  # The shell says nothing of a fixture that it killed.
+  LEASH = '"$@" & fixture=$!; read -r _ <&9; exec 2>/dev/null; kill "$fixture"; wait "$fixture"'
+
+  # Starts a fixture that is stopped when the test ends.
+  def spawn_fixture(*command, **options)
+    leash, hold = IO.pipe
+    # Ruby makes its pipes non-blocking, and the shell's read would not
+    # wait on one.
+    leash.nonblock = false
+    pid = Process.spawn("sh", "-c", LEASH, "fixture", *command, 9 => leash, **options)
+    leash.close
+    @closers << lambda {
+      hold.close
+      Process.wait(pid)
+    }
+    pid
+  end
+
+  # Returns a TCP port on the loopback interface that was free a moment
+  # ago.
+  def free_tcp_port
+    server = TCPServer.new("127.0.0.1", 0)
+    server.addr[1]
+  ensure
+    server&.close
+  end
+
+  # Waits until something accepts connections on a loopback port.
+  def wait_for_tcp(port)
+    eventually do
+      TCPSocket.new("127.0.0.1", port).close
+      true
+    rescue Errno::ECONNREFUSED
+      false
+    end
+  end
+
+  # Writes +data+ to one socket while it reads as much from another, and
+  # returns what it read.
+  def transfer(from, to, data)
+    writer = Thread.new { from.write(data) }
+    got = +""
+    got << to.readpartial(1 << 20) while got.bytesize < data.bytesize
+    writer.join
+    got
   end
 
   # Returns a UDP port that was free a moment ago.
