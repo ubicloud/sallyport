@@ -18,7 +18,7 @@ Gem::Specification.new do |s|
   s.required_ruby_version = ">= 3.1"
 
   s.files = Dir.chdir(__dir__) do
-    Dir["lib/**/*.rb", "ext/sallyport/{Cargo.toml,Cargo.lock,extconf.rb}", "ext/sallyport/src/*.rs", "LICENSE"]
+    Dir["lib/**/*.rb", "ext/sallyport/{Cargo.toml,Cargo.lock,extconf.rb}", "ext/sallyport/src/*.rs", "LICENSE", "README.md"]
   end
   s.extensions = ["ext/sallyport/extconf.rb"]
 
