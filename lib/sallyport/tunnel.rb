@@ -95,6 +95,15 @@ module Sallyport
       raise TypeError, "a tunnel cannot be copied"
     end
 
+    # These are the lines of the model "wake" for Ruby's part. See
+    # ext/sallyport/src/engine.rs for the model.
+    #
+    # TLA-wake> \* Tunnel#connect and Tunnel#listen call the library under the
+    # TLA-wake> \* tunnel's lock, and only while the tunnel has its handle.
+    # TLA-wake> CEnter(c) == /\ s.cpc[c] = "idle" /\ s.mon = "none" /\ s.held
+    # TLA-wake>              /\ s' = [s EXCEPT !.mon = c, !.cpc[c] = "push"]
+    # TLA-wake> CReturn(c) == /\ s.cpc[c] = "return" /\ s' = [s EXCEPT !.mon = "none", !.cpc[c] = "done"]
+
     # Connects to a TCP port of an IP address through the tunnel, and
     # returns the connection's Socket.
     #
@@ -164,6 +173,17 @@ module Sallyport
         io.close unless listener
       end
     end
+
+    # TLA-wake> \* Tunnel#close holds the lock from before it takes the handle until
+    # TLA-wake> \* the library has freed it, and the lock lets no thread in twice. So
+    # TLA-wake> \* no call is under way on the handle when it is freed, and none
+    # TLA-wake> \* begins afterwards. The finalizer takes no lock, and the model
+    # TLA-wake> \* leaves it out: it runs when nothing can reach the Tunnel, or when
+    # TLA-wake> \* every other thread has ended.
+    # TLA-wake> KEnter == /\ s.kpc = "idle" /\ (s.mon = "none" \/ Fault = "no lock")
+    # TLA-wake>           /\ s' = [s EXCEPT !.mon = IF Fault = "no lock" THEN @ ELSE "closer", !.kpc = "pop"]
+    # TLA-wake> KReturn == /\ s.kpc = "return"
+    # TLA-wake>            /\ s' = [s EXCEPT !.mon = IF Fault = "no lock" THEN @ ELSE "none", !.kpc = "done"]
 
     # Stops the tunnel. Its listeners stop at once. Each connection is
     # ended as if its Socket had been closed: what was written to it is
@@ -261,6 +281,13 @@ module Sallyport
 
       text
     end
+
+    # TLA-wake> \* The handle is taken out of the holder before the library is
+    # TLA-wake> \* called, and nothing between the two can raise. A tunnel that is
+    # TLA-wake> \* closed already has no handle to take.
+    # TLA-wake> KPop == /\ s.kpc = "pop"
+    # TLA-wake>         /\ s' = [s EXCEPT !.held = FALSE,
+    # TLA-wake>                           !.kpc = IF s.held /\ Fault # "lost handle" THEN "stop" ELSE "return"]
 
     # Returns a linger in milliseconds, and no more of them than the
     # library takes.

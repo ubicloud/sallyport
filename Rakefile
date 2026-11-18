@@ -79,6 +79,37 @@ task :vpp do
   mv "tmp/vpp/new", "tmp/vpp/root"
 end
 
+# The TLA+ models are in the source, beside the code that they describe.
+# tools/tla gathers them and runs TLC, which is this file.
+TLA2TOOLS = "https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
+TLA2TOOLS_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+
+desc "Check the TLA+ models with TLC (needs Java)"
+task tla: "tla:tools" do
+  # The models are named, so that one that the tool no longer finds is
+  # missed.
+  sh "tools/tla", "check", "wake"
+end
+
+namespace :tla do
+  desc "Fetch TLC into tmp (needs curl)"
+  task :tools do
+    require "digest"
+    jar = "tmp/tla2tools.jar"
+    next if File.exist?(jar) && Digest::SHA256.file(jar).hexdigest == TLA2TOOLS_SHA256
+
+    mkdir_p "tmp"
+    sh "curl", "-sSfL", "-o", "#{jar}.new", TLA2TOOLS
+    abort "#{jar}.new is not the file that is expected" unless Digest::SHA256.file("#{jar}.new").hexdigest == TLA2TOOLS_SHA256
+    mv "#{jar}.new", jar
+  end
+
+  desc "Write the models into tmp/tla, and do not check them"
+  task :extract do
+    sh "tools/tla", "extract"
+  end
+end
+
 Rake::TestTask.new(test: %i[compile unit]) do |t|
   t.libs << "lib"
   t.test_files = FileList["test/test_*.rb"]

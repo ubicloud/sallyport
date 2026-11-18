@@ -69,6 +69,21 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ethtool libunwind8
       - run: bundle exec rake compile vpp
       - run: sudo env "PATH=$PATH" SALLYPORT_NO_SKIP=1 ruby -w -Ilib -Itest test/test_vpp.rb
+  # TLC checks the TLA+ models that are in the source.
+  models:
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: bundle exec rake tla
   # These are the tests that wait for a timer of WireGuard or of TCP to
   # run out.
   slow:

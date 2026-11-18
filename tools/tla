@@ -1,0 +1,209 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# The TLA+ models of this library are in its source, beside the code that
+# they describe. A line of a model is a comment:
+#
+#   // TLA-wake> Wake == pipe' = Min(pipe + 1, PipeCap)
+#
+# is a line of the module "wake". This tool gathers the lines of each
+# model into a module that TLC can check, and runs TLC on it.
+#
+#   TLA-NAME> TEXT      A line of NAME.tla.
+#   TLA-NAME@N> TEXT    The same, in section N, which is 50 if none is
+#                       given. TLA+ wants a name defined before it is
+#                       used. So the sections are assembled in order, and
+#                       a section keeps the order of the files and of the
+#                       lines in them.
+#   TLA-NAME.cfg> TEXT  A line of NAME.cfg, which is TLC's configuration.
+#                       Each constant has a line to itself.
+#   TLA-NAME.cfg/V> CONSTANT = VALUE
+#                       V is a variant, which is checked as well. It is
+#                       the same configuration with this constant changed.
+#   TLA-NAME.cfg/V!P> CONSTANT = VALUE
+#                       V is a variant that must fail. It is the model
+#                       with a fault put into it, and it is kept to show
+#                       that the model can find the fault. It must violate
+#                       P, and nothing else is checked of it. A variant
+#                       can also have no constant to change.
+#
+# The tool adds the first line and the last line of a module. One space
+# after the ">" belongs to the pragma, and the rest of the line is a line
+# of the model, with the indentation that TLA+ reads.
+#
+#   tools/tla extract [DIR]     Write the modules, into tmp/tla if no
+#                               directory is given.
+#   tools/tla check [MODEL...]  Write them, and run TLC on each model and
+#                               on each of its variants.
+#
+# TLC is tla2tools.jar, which is looked for at $TLA2TOOLS and then at
+# tmp/tla2tools.jar, where "rake tla:tools" puts it. $TLC_OPTS and
+# $JAVA_OPTS add options, for more workers or more memory.
+
+require "fileutils"
+
+ROOT = File.expand_path("..", __dir__)
+SOURCES = Dir.glob(%w[ext/sallyport/src/**/*.rs lib/**/*.rb], base: ROOT).sort.freeze
+COMMENT = %r{\A\s*(?://[/!]?|#)\s*}
+PRAGMA = %r{#{COMMENT}TLA-(?<model>\w+)
+            (?:@(?<section>\d+)|(?<cfg>\.cfg)(?:/(?<variant>[\w-]+)(?:!(?<fails>\w+))?)?)?
+            >(?:\ (?<text>.*))?\z}x
+# A line may hold a pragma that is misspelt or misplaced. This finds
+# something like the prefix anywhere in a line.
+NEARLY = /\bT(?:LA|AL)[-_ +:.]{0,2}\w+(?:@\S*|\.cfg\S*)?\s?>/i
+# The words that begin a statement of a configuration, and those of them
+# that say what is checked.
+KEYWORDS = %w[SPECIFICATION INIT NEXT CONSTANT CONSTANTS INVARIANT INVARIANTS PROPERTY PROPERTIES CHECK_DEADLOCK
+              CONSTRAINT CONSTRAINTS ACTION_CONSTRAINT ACTION_CONSTRAINTS SYMMETRY VIEW ALIAS POSTCONDITION].freeze
+CHECKS = %w[INVARIANT INVARIANTS PROPERTY PROPERTIES].freeze
+
+Model = Struct.new(:name, :lines, :cfg, :variants)
+Variant = Struct.new(:name, :fails, :changes)
+
+# Reads every pragma of the sources. A line that is nearly a pragma stops
+# the tool, since a model that has lost a line may still pass, and it
+# then says less than it seems to.
+def gather
+  models = Hash.new { |all, name| all[name] = Model.new(name, [], [], {}) }
+  SOURCES.each_with_index do |path, file|
+    # The lines are read as UTF-8 whatever the locale is.
+    File.readlines(File.join(ROOT, path), chomp: true, encoding: "UTF-8").each_with_index do |line, at|
+      here = "#{path}:#{at + 1}"
+      pragma = PRAGMA.match(line.scrub!)
+      abort "#{here}: this looks like a pragma, and is not one" if !pragma && NEARLY.match?(line)
+      next unless pragma
+
+      model, text = models[pragma[:model]], pragma[:text].to_s
+      if pragma[:variant]
+        variant = (model.variants[pragma[:variant]] ||= Variant.new(pragma[:variant], pragma[:fails], []))
+        abort "#{here}: the variant #{variant.name} is said to fail in two ways" unless variant.fails == pragma[:fails]
+        next if text.strip.empty?
+
+        change = text.match(/\A\s*(\w+)\s*=\s*(\S.*?)\s*\z/) or abort "#{here}: a variant changes a constant, as in N = 2"
+        # A second change on the line would be taken for part of the value.
+        abort "#{here}: a line of a variant changes one constant" if change[2].gsub(/"[^"]*"/, "").match?(/\w\s*=/)
+        variant.changes << change.captures
+      elsif pragma[:cfg]
+        model.cfg << text
+      else
+        model.lines << [(pragma[:section] || 50).to_i, file, at, path, text]
+      end
+    end
+  end
+  abort "there is no model in the sources" if models.empty?
+  models.each_value do |model|
+    abort "the model #{model.name} has a configuration and no lines" if model.lines.empty?
+    abort "the model #{model.name} has no configuration, so nothing would check it" if model.cfg.empty?
+  end
+  models.values
+end
+
+# Splits the lines of a configuration into its statements. Each is the
+# keyword that begins it, and its lines without the keyword.
+def statements(cfg)
+  cfg.each_with_object([]) do |line, all|
+    keyword, rest = line.strip.split(/\s+/, 2)
+    if KEYWORDS.include?(keyword)
+      all << [keyword, [rest.to_s]]
+    elsif all.empty?
+      abort "a configuration begins with a keyword, and not with #{line.inspect}"
+    else
+      all.last[1] << line.strip
+    end
+  end
+end
+
+# Returns the names that the statements of a configuration check.
+def checked(statements)
+  statements.select { |keyword, _| CHECKS.include?(keyword) }.flat_map { |_, lines| lines.join(" ").split }
+end
+
+# Returns the statements of a variant's configuration.
+def vary(model, variant)
+  all = statements(model.cfg)
+  variant.changes.each do |constant, value|
+    lines = all.select { |keyword, _| keyword.start_with?("CONSTANT") }.flat_map { |_, lines| lines }
+    line = lines.find { |l| l.match?(/\A#{constant}\s*=/) }
+    abort "#{model.name}/#{variant.name}: the configuration has no constant #{constant}" unless line
+    line.replace("#{constant} = #{value}")
+  end
+  return all unless variant.fails
+
+  # The property is checked as the model's configuration checks it, and
+  # as an invariant if that does not check it.
+  temporal = all.any? { |keyword, lines| keyword.start_with?("PROPERT") && lines.join(" ").split.include?(variant.fails) }
+  all.reject { |keyword, _| CHECKS.include?(keyword) } << [temporal ? "PROPERTY" : "INVARIANT", [variant.fails]]
+end
+
+def write(dir, name, statements)
+  text = statements.map { |keyword, lines| "#{keyword} #{lines.join("\n  ")}\n" }.join
+  File.write(File.join(dir, "#{name}.cfg"), text)
+end
+
+# Writes each model's module and its configurations into a directory.
+# Returns each run that TLC is to make: the model, the variant or nil,
+# and the statements of the configuration.
+def extract(dir)
+  FileUtils.mkdir_p(dir)
+  gather.flat_map do |model|
+    out = ["---- MODULE #{model.name} ----",
+           "\\* tools/tla made this from the TLA-#{model.name}> lines of the source. Change those."]
+    last = nil
+    model.lines.sort.each do |_, file, at, path, text|
+      out << "\\* #{path}:#{at + 1}" unless last == [file, at - 1]
+      out << text
+      last = [file, at]
+    end
+    File.write(File.join(dir, "#{model.name}.tla"), "#{out.join("\n")}\n====\n")
+    runs = [[model, nil, statements(model.cfg)]] + model.variants.each_value.map { |v| [model, v, vary(model, v)] }
+    runs.each { |_, variant, statements| write(dir, [model.name, variant&.name].compact.join("."), statements) }
+  end
+end
+
+# Runs TLC, and says in a line what came of it. Returns whether that was
+# what should come of it.
+def tlc(dir, model, variant, statements)
+  # TLC runs in another directory, so the path is made whole.
+  jar = File.expand_path(ENV.fetch("TLA2TOOLS", File.join(ROOT, "tmp/tla2tools.jar")))
+  abort "there is no #{jar}: run `rake tla:tools`, or set TLA2TOOLS" unless File.exist?(jar)
+  label = [model.name, variant&.name].compact.join("/")
+  name = label.tr("/", ".")
+  states = File.join(dir, "states", name)
+  FileUtils.rm_rf(states)
+  command = ["java", "-XX:+UseParallelGC", *ENV.fetch("JAVA_OPTS", "").split, "-cp", jar, "tlc2.TLC",
+             "-config", "#{name}.cfg", "-metadir", states, "-workers", "auto", *ENV.fetch("TLC_OPTS", "").split,
+             "#{model.name}.tla"]
+  log = File.join(dir, "#{name}.log")
+  passed = system(*command, chdir: dir, out: log, err: %i[child out])
+  text = File.read(log)
+  count = text[/^\d+ states generated.*$/] || "no states"
+  names = checked(statements).join(" ")
+  if variant&.fails
+    # Only the one property is checked, and TLC ends with one of these
+    # two statuses when a property is violated. Its words for that vary.
+    found = [12, 13].include?($?.exitstatus)
+    return puts("ok    #{label}: #{names} fails, as it must -- #{count}") || true if !passed && found
+
+    puts "FAIL  #{label}: #{names} was to fail, and #{passed ? "it holds" : "TLC stopped for another reason"}: see #{log}"
+  elsif passed
+    return puts("ok    #{label}: #{names} -- #{count}") || true
+  else
+    puts "FAIL  #{label}: #{text[/^Error: .*$/] || "TLC did not run"}: see #{log}"
+  end
+  false
+end
+
+dir = File.join(ROOT, "tmp/tla")
+case ARGV.shift
+when "extract"
+  extract(ARGV.first || dir)
+when "check"
+  runs = extract(dir)
+  unknown = ARGV - runs.map { |model, _| model.name }
+  abort "there is no model #{unknown.join(" or ")}" unless unknown.empty?
+  runs.select! { |model, _| ARGV.empty? || ARGV.include?(model.name) }
+  results = runs.map { |model, variant, statements| tlc(dir, model, variant, statements) }
+  exit results.all?
+else
+  abort File.read(__FILE__)[/^# The TLA\+.*?(?=^\nrequire)/m].gsub(/^# ?/, "")
+end

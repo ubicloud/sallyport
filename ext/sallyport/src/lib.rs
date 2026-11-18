@@ -37,6 +37,14 @@ pub struct Handle {
     port: u16,
 }
 
+// TLA-wake> \* Handle::pair. The lock makes the test of `dead` and the push one step.
+// TLA-wake> \* A caller that is refused drops both ends of its pair.
+// TLA-wake> CPush(c) == /\ s.cpc[c] = "push"
+// TLA-wake>             /\ s' = IF s.dead THEN [s EXCEPT !.fd[c] = "closed", !.cpc[c] = "return"]
+// TLA-wake>                               ELSE [s EXCEPT !.cmds = @ \cup {c}, !.fd[c] = "queued", !.cpc[c] = "wake"]
+// TLA-wake> \* The wake comes after the lock is let go. The thread may have taken the
+// TLA-wake> \* command by then, and may even have ended.
+// TLA-wake> CWake(c) == /\ s.cpc[c] = "wake" /\ s' = Woke([s EXCEPT !.cpc[c] = "return"])
 impl Handle {
     /// Makes a socket pair, queues the command that carries our end of
     /// it for the tunnel's thread, and returns Ruby's end. An error is an
@@ -134,6 +142,14 @@ pub unsafe extern "C" fn sp_open(
     std::ptr::null_mut()
 }
 
+// TLA-wake> \* sp_close tells the thread to stop, wakes it and waits for it to end.
+// TLA-wake> KStop == /\ s.kpc = "stop" /\ s' = [s EXCEPT !.stop = TRUE, !.kpc = "wake"]
+// TLA-wake> KWake == /\ s.kpc = "wake" /\ s' = Woke([s EXCEPT !.kpc = "join"])
+// TLA-wake> KJoin == /\ s.kpc = "join" /\ s.epc = "done" /\ s' = [s EXCEPT !.kpc = "free"]
+// TLA-wake> \* The handle is then dropped, and both ends of the pipe are closed with
+// TLA-wake> \* it. Only this thread knows that nothing is left to use either end.
+// TLA-wake> KFree == /\ s.kpc = "free"
+// TLA-wake>          /\ s' = [s EXCEPT !.rOpen = FALSE, !.wOpen = FALSE, !.freed = TRUE, !.kpc = "return"]
 /// Stops a tunnel. Its listeners stop at once. Each connection is ended
 /// as if its descriptor had been closed: what was written to it is sent,
 /// and then the end of the stream. The call waits for that for up to
