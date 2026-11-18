@@ -1,0 +1,4 @@
+/ext/sallyport/target/
+/lib/sallyport/*.so
+/Gemfile.lock
+*.gem

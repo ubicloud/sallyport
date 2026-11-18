@@ -1,0 +1,12 @@
+[package]
+name = "sallyport"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+# Keep line tables, so that a panic's backtrace names lines.
+debug = 1
