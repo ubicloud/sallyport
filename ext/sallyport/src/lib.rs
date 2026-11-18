@@ -1,10 +1,13 @@
 //! sallyport: WireGuard and TCP in user space, behind a C ABI small
 //! enough to bind by hand.
 
-// Only the tests call this module until a tunnel reads its configuration.
+// Only the tests call these two modules until there is a tunnel to use
+// them.
 #[allow(dead_code)]
 mod config;
 mod keys;
+#[allow(dead_code)]
+mod peers;
 mod sys;
 
 use std::ffi::{c_char, c_int, CStr};
