@@ -126,7 +126,8 @@ module Sallyport
 
     # Listens on a TCP port of the tunnel's addresses, and returns the
     # Listener. At most +backlog+ connections, and no more than 128, wait
-    # to be accepted, and a connection that would be one more is refused.
+    # to be accepted. One that would be one more gets no answer, and its
+    # peer tries again.
     #
     # Raises Errno::EADDRINUSE if the tunnel listens on the port already.
     def listen(port, backlog: 32)

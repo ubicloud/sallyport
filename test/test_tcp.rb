@@ -91,13 +91,16 @@ class TestTCP < Minitest::Test
     assert_raises(Errno::ECONNREFUSED) { b.connect("10.9.0.1", 7) }
   end
 
-  def test_a_connection_over_the_backlog_is_refused
+  # The SYN of a connection over the backlog is dropped. It is sent again
+  # a second later, and by then there is room.
+  def test_a_connection_over_the_backlog_waits
     a, b = pair
     listener = a.listen(7, backlog: 1)
     b.connect("10.9.0.1", 7)
-    assert_raises(Errno::ECONNREFUSED) { b.connect("10.9.0.1", 7) }
+    waiting = Thread.new { b.connect("10.9.0.1", 7) }
+    refute waiting.join(0.3)
     assert listener.accept(timeout: 5)
-    b.connect("10.9.0.1", 7)
+    assert waiting.value
     assert listener.accept(timeout: 5)
   end
 

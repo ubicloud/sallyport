@@ -190,6 +190,16 @@ impl Conn {
     }
 }
 
+/// A SYN to a port meets one of these.
+enum Welcome {
+    /// Nothing listens on the port, and smoltcp resets the SYN.
+    Nobody,
+    /// The listener has no room for another connection.
+    Full,
+    /// The listener made this socket for the SYN.
+    Socket(SocketHandle),
+}
+
 struct Listener {
     port: u16,
     /// Our end of the pair on which Ruby is sent each connection.
@@ -346,21 +356,21 @@ impl Stack {
     /// that Ruby has not accepted, and the handshakes under way, are as
     /// many as its backlog. smoltcp keeps no queue of them: a socket takes
     /// one connection.
-    fn socket_for(&mut self, port: u16) -> Option<SocketHandle> {
-        let l = self.listeners.iter_mut().find(|l| l.port == port)?;
+    fn welcome(&mut self, port: u16) -> Welcome {
+        let Some(l) = self.listeners.iter_mut().find(|l| l.port == port) else { return Welcome::Nobody };
         // Ruby may have closed the listener a moment ago.
         if sys::ended(l.ctl.as_raw_fd()) {
-            return None;
+            return Welcome::Nobody;
         }
         l.credit();
         let pending = l.unaccepted + self.conns.iter().filter(|c| c.listener == Some(port)).count();
         let mut s = socket();
         if pending >= l.backlog || s.listen(port).is_err() {
-            return None;
+            return Welcome::Full;
         }
         let handle = self.sockets.add(s);
         self.conns.push(Conn { listener: Some(port), ..Conn::new(handle, None, Phase::Listening) });
-        Some(handle)
+        Welcome::Socket(handle)
     }
 
     /// Says whether a socket already has the connection between these two
@@ -384,7 +394,18 @@ impl Stack {
             // socket, and is left to the one that the first copy got.
             let fresh = syn(packet).filter(|(from, to)| !self.has(*from, *to));
             let reset = rst(packet);
-            let made = fresh.and_then(|(_, to)| self.socket_for(to.port()));
+            let made = match fresh.map(|(_, to)| self.welcome(to.port())) {
+                // smoltcp would reset a SYN that finds no socket, and its
+                // sender would take that to mean that nothing listens. A
+                // SYN that the backlog has no room for is dropped, as
+                // Linux drops it, and its sender tries again.
+                Some(Welcome::Full) => {
+                    self.link.rx.pop_front();
+                    continue;
+                }
+                Some(Welcome::Socket(handle)) => Some(handle),
+                Some(Welcome::Nobody) | None => None,
+            };
             let now = self.now();
             self.iface.poll_ingress_single(now, &mut self.link, &mut self.sockets);
             // A socket that listens now would take the next SYN to the
@@ -982,14 +1003,38 @@ mod tests {
         // The three SYNs arrive in one burst.
         let mut rubies: Vec<UnixStream> = (0..3).map(|_| connect(&mut a, B, 7)).collect();
         settle(&mut a, &mut b);
-        let statuses: Vec<u8> = rubies.iter_mut().map(|ruby| read(ruby).0[0]).collect();
-        assert_eq!(statuses, [status::OK, status::OK, status::REFUSED]);
-        // Ruby accepts one, and there is room for another.
+        let statuses: Vec<Vec<u8>> = rubies.iter_mut().map(|ruby| read(ruby).0).collect();
+        assert_eq!(statuses, [vec![status::OK], vec![status::OK], vec![]], "the third SYN was dropped");
+        // Ruby accepts one, and there is room for the third when its SYN
+        // is sent again, a second after the first time.
         listener.send(&[0]).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut rubies[2]), (vec![status::OK], false));
+        assert_eq!(b.listeners[0].unaccepted, 2);
+    }
+
+    #[test]
+    fn handshakes_that_their_peer_resets_leave_the_backlog() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let _listener = listen(&mut b, 7, 2);
+        // As many SYNs as the backlog arrive in one burst.
+        let rubies: Vec<UnixStream> = (0..2).map(|_| connect(&mut a, B, 7)).collect();
+        a.turn();
+        while let Some(packet) = a.transmit() {
+            b.receive(packet);
+        }
+        b.turn();
+        let answers = std::iter::from_fn(|| b.transmit()).filter(|packet| !is_reset(packet)).count();
+        assert_eq!(answers, 2, "each SYN is answered");
+        // The answers are lost. Ruby gives both attempts up, and A resets
+        // them.
+        drop(rubies);
+        settle(&mut a, &mut b);
+        // The next SYN finds room, and is not dropped.
         let mut ruby = connect(&mut a, B, 7);
         settle(&mut a, &mut b);
         assert_eq!(read(&mut ruby), (vec![status::OK], false));
-        assert_eq!(b.listeners[0].unaccepted, 2);
     }
 
     #[test]
