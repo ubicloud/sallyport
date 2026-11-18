@@ -31,6 +31,7 @@ fn tcp(p: &[u8]) -> Option<&[u8]> {
     (header >= 20 && t.len() >= header).then_some(t)
 }
 
+const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
 const ACK: u8 = 0x10;
@@ -87,6 +88,15 @@ fn options(t: &[u8], mut f: impl FnMut(u8, usize, usize)) {
     }
 }
 
+/// Returns a checksum corrected for a 16-bit word of what it covers that
+/// was `old` and is `new`, as RFC 1624 has it: HC' = ~(~HC + ~m + m').
+fn corrected(sum: u16, old: u16, new: u16) -> u16 {
+    let mut x = u32::from(!sum) + u32::from(!old) + u32::from(new);
+    x = (x & 0xffff) + (x >> 16);
+    x = (x & 0xffff) + (x >> 16);
+    !(x as u16)
+}
+
 /// Takes the offer of selective acknowledgement out of a SYN or a
 /// SYN-ACK, and corrects the checksum. Padding takes the offer's place.
 pub fn without_sack(p: &mut [u8]) {
@@ -105,18 +115,68 @@ pub fn without_sack(p: &mut [u8]) {
     for i in offers {
         for j in [i, i + 1] {
             // The checksum is corrected for the 16-bit word that the byte
-            // is in, as RFC 1624 has it: HC' = ~(~HC + ~m + m').
+            // is in.
             let word = j & !1;
             let old = u16::from_be_bytes([t[word], t[word + 1]]);
             t[j] = NOP;
             let new = u16::from_be_bytes([t[word], t[word + 1]]);
             let sum = u16::from_be_bytes([t[16], t[17]]);
-            let mut x = u32::from(!sum) + u32::from(!old) + u32::from(new);
-            x = (x & 0xffff) + (x >> 16);
-            x = (x & 0xffff) + (x >> 16);
-            t[16..18].copy_from_slice(&(!(x as u16)).to_be_bytes());
+            t[16..18].copy_from_slice(&corrected(sum, old, new).to_be_bytes());
         }
     }
+}
+
+/// Takes the FIN off a segment that has data too, and returns a packet
+/// that has the FIN and no data, at the place in the stream where the
+/// data ends. A peer may send the two packets in place of the one, as
+/// this library does. Each checksum is corrected and not worked out
+/// afresh, so a packet that arrived damaged makes two that are damaged.
+/// Any other packet is left as it is.
+pub fn split_fin(p: &mut [u8]) -> Option<Vec<u8>> {
+    let at = tcp_offset(p)?;
+    let t = tcp(p)?;
+    let word = |b: &[u8], i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+    let header = ((t[12] >> 4) as usize) * 4;
+    // The data is known to end where the packet ends only if the IP
+    // header gives the packet's length as it is, and if no more of the
+    // segment follows in another fragment.
+    let whole = match p[0] >> 4 {
+        4 => usize::from(word(p, 2)) == p.len() && p[6] & 0x20 == 0,
+        _ => usize::from(word(p, 4)) + 40 == p.len(),
+    };
+    if !whole || t.len() == header || t[13] & (FIN | SYN | RST) != FIN {
+        return None;
+    }
+    // The packet of the FIN has the headers of the segment. Its checksum
+    // is that of the segment, corrected for the data that it does not
+    // have, for its length, and for its sequence number, which is the one
+    // that follows the data.
+    let mut fin = p[..at + header].to_vec();
+    let mut sum = word(t, 16);
+    for pair in t[header..].chunks(2) {
+        sum = corrected(sum, u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]), 0);
+    }
+    sum = corrected(sum, t.len() as u16, header as u16);
+    let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]).wrapping_add((t.len() - header) as u32);
+    sum = corrected(sum, word(t, 4), (seq >> 16) as u16);
+    sum = corrected(sum, word(t, 6), seq as u16);
+    fin[at + 4..at + 8].copy_from_slice(&seq.to_be_bytes());
+    fin[at + 16..at + 18].copy_from_slice(&sum.to_be_bytes());
+    // The IP header gives the length of the packet, and that of IPv4 has
+    // a checksum of its own.
+    if p[0] >> 4 == 4 {
+        let total = fin.len() as u16;
+        let sum = corrected(word(p, 10), word(p, 2), total);
+        fin[2..4].copy_from_slice(&total.to_be_bytes());
+        fin[10..12].copy_from_slice(&sum.to_be_bytes());
+    } else {
+        let payload = (fin.len() - 40) as u16;
+        fin[4..6].copy_from_slice(&payload.to_be_bytes());
+    }
+    let sum = corrected(word(t, 16), word(t, 12), word(t, 12) & !u16::from(FIN));
+    p[at + 13] &= !FIN;
+    p[at + 16..at + 18].copy_from_slice(&sum.to_be_bytes());
+    Some(fin)
 }
 
 /// Describes a TCP packet in one line, much as tcpdump would: its ports,
@@ -177,14 +237,19 @@ mod tests {
     }
 
     /// Builds an IP packet around a TCP segment from port 51000 to port
-    /// 7000 that has these flags, options and payload, and a checksum
-    /// that is right.
+    /// 7000 that has these flags, options and payload, and checksums
+    /// that are right.
     fn packet(version: u8, flags: u8, opts: &[u8], payload: &[u8]) -> Vec<u8> {
+        packet_at(0x0102_0304, version, flags, opts, payload)
+    }
+
+    /// Builds the same packet with a sequence number of its own.
+    fn packet_at(seq: u32, version: u8, flags: u8, opts: &[u8], payload: &[u8]) -> Vec<u8> {
         assert_eq!(opts.len() % 4, 0);
         let mut t = vec![0u8; 20];
         t[0..2].copy_from_slice(&51000u16.to_be_bytes());
         t[2..4].copy_from_slice(&7000u16.to_be_bytes());
-        t[4..8].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        t[4..8].copy_from_slice(&seq.to_be_bytes());
         t[8..12].copy_from_slice(&0x0a0b_0c0du32.to_be_bytes());
         t[12] = ((20 + opts.len()) as u8 / 4) << 4;
         t[13] = flags;
@@ -194,6 +259,12 @@ mod tests {
         let mut p = if version == 4 {
             let mut h = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0, 10, 9, 0, 1, 10, 9, 0, 2];
             h[2..4].copy_from_slice(&((20 + t.len()) as u16).to_be_bytes());
+            // The header has a checksum of its own.
+            let mut acc = sum(&h, 0);
+            while acc >> 16 != 0 {
+                acc = (acc & 0xffff) + (acc >> 16);
+            }
+            h[10..12].copy_from_slice(&(!(acc as u16)).to_be_bytes());
             h
         } else {
             let mut h = vec![0x60, 0, 0, 0, 0, 0, 6, 64];
@@ -354,6 +425,69 @@ mod tests {
             assert!(got == want || (got == 0xffff && want == 0) || (got == 0 && want == 0xffff));
         }
         assert!(seen >= 4);
+    }
+
+    const PSH: u8 = 0x08;
+
+    #[test]
+    fn a_fin_with_data_becomes_the_data_and_then_the_fin() {
+        // The second set of options is a timestamp.
+        let layouts: [&[u8]; 2] = [&[], &[1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9]];
+        for version in [4, 6] {
+            for opts in layouts {
+                // The data is of an odd and of an even length, and the
+                // sequence number that follows it has passed zero or not.
+                for len in [1, 2, 699, 1380] {
+                    for seq in [0x0102_0304, u32::MAX - 1] {
+                        let payload: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+                        let mut data = packet_at(seq, version, FIN | PSH | ACK, opts, &payload);
+                        let fin = split_fin(&mut data).unwrap();
+                        assert_eq!(data, packet_at(seq, version, PSH | ACK, opts, &payload));
+                        assert_eq!(fin, packet_at(seq.wrapping_add(len as u32), version, FIN | PSH | ACK, opts, &[]));
+                    }
+                }
+            }
+        }
+        // A hop-by-hop header stays before both.
+        let mut data = behind_hop_by_hop(packet(6, FIN | ACK, &[], b"data"));
+        let fin = split_fin(&mut data).unwrap();
+        assert_eq!(data, behind_hop_by_hop(packet(6, ACK, &[], b"data")));
+        assert_eq!(fin, behind_hop_by_hop(packet_at(0x0102_0308, 6, FIN | ACK, &[], &[])));
+        // A packet that arrived with a byte changed makes two whose
+        // checksums are both wrong.
+        let mut data = packet(4, FIN | ACK, &[], b"data");
+        *data.last_mut().unwrap() ^= 1;
+        let fin = split_fin(&mut data).unwrap();
+        for p in [data, fin] {
+            assert_ne!(u16::from_be_bytes([p[36], p[37]]), checksum(&p));
+        }
+    }
+
+    #[test]
+    fn nothing_but_a_fin_with_data_is_split() {
+        let mut fragment = packet(4, FIN | ACK, &[], b"data");
+        fragment[6] |= 0x20;
+        let mut udp = packet(4, FIN | ACK, &[], b"data");
+        udp[9] = 17;
+        let mut untouched = vec![
+            packet(4, FIN | ACK, &[], &[]),
+            packet(6, PSH | ACK, &[], b"data"),
+            packet(4, SYN | FIN, &MSS, b"data"),
+            packet(6, RST | FIN | ACK, &[], b"data"),
+            fragment,
+            udp,
+        ];
+        // The IP header gives a length that the packet does not have.
+        for version in [4, 6] {
+            let mut long = packet(version, FIN | ACK, &[], b"data");
+            long.push(0);
+            untouched.push(long);
+        }
+        for before in untouched {
+            let mut after = before.clone();
+            assert_eq!(split_fin(&mut after), None);
+            assert_eq!(after, before);
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! control from end to end.
 
 use crate::config::Config;
-use crate::packet::{rst, syn, without_sack};
+use crate::packet::{rst, split_fin, syn, without_sack};
 use crate::sys::{self, Sent};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -303,7 +303,8 @@ impl Conn {
 // TLA-conn@10>                         [] s.st = "Closing" -> [s EXCEPT !.st = "TimeWait", !.kick = TRUE]
 // TLA-conn@10>                         [] s.st = "LastAck" -> [s EXCEPT !.st = "Closed", !.owed = "none", !.kick = TRUE]
 // TLA-conn@10> \* The model takes it that the socket takes the peer's FIN only when it
-// TLA-conn@10> \* has taken all that the peer sent before it.
+// TLA-conn@10> \* has taken all that the peer sent before it. smoltcp does not see to
+// TLA-conn@10> \* that, so receive gives it each FIN in a packet of its own.
 // TLA-conn@10> PeerFin == /\ s.peer = "up"
 // TLA-conn@10>            /\ s' = CASE s.st = "Established" -> [s EXCEPT !.st = "CloseWait", !.owed = "ack", !.finRcvd = TRUE,
 // TLA-conn@10>                                                           !.peer = "fin", !.kick = TRUE]
@@ -456,7 +457,20 @@ impl Stack {
         if !self.sack {
             without_sack(&mut packet);
         }
+        // smoltcp takes a segment as far as the end of the window that it
+        // has on record, and it takes the FIN of a segment that it cut
+        // there. Ruby would then read the end of the stream without the
+        // bytes that were cut. A peer can have sent past that end. A
+        // keep-alive carries the window as it is then, and so does a probe
+        // of the peer's window, and smoltcp keeps no record of either. And
+        // after a SYN of its own, smoltcp has the end on record a byte
+        // short until its first ACK has left. So a FIN comes to smoltcp in
+        // a packet of its own, after its data. smoltcp passes over a FIN
+        // that follows bytes which it does not have, and the peer sends
+        // the FIN again with those bytes.
+        let fin = split_fin(&mut packet);
         self.link.rx.push_back(packet);
+        self.link.rx.extend(fin);
     }
 
     /// Returns the next IP packet that the stack wants sent.
@@ -1649,6 +1663,10 @@ mod tests {
         set_word(packet, 12, |flags| flags | 0x01);
     }
 
+    fn set_window(packet: &mut [u8], window: u16) {
+        set_word(packet, 14, |_| window);
+    }
+
     /// Gives A what B has to send. Linux puts its FIN on the last segment
     /// of data that it has still to send when a program closes its end.
     /// This stack has smoltcp send its FIN apart, so the FIN is put on
@@ -1721,14 +1739,54 @@ mod tests {
         // A acknowledges the first write at once, as it is more than a
         // segment, and the window that it tells of is all of the room.
         // With a scaled window it would be a byte short of the second
-        // write: smoltcp would drop the last byte of the stream, and take
-        // the FIN that comes with it.
+        // write, and smoltcp would drop the last byte of the stream.
         a.turn();
         // The second write is all that B has left to send, and A takes the
         // whole of it.
         give_with_a_fin(&mut b, &mut a);
         a.turn();
         assert_eq!(held(&a), RECV_BUF);
+        let got = read_to_a_fin(&mut a, &mut b, &mut client);
+        assert_eq!(got.len(), end);
+        assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
+    }
+
+    #[test]
+    fn a_fin_is_not_taken_with_a_segment_that_the_window_cut() {
+        // The client's socket has room for this much of the last write.
+        const ROOM: usize = 500;
+        const LAST: usize = 1001;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // The client reads nothing. Its pair fills, and then its socket
+        // does, but for the room.
+        let mut at = 0;
+        while held(&a) == 0 {
+            at = write_from(&mut server, at, at + 16384);
+            settle(&mut a, &mut b);
+        }
+        let end = at - held(&a) + RECV_BUF - ROOM + LAST;
+        while at < end - LAST {
+            at = write_from(&mut server, at, end - LAST);
+            settle(&mut a, &mut b);
+        }
+        assert_eq!(held(&a), RECV_BUF - ROOM);
+        // A segment from A tells B of more room than A has on record, as a
+        // keep-alive may when Ruby has read a little since the last ACK.
+        client.write_all(b"x").unwrap();
+        while a.turn() {}
+        let mut packet = a.transmit().unwrap();
+        set_window(&mut packet, 2 * LAST as u16);
+        b.receive(packet);
+        b.turn();
+        // So B sends the whole of the last write, and A takes the part of
+        // it that there is room for.
+        assert_eq!(write_from(&mut server, at, end), end);
+        while b.turn() {}
+        give_with_a_fin(&mut b, &mut a);
+        a.turn();
+        assert_eq!(held(&a), RECV_BUF);
+        // B sends the rest again when Ruby has read.
         let got = read_to_a_fin(&mut a, &mut b, &mut client);
         assert_eq!(got.len(), end);
         assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
@@ -2127,18 +2185,6 @@ mod tests {
         assert!(got.iter().enumerate().all(|(at, got)| *got == byte(at)));
     }
 
-    /// Shuts the window that an IPv4 TCP packet advertises, and corrects
-    /// the checksum as RFC 1624 has it.
-    fn shut_window(packet: &mut [u8]) {
-        let t = &mut packet[20..];
-        let old = u16::from_be_bytes([t[14], t[15]]);
-        let mut sum = u32::from(!u16::from_be_bytes([t[16], t[17]])) + u32::from(!old);
-        sum = (sum & 0xffff) + (sum >> 16);
-        sum = (sum & 0xffff) + (sum >> 16);
-        t[14..16].copy_from_slice(&[0, 0]);
-        t[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
-    }
-
     // The test waits for smoltcp to probe a window, which takes seconds.
     // It runs when the tests that were passed over are asked for, as
     // "rake slow" asks.
@@ -2156,7 +2202,7 @@ mod tests {
                 b.receive(packet);
             }
             while let Some(mut packet) = b.transmit() {
-                shut_window(&mut packet);
+                set_window(&mut packet, 0);
                 a.receive(packet);
             }
         };
