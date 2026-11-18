@@ -222,6 +222,50 @@ impl Conn {
     }
 }
 
+// The model "stream" is the promise that a connection makes to Ruby and
+// to the peer. It says nothing of sockets or descriptors. The model "conn"
+// below is checked to keep it.
+//
+// TLA-stream> \* What one connection promises, whatever carries it. A state of the
+// TLA-stream> \* promise is a record:
+// TLA-stream> \*   dn, dq    the bytes from the peer that the stack holds, and those that
+// TLA-stream> \*             it has given Ruby and Ruby has not read
+// TLA-stream> \*   dOpen     the stream to Ruby has not ended
+// TLA-stream> \*   dDone     the peer will send no more
+// TLA-stream> \*   rGone     nobody is left to read: Ruby has closed, or the tunnel has
+// TLA-stream> \*   un, uq    the bytes from Ruby that the stack has yet to take, and
+// TLA-stream> \*             those that it has taken and the peer has not acknowledged
+// TLA-stream> \*   uOpen     the stream to the peer has not ended
+// TLA-stream> \*   uDone     Ruby will write no more
+// TLA-stream> \*   pGone     the peer is gone for good
+// TLA-stream> \*   late      Ruby has left, and its time is up
+// TLA-stream> EXTENDS Naturals
+// TLA-stream> \* The stack loses none of the peer's bytes, and adds none, while someone
+// TLA-stream> \* may read them. A step keeps them, or Ruby reads one, or the peer sends
+// TLA-stream> \* one.
+// TLA-stream> Down(a, b) ==
+// TLA-stream>   /\ \/ b.rGone
+// TLA-stream>      \/ b.dn + b.dq = a.dn + a.dq
+// TLA-stream>      \/ b.dn = a.dn /\ b.dq + 1 = a.dq
+// TLA-stream>      \/ b.dn = a.dn + 1 /\ b.dq = a.dq /\ a.dOpen
+// TLA-stream>   \* It ends the stream once, when the peer has ended it and Ruby has been
+// TLA-stream>   \* given all of it.
+// TLA-stream>   /\ ~a.dOpen => ~b.dOpen
+// TLA-stream>   /\ a.dOpen /\ ~b.dOpen => b.rGone \/ (b.dn = 0 /\ b.dDone)
+// TLA-stream> \* It loses none of Ruby's bytes while the peer is there, unless Ruby has
+// TLA-stream> \* left and has had its time. A step keeps them, or the peer acknowledges
+// TLA-stream> \* one, or Ruby writes one.
+// TLA-stream> Up(a, b) ==
+// TLA-stream>   /\ \/ b.pGone \/ b.late
+// TLA-stream>      \/ b.un + b.uq = a.un + a.uq
+// TLA-stream>      \/ b.un = a.un /\ b.uq + 1 = a.uq
+// TLA-stream>      \/ b.un = a.un + 1 /\ b.uq = a.uq
+// TLA-stream>   \* It ends the stream once, when Ruby has ended it and the stack has
+// TLA-stream>   \* taken all of it.
+// TLA-stream>   /\ ~a.uOpen => ~b.uOpen
+// TLA-stream>   /\ a.uOpen /\ ~b.uOpen => b.pGone \/ b.late \/ (b.un = 0 /\ b.uDone)
+// TLA-stream> Step(a, b) == Down(a, b) /\ Up(a, b)
+//
 // The model "conn" is of one connection from the time that it is open: how
 // carry moves bytes between Ruby's descriptor and smoltcp's socket, what
 // poll is asked about the descriptor, and how the connection ends. It
@@ -1161,23 +1205,24 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 // TLA-conn@90> FinQueued == s.phase = "open" /\ ~s.kick /\ s.fdEof /\ MaySend(s) => s.tx > 0
 // TLA-conn@90> ClosedWhenDone == s.phase = "open" /\ ~s.kick => ~(s.st \in {"Closed", "TimeWait"} /\ s.fdEof /\ s.rxShut)
 // TLA-conn@90> OrphanRead == s.phase = "open" /\ ~s.kick /\ s.orphan /\ MaySend(s) /\ s.tx < TxCap => s.fdEof
-// TLA-conn@90> \* Bytes are neither lost nor doubled on their way. What leaves the pair
-// TLA-conn@90> \* goes into the socket, and what Ruby is given leaves the socket or the
-// TLA-conn@90> \* tail.
-// TLA-conn@90> FromRuby == [][s'.phase = "open" /\ s'.r2u < s.r2u => s'.r2u + s'.tx = s.r2u + s.tx]_s
-// TLA-conn@90> ToRuby == [][s'.u2r > s.u2r => s'.u2r + s'.rx + s'.tail = s.u2r + s.rx + s.tail]_s
-// TLA-conn@90> \* While the connection is open and Ruby has not closed its end, what the
-// TLA-conn@90> \* peer sent leaves the socket and the tail only into Ruby's hands.
-// TLA-conn@90> NoneDropped == [][s'.phase = "open" /\ s.ruby # "closed" /\ s'.rx + s'.tail < s.rx + s.tail
-// TLA-conn@90>                     => s'.u2r + s'.rx + s'.tail = s.u2r + s.rx + s.tail]_s
-// TLA-conn@90> \* And a connection does not end with bytes for a Ruby that is there.
-// TLA-conn@90> NoneDroppedAtEnd == [][s.phase = "open" /\ s'.phase # "open" /\ s.ruby # "closed" /\ ~s.orphan
-// TLA-conn@90>                          => s'.rx + s'.tail = 0]_s
-// TLA-conn@90> \* The stack ends a connection only if Ruby is gone, the peer is gone, or
-// TLA-conn@90> \* each has ended its stream.
-// TLA-conn@90> EndsForCause == [][s.phase = "open" /\ s'.phase # "open"
-// TLA-conn@90>                      => \/ s.ruby = "closed" \/ s.orphan \/ s.peer = "gone"
-// TLA-conn@90>                         \/ s.ruby = "shutwr" /\ s.finRcvd]_s
+// TLA-conn@90> \* What the promise sees of this model. Ruby has had its time when the
+// TLA-conn@90> \* tunnel closes, when a deadline of carry is over, and when it closed
+// TLA-conn@90> \* its end with bytes that it had yet to read or to be given.
+// TLA-conn@90> Seen == [dn    |-> IF s.phase = "open" THEN s.rx + s.tail ELSE 0,
+// TLA-conn@90>          dq    |-> s.u2r,
+// TLA-conn@90>          dOpen |-> s.phase = "open" /\ ~s.rxShut /\ ~s.orphan,
+// TLA-conn@90>          dDone |-> ~MayRecv(s),
+// TLA-conn@90>          rGone |-> s.ruby = "closed" \/ s.orphan,
+// TLA-conn@90>          un    |-> s.r2u,
+// TLA-conn@90>          uq    |-> s.tx,
+// TLA-conn@90>          uOpen |-> s.phase = "open" /\ MaySend(s),
+// TLA-conn@90>          uDone |-> s.fdEof,
+// TLA-conn@90>          pGone |-> s.peer = "gone",
+// TLA-conn@90>          late  |-> \/ s.orphan \/ s.gone = "timeout" \/ s.wait = "over"
+// TLA-conn@90>                    \/ s.ruby = "closed" /\ (s.rerr \/ s.rx + s.tail > 0)]
+// TLA-conn@90> Promise == INSTANCE stream
+// TLA-conn@90> \* Every step of this model is a step that the promise allows.
+// TLA-conn@90> Kept == [][Promise!Step(Seen, Seen')]_s
 // TLA-conn@90> \* A dead connection's socket goes, whether or not Ruby ever closes its end.
 // TLA-conn@90> DeadGoes == s.phase = "dead" ~> s.phase = "removed"
 // TLA-conn@90> \* If a peer is silent for good, its socket is closed, or goes.
@@ -1203,7 +1248,7 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 // TLA-conn.cfg>   Fault = "none"
 // TLA-conn.cfg> INVARIANTS RemovedClean DeadEnds NoneWithheld FinIsLast FinIsBare TailIsFirst
 // TLA-conn.cfg>   NoMissedWake NoSpin Settles EndPassedOn FinQueued ClosedWhenDone OrphanRead
-// TLA-conn.cfg> PROPERTIES NoneDropped NoneDroppedAtEnd FromRuby ToRuby EndsForCause DeadGoes SilenceEnds LetGo
+// TLA-conn.cfg> PROPERTIES Kept DeadGoes SilenceEnds LetGo
 // TLA-conn.cfg> CHECK_DEADLOCK FALSE
 //
 // With room for two bytes, a buffer can also be part full.
@@ -1238,16 +1283,16 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 //
 // The socket does not ask a quiet peer to answer:
 //
-// TLA-conn.cfg/no-keep-alive!EndsForCause> Fault = "no keep-alive"
+// TLA-conn.cfg/no-keep-alive!Kept> Fault = "no keep-alive"
 //
 // What Ruby has yet to be given stays in the socket through TIME-WAIT:
 //
-// TLA-conn.cfg/no-tail!NoneDropped> Fault = "no tail"
+// TLA-conn.cfg/no-tail!Kept> Fault = "no tail"
 //
 // A connection is closed when both streams have ended, though Ruby has
 // yet to be given the last bytes that the peer sent:
 //
-// TLA-conn.cfg/early-close!NoneDroppedAtEnd> Fault = "early close"
+// TLA-conn.cfg/early-close!Kept> Fault = "early close"
 //
 // Our FIN is queued behind data that the peer has yet to take. The
 // socket must hold more than a byte for that:

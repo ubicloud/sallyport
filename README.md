@@ -144,6 +144,11 @@ a caller is answered, and how the thread and its handle end. The model
 the TCP socket, what `poll` is asked about the descriptor, and how the
 connection ends.
 
+A third module, `stream`, is what a connection promises to Ruby and to
+the peer, with no word of sockets or descriptors: no byte is lost while
+someone may read it, and a stream ends once, after its last byte. TLC
+checks that every step of `conn` is a step that `stream` allows.
+
 A model is written in the source, as comments beside the code that each
 line describes:
 

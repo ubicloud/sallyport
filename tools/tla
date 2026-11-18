@@ -27,6 +27,9 @@
 #                       P, and nothing else is checked of it. A variant
 #                       can also have no constant to change.
 #
+# A module that has no configuration is not checked alone. Another model
+# has to name it, as "INSTANCE NAME", and is checked with it.
+#
 # The tool adds the first line and the last line of a module. One space
 # after the ">" belongs to the pragma, and the rest of the line is a line
 # of the model, with the indentation that TLA+ reads.
@@ -93,7 +96,11 @@ def gather
   abort "there is no model in the sources" if models.empty?
   models.each_value do |model|
     abort "the model #{model.name} has a configuration and no lines" if model.lines.empty?
-    abort "the model #{model.name} has no configuration, so nothing would check it" if model.cfg.empty?
+    next unless model.cfg.empty?
+    # A module with no configuration is one that a model checks as part
+    # of itself.
+    used = models.each_value.any? { |other| other.lines.any? { |line| line.last.match?(/\bINSTANCE #{model.name}\b/) } }
+    abort "the model #{model.name} has no configuration, and no model is an INSTANCE of it" unless used
   end
   models.values
 end
@@ -155,6 +162,8 @@ def extract(dir)
       last = [file, at]
     end
     File.write(File.join(dir, "#{model.name}.tla"), "#{out.join("\n")}\n====\n")
+    next [] if model.cfg.empty?
+
     runs = [[model, nil, statements(model.cfg)]] + model.variants.each_value.map { |v| [model, v, vary(model, v)] }
     runs.each { |_, variant, statements| write(dir, [model.name, variant&.name].compact.join("."), statements) }
   end
