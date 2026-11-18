@@ -32,6 +32,11 @@ pub enum Opening {
     Failed,
 }
 
+/// What moves bytes into the socket or out of it says how many it moved.
+pub trait Moved {
+    fn bytes(&self) -> usize;
+}
+
 /// One connection's socket, with the bytes that were taken out of it for
 /// Ruby before smoltcp could clear them.
 pub struct Sock<'a, 'b> {
@@ -83,14 +88,14 @@ impl<'a, 'b> Sock<'a, 'b> {
     }
 
     /// Lets `read` put bytes for the peer into the socket's buffer, and
-    /// returns what `read` returned: how many bytes, or what stopped it.
-    pub fn fill(&mut self, mut read: impl FnMut(&mut [u8]) -> isize) -> isize {
-        self.s
-            .send(|buf| {
-                let n = read(buf);
-                (n.max(0) as usize, n)
-            })
-            .unwrap_or(0)
+    /// returns what `read` found. Returns nothing if the socket takes no
+    /// bytes, which carry rules out by asking for room first.
+    pub fn fill<R: Moved>(&mut self, read: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        let filled = |buf: &mut [u8]| {
+            let found = read(buf);
+            (found.bytes(), found)
+        };
+        self.s.send(filled).ok()
     }
 
     /// Says whether the peer has acknowledged all that the socket took.
@@ -113,19 +118,19 @@ impl<'a, 'b> Sock<'a, 'b> {
     }
 
     /// Lets `write` take bytes for Ruby, the oldest first, and returns
-    /// what `write` returned: how many bytes it took, or what stopped it.
-    pub fn drain(&mut self, mut write: impl FnMut(&[u8]) -> isize) -> isize {
+    /// what `write` found. Returns nothing if the socket holds no bytes,
+    /// which carry rules out by asking first.
+    pub fn drain<R: Moved>(&mut self, write: impl FnOnce(&[u8]) -> R) -> Option<R> {
         if !self.tail.is_empty() {
-            let n = write(self.tail.as_slices().0);
-            self.tail.drain(..n.max(0) as usize);
-            return n;
+            let found = write(self.tail.as_slices().0);
+            self.tail.drain(..found.bytes());
+            return Some(found);
         }
-        self.s
-            .recv(|buf| {
-                let n = write(buf);
-                (n.max(0) as usize, n)
-            })
-            .unwrap_or(0)
+        let drained = |buf: &mut [u8]| {
+            let found = write(buf);
+            (found.bytes(), found)
+        };
+        self.s.recv(drained).ok()
     }
 
     /// Says how the handshake of a socket stands. A socket that listens

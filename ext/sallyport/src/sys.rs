@@ -41,53 +41,25 @@ pub fn readable(fd: RawFd) -> usize {
     n.max(0) as usize
 }
 
-/// Ends what the other end of a socket pair can read, after what was
-/// sent already.
-pub fn shutdown_write(fd: RawFd) {
-    unsafe { libc::shutdown(fd, libc::SHUT_WR) };
+/// Shuts down an end of a socket pair. `how` is SHUT_RD for its reading,
+/// SHUT_WR for its writing, or SHUT_RDWR for both.
+pub fn shutdown(fd: RawFd, how: libc::c_int) {
+    unsafe { libc::shutdown(fd, how) };
 }
 
-/// Ends what the other end of a socket pair can write: a write to it
-/// fails from now on. What it wrote already can still be read here.
-pub fn shutdown_read(fd: RawFd) {
-    unsafe { libc::shutdown(fd, libc::SHUT_RD) };
-}
-
-/// Shuts an end of a socket pair down both ways. The other end reads what
-/// was sent already and then the end, and a write to it fails.
-pub fn shutdown(fd: RawFd) {
-    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
-}
-
-/// poll(2) reports one of these of an end of a socket pair, whatever
-/// events it is asked about.
-#[derive(Clone, Copy, PartialEq)]
-pub enum Hangup {
-    /// Bytes can still go one way or the other.
-    No,
-    /// No more can go either way: the other end is closed, or this end is
-    /// shut down both ways, or each end has shut down its writing.
-    Yes,
-    /// The other end is closed, and it had not read all that it was sent.
-    Unread,
-}
-
-pub fn hangup(fd: RawFd) -> Hangup {
-    let mut p = libc::pollfd { fd, events: 0, revents: 0 };
+/// Returns what poll(2) reports of a descriptor now, when it is asked
+/// about these events. It reports a hangup and an error whatever it is
+/// asked.
+pub fn revents(fd: RawFd, events: libc::c_short) -> libc::c_short {
+    let mut p = libc::pollfd { fd, events, revents: 0 };
     unsafe { libc::poll(&mut p, 1, 0) };
-    match p.revents {
-        r if r & libc::POLLERR != 0 => Hangup::Unread,
-        r if r & libc::POLLHUP != 0 => Hangup::Yes,
-        _ => Hangup::No,
-    }
+    p.revents
 }
 
 /// Says whether the other end of a socket pair will send no more: it is
 /// closed, or it has shut down its writing.
 pub fn ended(fd: RawFd) -> bool {
-    let mut p = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
-    unsafe { libc::poll(&mut p, 1, 0) };
-    p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP) != 0
+    revents(fd, libc::POLLRDHUP) & (libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP) != 0
 }
 
 /// Waits until a descriptor is ready or the time has passed, for a second

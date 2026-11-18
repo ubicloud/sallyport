@@ -10,6 +10,7 @@ mod config;
 mod engine;
 mod keys;
 mod packet;
+mod pair;
 mod peers;
 mod sock;
 mod sys;

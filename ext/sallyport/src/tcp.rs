@@ -7,8 +7,9 @@
 
 use crate::config::Config;
 use crate::packet::{rst, split_fin, syn, without_sack};
+use crate::pair::{Gave, Hangup, Pair, Took};
 use crate::sock::{Opening, Sock, Up};
-use crate::sys::{self, Hangup, Sent};
+use crate::sys::{self, Sent};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -17,7 +18,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndp
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 /// A socket holds this many bytes that Ruby wrote, until the peer has
@@ -163,7 +164,7 @@ struct Conn {
     handle: SocketHandle,
     /// Our end of the pair. An inbound connection has none until it is
     /// established, and no connection has one once it is closed to Ruby.
-    fd: Option<OwnedFd>,
+    pair: Option<Pair>,
     phase: Phase,
     /// The port of the listener that has yet to send Ruby this inbound
     /// connection.
@@ -172,14 +173,6 @@ struct Conn {
     theirs: Option<OwnedFd>,
     /// The local port that an outbound connection took.
     local_port: Option<u16>,
-    /// Nothing more comes from the pair. A read of our end returned 0,
-    /// which says that Ruby has written all that it will, and our FIN
-    /// follows the data. Or the peer cut the connection, and carry shut
-    /// down the reading of our end.
-    fd_eof: bool,
-    /// The peer's FIN has been passed on to Ruby, as a shutdown of our
-    /// end.
-    rx_shut: bool,
     /// When poll first reported a hangup on our end. Either Ruby has
     /// closed its end, or each side has shut down its writing, which poll
     /// does not tell apart. In both cases Ruby has no more to say, and
@@ -191,34 +184,21 @@ struct Conn {
     /// The tail holds what the peer sent last and Ruby has yet to be
     /// given, once that is taken out of the socket's buffer.
     tail: VecDeque<u8>,
-    /// The pair has refused a write: Ruby will read no more. It has
-    /// closed its end, or it has shut down its reading and may still
-    /// write. What the peer sends from then on stays in the socket.
-    deaf: bool,
 }
 
 impl Conn {
-    fn new(handle: SocketHandle, fd: Option<OwnedFd>, phase: Phase) -> Conn {
+    fn new(handle: SocketHandle, pair: Option<Pair>, phase: Phase) -> Conn {
         Conn {
             handle,
-            fd,
+            pair,
             phase,
             listener: None,
             theirs: None,
             local_port: None,
-            fd_eof: false,
-            rx_shut: false,
             app_gone: None,
             fin_wait: None,
             tail: VecDeque::new(),
-            deaf: false,
         }
-    }
-
-    /// Returns our end of the pair as a system call takes it, or -1 if
-    /// there is none.
-    fn raw(&self) -> RawFd {
-        self.fd.as_ref().map_or(-1, |fd| fd.as_raw_fd())
     }
 }
 
@@ -287,7 +267,7 @@ impl Conn {
 // TLA-conn@0>   u2r     |-> 0,        \* the bytes that carry wrote and Ruby has not read
 // TLA-conn@0>   rerr    |-> FALSE,    \* Ruby closed with bytes unread, and a read of the pair will fail
 // TLA-conn@0>   rdShut  |-> FALSE,    \* Ruby has shut down its reading, and a write to the pair will fail
-// TLA-conn@0>   deaf    |-> FALSE,    \* Conn.deaf: the pair has refused a write
+// TLA-conn@0>   deaf    |-> FALSE,    \* Pair::deaf: the pair has refused a write
 // TLA-conn@0>   wleft   |-> Budget,   \* the bytes that Ruby may still write
 // TLA-conn@0>   up      |-> "open",   \* Sock::up: "open", "ending" (our FIN is queued) or "ended"
 // TLA-conn@0>   down    |-> TRUE,     \* Sock::down_open: the peer may still send
@@ -300,8 +280,8 @@ impl Conn {
 // TLA-conn@0>   pleft   |-> Budget,   \* the bytes that the peer may still send
 // TLA-conn@0>   stuck   |-> FALSE,    \* the peer holds its window shut: it answers, and takes no data
 // TLA-conn@0>   finRcvd |-> FALSE,    \* the peer's FIN has arrived
-// TLA-conn@0>   fdEof   |-> FALSE,    \* Conn.fd_eof
-// TLA-conn@0>   rxShut  |-> FALSE,    \* Conn.rx_shut
+// TLA-conn@0>   fdEof   |-> FALSE,    \* Pair::done
+// TLA-conn@0>   rxShut  |-> FALSE,    \* Pair::told
 // TLA-conn@0>   orphan  |-> FALSE,    \* Stack.closing: the tunnel is closing, and has shut the pair down
 // TLA-conn@0>   gone    |-> "no",     \* Conn.app_gone: "no", "yes" or "timeout" (TCP_TIMEOUT ago)
 // TLA-conn@0>   wait    |-> "no",     \* Conn.fin_wait: "no", "yes" or "over" (FIN_WAIT ago)
@@ -314,7 +294,7 @@ impl Conn {
 // TLA-conn@0> Min(a, b) == IF a < b THEN a ELSE b
 // TLA-conn@0> \* The socket is the one that sock.rs describes, and no more of smoltcp
 // TLA-conn@0> \* shows here than that file lets carry see.
-// TLA-conn@0> \* sys::hangup. poll reports a hangup on our end when no more can go
+// TLA-conn@0> \* Pair::hangup. poll reports a hangup on our end when no more can go
 // TLA-conn@0> \* either way. Ruby has closed its end, or the tunnel has shut the pair
 // TLA-conn@0> \* down. Or carry has shut down the writing of our end, to pass on the
 // TLA-conn@0> \* peer's FIN, and nothing comes the other way: Ruby has shut down its
@@ -563,7 +543,7 @@ impl Stack {
         }
         let handle = self.sockets.add(s);
         let phase = Phase::Connecting(self.clock);
-        self.conns.push(Conn { local_port: Some(local), ..Conn::new(handle, Some(fd), phase) });
+        self.conns.push(Conn { local_port: Some(local), ..Conn::new(handle, Some(Pair::new(fd)), phase) });
     }
 
     /// Listens on a TCP port. `ctl` is our end of the pair on which Ruby
@@ -711,9 +691,9 @@ impl Stack {
                 s.state(),
                 s.send_queue(),
                 s.recv_queue() + c.tail.len(),
-                sys::readable(c.raw()),
-                if c.fd_eof { ", Ruby has ended its stream" } else { "" },
-                if c.rx_shut { ", the peer has ended its stream" } else { "" },
+                c.pair.as_ref().map_or(0, Pair::waiting),
+                if c.pair.as_ref().is_some_and(Pair::done) { ", no more comes from Ruby" } else { "" },
+                if c.pair.as_ref().is_some_and(Pair::told) { ", the peer has ended its stream" } else { "" },
                 if c.app_gone.is_some() { ", Ruby is gone" } else { "" },
             );
             let mut detail = format!("{s:?}");
@@ -765,13 +745,10 @@ impl Stack {
         for c in &mut self.conns {
             // The next step resets a connection that Ruby was not sent.
             c.listener = None;
-            // A pair that is shut down both ways is to our end what a
-            // pair is whose other end Ruby has closed. A read gives what
-            // Ruby had written and then the end, a write fails, and poll
-            // reports a hangup. Ruby reads what it was given and then the
-            // end, and the kernel refuses what it writes from now on.
-            if let Some(fd) = &c.fd {
-                sys::shutdown(fd.as_raw_fd());
+            // To our end, the pair is then what a pair is whose other
+            // end Ruby has closed.
+            if let Some(pair) = &c.pair {
+                pair.shut();
             }
         }
     }
@@ -837,7 +814,7 @@ impl Stack {
                     if matches!(fate, Fate::Abort) {
                         s.abort();
                     }
-                    c.fd = None;
+                    c.pair = None;
                     c.theirs = None;
                     c.listener = None;
                     c.phase = Phase::Dead(self.clock);
@@ -890,6 +867,7 @@ impl Stack {
             // poll reports a hangup whether asked or not. So a descriptor
             // with no events asked of it is watched for Ruby closing its
             // end, and for nothing else.
+            let Some(pair) = &c.pair else { continue };
             let events = match c.phase {
                 Phase::Listening | Phase::Accepting | Phase::Dead(_) => continue,
                 // Ruby may write before it has the status, and nothing
@@ -901,8 +879,8 @@ impl Stack {
                     // written while the socket has bytes for Ruby, unless
                     // the pair has refused them.
                     let (room, holds) = Sock::asks(s, &c.tail);
-                    let read = if !c.fd_eof && room { libc::POLLIN } else { 0 };
-                    let write = if holds && !c.deaf { libc::POLLOUT } else { 0 };
+                    let read = if !pair.done() && room { libc::POLLIN } else { 0 };
+                    let write = if holds && !pair.deaf() { libc::POLLOUT } else { 0 };
                     // Once the hangup has been seen, poll would return
                     // for it for ever.
                     if read | write == 0 && c.app_gone.is_some() {
@@ -911,7 +889,7 @@ impl Stack {
                     read | write
                 }
             };
-            fds.push(libc::pollfd { fd: c.raw(), events, revents: 0 });
+            fds.push(libc::pollfd { fd: pair.raw(), events, revents: 0 });
         }
     }
 }
@@ -1025,7 +1003,7 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
         }
         // Ruby gave up waiting, and closed its end. Or the tunnel is
         // closing, and has shut the pair down.
-        Phase::Connecting(_) if sys::hangup(c.raw()) != Hangup::No => (true, Fate::Abort),
+        Phase::Connecting(_) if c.pair.as_ref().is_none_or(|pair| pair.hangup() != Hangup::No) => (true, Fate::Abort),
         // Ruby closed the listener.
         Phase::Listening | Phase::Accepting if c.listener.is_none() => (true, Fate::Abort),
         Phase::Listening => match Sock::opening(s) {
@@ -1035,7 +1013,7 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
             Opening::Failed => (true, Fate::Close),
             Opening::Done => match sys::socketpair(libc::SOCK_STREAM) {
                 Ok((ours, theirs)) => {
-                    c.fd = Some(ours);
+                    c.pair = Some(Pair::new(ours));
                     c.theirs = Some(theirs);
                     c.phase = Phase::Accepting;
                     (true, Fate::Keep)
@@ -1072,11 +1050,15 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
                 // smoltcp does not say whether a reset or its timeout
                 // closed the socket, so the time taken has to.
                 let late = now - since + Duration::from_secs(1) >= TCP_TIMEOUT;
-                sys::send(c.raw(), &[if late { status::TIMED_OUT } else { status::REFUSED }]);
+                if let Some(pair) = &c.pair {
+                    pair.say(if late { status::TIMED_OUT } else { status::REFUSED });
+                }
                 (true, Fate::Close)
             }
             Opening::Done => {
-                sys::send(c.raw(), &[status::OK]);
+                if let Some(pair) = &c.pair {
+                    pair.say(status::OK);
+                }
                 c.phase = Phase::Open;
                 (true, Fate::Keep)
             }
@@ -1094,6 +1076,8 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
 /// Moves bytes each way for an open connection, and passes on the end of
 /// each direction.
 fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fate) {
+    // An open connection has a pair.
+    let Some(pair) = c.pair.as_mut() else { return (true, Fate::Abort) };
     let mut moved = false;
 
     // A pass of carry is the steps of the model that follow, each from the
@@ -1112,25 +1096,20 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fat
     // TLA-conn>                end == more /\ ~t.rerr /\ (t.ruby # "open" \/ t.orphan)
     // TLA-conn>            IN [t EXCEPT !.fdEof = eof \/ end, !.tx = @ + n, !.r2u = @ - n,
     // TLA-conn>                         !.moved = n > 0 \/ end, !.fate = IF more /\ t.rerr THEN "abort" ELSE "keep"]
-    let fd = c.raw();
-    if !c.fd_eof && s.up() != Up::Open {
+    if !pair.done() && s.up() != Up::Open {
         // The peer reset the connection, or it timed out, and nothing
-        // that Ruby writes from now on can be sent. So the reading of
-        // the pair is shut down, and a write by Ruby fails, as a write to
-        // a TCP socket does once it is reset.
-        sys::shutdown_read(fd);
-        c.fd_eof = true;
+        // that Ruby writes from now on can be sent. A write by Ruby then
+        // fails, as a write to a TCP socket does once it is reset.
+        pair.stop();
     }
-    while !c.fd_eof && s.has_room() {
-        match s.fill(|buf| sys::read(fd, buf)) {
-            n if n > 0 => moved = true,
-            0 => {
-                c.fd_eof = true;
-                moved = true;
-            }
-            sys::AGAIN => break,
-            // Ruby closed its end with bytes from us unread.
-            _ => return (true, Fate::Abort),
+    while !pair.done() && s.has_room() {
+        match s.fill(|buf| pair.read(buf)) {
+            Some(Took::Bytes(_) | Took::End) => moved = true,
+            // The peer sent the bytes that Ruby left unread, and it is
+            // reset, as a TCP socket of the kernel resets it when it is
+            // closed with bytes unread.
+            Some(Took::Reset) => return (true, Fate::Abort),
+            Some(Took::Nothing) | None => break,
         }
     }
     // Our FIN follows what Ruby wrote, and it waits until the peer has
@@ -1138,20 +1117,44 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fat
     // TLA-conn> Fin(t) == IF t.up = "open" /\ t.fdEof /\ (t.tx = 0 \/ Fault = "early fin")
     // TLA-conn>           THEN [t EXCEPT !.up = "ending", !.last = ~t.down, !.moved = TRUE]
     // TLA-conn>           ELSE t
-    if s.up() == Up::Open && c.fd_eof && s.all_acknowledged() {
+    if s.up() == Up::Open && pair.done() && s.all_acknowledged() {
         s.end();
         moved = true;
     }
+
+    // TLA-conn> \* Ruby is given what the socket holds, for as much as the pair has
+    // TLA-conn> \* room. The pair refuses a write when Ruby will read no more: it has
+    // TLA-conn> \* closed its end or shut down its reading, or orphan has shut the pair
+    // TLA-conn> \* down. carry then writes no more, and the socket keeps what it holds.
+    // TLA-conn> Give(t) == LET n == Min(t.rx, PairCap - t.u2r)
+    // TLA-conn>            IN IF t.rx = 0 \/ t.deaf THEN t
+    // TLA-conn>               ELSE IF t.ruby = "closed" \/ t.orphan \/ t.rdShut THEN [t EXCEPT !.deaf = TRUE]
+    // TLA-conn>               ELSE [t EXCEPT !.rx = @ - n, !.u2r = @ + n, !.moved = @ \/ n > 0]
+    // The socket keeps what the pair refuses, as a TCP socket of the
+    // kernel does, and the peer is held once the socket is full. Nothing
+    // is dropped while the connection lasts.
+    while !pair.deaf() && s.holds() {
+        match s.drain(|buf| pair.write(buf)) {
+            Some(Gave::Bytes(_)) => moved = true,
+            _ => break,
+        }
+    }
+    // TLA-conn> End(t) == IF ~t.down /\ t.rx = 0 /\ (~t.rxShut \/ Fault = "restless")
+    // TLA-conn>           THEN [t EXCEPT !.rxShut = TRUE, !.moved = TRUE] ELSE t
+    if !pair.told() && !s.down_open() && !s.holds() {
+        // The peer will send no more, and Ruby has been given all of it.
+        pair.end();
+        moved = true;
+    }
+
     // TLA-conn> \* poll also tells of a Ruby that closed its end with bytes that it had
     // TLA-conn> \* not read, whether or not carry reads the pair.
     // TLA-conn> Hung(t) == IF t.gone # "no" \/ ~HungUp(t) THEN t
     // TLA-conn>            ELSE IF t.rerr THEN [t EXCEPT !.fate = "abort"] ELSE [t EXCEPT !.gone = "yes"]
     if c.app_gone.is_none() {
-        match sys::hangup(fd) {
+        match pair.hangup() {
             Hangup::No => {}
             Hangup::Yes => c.app_gone = Some(now),
-            // The peer sent those bytes, and it is reset, as a TCP socket
-            // of the kernel resets it when it is closed with bytes unread.
             Hangup::Unread => return (true, Fate::Abort),
         }
     }
@@ -1163,36 +1166,8 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fat
         c.fin_wait = Some(now);
     }
 
-    // TLA-conn> \* Ruby is given what the socket holds, for as much as the pair has
-    // TLA-conn> \* room. The pair refuses a write when Ruby will read no more: it has
-    // TLA-conn> \* closed its end or shut down its reading, or orphan has shut the pair
-    // TLA-conn> \* down. carry then writes no more, and the socket keeps what it holds.
-    // TLA-conn> Give(t) == LET n == Min(t.rx, PairCap - t.u2r)
-    // TLA-conn>            IN IF t.rx = 0 \/ t.deaf THEN t
-    // TLA-conn>               ELSE IF t.ruby = "closed" \/ t.orphan \/ t.rdShut THEN [t EXCEPT !.deaf = TRUE]
-    // TLA-conn>               ELSE [t EXCEPT !.rx = @ - n, !.u2r = @ + n, !.moved = @ \/ n > 0]
-    // The pair refuses a write when Ruby reads no more. The socket then
-    // keeps the bytes, as a TCP socket of the kernel does, and the peer
-    // is held once the socket is full. Nothing is dropped while the
-    // connection lasts.
-    while !c.deaf && s.holds() {
-        match s.drain(|buf| sys::send(fd, buf)) {
-            n if n > 0 => moved = true,
-            sys::AGAIN => break,
-            _ => c.deaf = true,
-        }
-    }
-    // TLA-conn> End(t) == IF ~t.down /\ t.rx = 0 /\ (~t.rxShut \/ Fault = "restless")
-    // TLA-conn>           THEN [t EXCEPT !.rxShut = TRUE, !.moved = TRUE] ELSE t
-    if !c.rx_shut && !s.down_open() && !s.holds() {
-        // The peer will send no more, and Ruby has been given all of it.
-        sys::shutdown_write(fd);
-        c.rx_shut = true;
-        moved = true;
-    }
-
     // TLA-conn> Fated(t) == [t EXCEPT !.fate =
-    // TLA-conn>     IF t.up = "ended" /\ ~t.down /\ t.fdEof /\ (t.rxShut \/ Fault = "early close") THEN "close"
+    // TLA-conn>     IF t.up = "ended" /\ ~t.down /\ (t.rxShut \/ Fault = "early close") THEN "close"
     // TLA-conn>     ELSE IF t.gone # "no" /\ t.rx > 0 THEN "abort"
     // TLA-conn>     ELSE IF t.up = "ended" /\ t.down /\ (t.orphan \/ t.wait = "over") THEN "abort"
     // TLA-conn>     ELSE IF t.gone = "timeout" /\ Fault # "no deadline" THEN "abort"
@@ -1202,10 +1177,10 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fat
     let waited = c.fin_wait.map(|since| now - since);
     let fate = match (s.up(), s.down_open()) {
         // Each stream has ended, and each end has been told.
-        (Up::Ended, false) if c.fd_eof && c.rx_shut => Fate::Close,
+        (Up::Ended, false) if pair.told() => Fate::Close,
         // Ruby has left, and the socket holds bytes that it did not take.
-        // The peer is reset, as a TCP socket of the kernel resets it when
-        // it is closed with bytes unread.
+        // The peer is reset, as it is for bytes that Ruby left unread in
+        // the pair.
         _ if c.app_gone.is_some() && s.holds() => Fate::Abort,
         // The peer has all that Ruby wrote, and is given a while to end
         // its stream too. What it sends in that time is reset above, for
@@ -1225,7 +1200,7 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fat
 // TLA-conn@60> \* later step. The set of one element has TLC work out t once, where it
 // TLA-conn@60> \* would otherwise work it out again for each place that names it.
 // TLA-conn@60> Then(t, Step(_)) == CHOOSE r \in {IF v.fate = "abort" THEN v ELSE Step(v) : v \in {t}} : TRUE
-// TLA-conn@60> Pass(t) == Then(Then(Then(Then(Then(Then(Read(t), Fin), Hung), Waits), Give), End), Fated)
+// TLA-conn@60> Pass(t) == Then(Then(Then(Then(Then(Then(Read(t), Fin), Give), End), Hung), Waits), Fated)
 //
 // TLA-conn@90> Loop == PumpOpen(s.kick \/ FdReady(s)) \/ PumpDead \/ Dispatch \/ Tick
 // TLA-conn@90> \* The tick turns the loop four times a second, whatever else happens.
@@ -1267,7 +1242,7 @@ fn carry(c: &mut Conn, s: &mut Sock, now: Duration, closing: bool) -> (bool, Fat
 // TLA-conn@90> \* that finds the end of what Ruby wrote to a tunnel that is closing.
 // TLA-conn@90> EndPassedOn == s.phase = "open" /\ ~s.kick /\ ~s.down /\ s.rx = 0 => s.rxShut
 // TLA-conn@90> FinQueued == s.phase = "open" /\ ~s.kick /\ s.fdEof /\ s.up = "open" => s.tx > 0
-// TLA-conn@90> ClosedWhenDone == s.phase = "open" /\ ~s.kick => ~(s.up = "ended" /\ ~s.down /\ s.fdEof /\ s.rxShut)
+// TLA-conn@90> ClosedWhenDone == s.phase = "open" /\ ~s.kick => ~(s.up = "ended" /\ ~s.down /\ s.rxShut)
 // TLA-conn@90> OrphanRead == s.phase = "open" /\ ~s.kick /\ s.orphan /\ s.up = "open" /\ s.tx < TxCap => s.fdEof
 // TLA-conn@90> \* What the promise sees of this model. Ruby has had its time when the
 // TLA-conn@90> \* tunnel closes, when a deadline of carry is over, and when it closed
@@ -1380,7 +1355,7 @@ mod tests {
     use crate::config;
     use std::io::{Read, Write};
     use std::net::Shutdown;
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{FromRawFd, RawFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
     const A: &str = "10.9.0.1";
@@ -2466,7 +2441,7 @@ mod tests {
         client.write_all(b"still talking").unwrap();
         settle(&mut a, &mut b);
         assert_eq!(read(&mut server), (b"still talking".to_vec(), false));
-        assert!(a.conns.len() == 1 && a.conns[0].deaf && b.conns.len() == 1);
+        assert!(a.conns.len() == 1 && a.conns[0].pair.as_ref().unwrap().deaf() && b.conns.len() == 1);
         assert_eq!(held(&a), b"unheard".len(), "the socket keeps what the pair refused");
         // The end leaves bytes that it did not take, and the peer is told.
         drop(client);
