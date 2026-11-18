@@ -1,6 +1,21 @@
 # frozen_string_literal: true
 
 module Sallyport
+  # A Peer is what a tunnel knows of one of its peers: the peer's public
+  # key, the address and port that it was last heard from or was
+  # configured with, the seconds since its last handshake, and the bytes
+  # of the packets sent to it and received from it. The endpoint and the
+  # age are nil where there is none.
+  Peer = Struct.new(:public_key, :endpoint, :handshake_age, :tx_bytes, :rx_bytes) do
+    # Says whether the peer completed a handshake in the last +within+
+    # seconds. WireGuard uses a session for three minutes at most. A
+    # handshake older than that means that no session is left, because
+    # the peer cannot be reached or because nothing was sent to it.
+    def alive?(within: 180)
+      !handshake_age.nil? && handshake_age <= within
+    end
+  end
+
   # A WireGuard interface inside this process. A thread of its own serves
   # it, and that thread never takes the GVL. There is no TUN device, no
   # routing table and no privilege: all that the system sees of a tunnel
@@ -11,6 +26,10 @@ module Sallyport
   # tunnel's descriptors, and the UDP port stays bound until the child
   # ends or calls exec.
   class Tunnel
+    # The tunnel's UDP port, which the system chose if the configuration
+    # named none.
+    attr_reader :listen_port
+
     # Starts a tunnel from a configuration in the format of wg-quick(8), or
     # from the parts that Tunnel.config takes. An endpoint that is a host
     # name is resolved now, and not again. Nothing can interrupt the call
@@ -43,6 +62,7 @@ module Sallyport
         # holder, so whichever comes first is the only one to free it.
         @holder = [handle]
         ObjectSpace.define_finalizer(self, self.class.finalizer(@holder, @pid))
+        @listen_port = Native::PORT.call(handle)
         nil
       end
       return unless code
@@ -71,6 +91,15 @@ module Sallyport
 
     def closed?
       @holder.empty?
+    end
+
+    # Returns a Peer for each peer, in the order of the configuration.
+    # What it says is a quarter of a second old at most.
+    def peers
+      stats.lines.map do |line|
+        key, endpoint, age, tx, rx = line.split
+        Peer.new(key, (endpoint unless endpoint == "-"), (age.to_i / 1000.0 unless age == "-1"), tx.to_i, rx.to_i)
+      end
     end
 
     # Returns the configuration, in the format of wg-quick(8), of a tunnel
@@ -128,6 +157,26 @@ module Sallyport
     # thread.
     def synchronize(&)
       @lock.synchronize(&)
+    end
+
+    # Returns the handle for a call into the library. The caller holds the
+    # lock, so that the tunnel is not closed while the call runs.
+    def handle
+      handle = @holder.first or raise IOError, "the tunnel is closed"
+      raise Error, "a tunnel does not survive fork" unless @pid == Process.pid
+
+      handle
+    end
+
+    def stats
+      size = 4096
+      loop do
+        text = Fiddle::Pointer.malloc(size, Fiddle::RUBY_FREE)
+        need = synchronize { Native::STATS.call(handle, text, size) }
+        return text.to_s.force_encoding(Encoding::UTF_8) if need <= size
+
+        size = need * 2
+      end
     end
   end
 end

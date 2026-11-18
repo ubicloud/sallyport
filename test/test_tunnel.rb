@@ -24,6 +24,36 @@ class TestTunnel < Minitest::Test
     t.close
   end
 
+  def test_a_tunnel_tells_its_port
+    key, = keypair
+    port = free_udp_port
+    assert_equal port, tunnel(private_key: key, addresses: ["10.9.0.1"], listen_port: port).listen_port
+    assert_operator tunnel(private_key: key, addresses: ["10.9.0.1"]).listen_port, :>, 0
+  end
+
+  def test_a_peer_before_its_handshake
+    key, = keypair
+    _, first = keypair
+    _, second = keypair
+    peers = [{public_key: first, endpoint: "127.0.0.1:9", allowed_ips: ["10.9.0.2/32"]}, {public_key: second}]
+    t = tunnel(private_key: key, addresses: ["10.9.0.1"], peers: peers)
+    assert_equal [[first, "127.0.0.1:9", nil, 0, 0], [second, nil, nil, 0, 0]], t.peers.map(&:to_a)
+    assert_equal [Encoding::UTF_8] * 2, t.peers.first.first(2).map(&:encoding)
+    refute t.peers.first.alive?
+    t.close
+    assert_raises(IOError) { t.peers }
+  end
+
+  # b's keepalive has it shake hands with a, which was not told where b
+  # is and learns it from the handshake.
+  def test_two_tunnels_shake_hands
+    a, b = pair(persistent_keepalive: 1)
+    assert_nil a.peers.first.endpoint
+    eventually { a.peers.first.alive? && b.peers.first.alive? }
+    assert_equal "127.0.0.1:#{b.listen_port}", a.peers.first.endpoint
+    assert_operator b.peers.first.handshake_age, :<, 10
+  end
+
   def test_a_configuration_for_wg_quick
     key, = keypair
     _, peer = keypair

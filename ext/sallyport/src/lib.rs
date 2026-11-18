@@ -20,6 +20,9 @@ use std::thread::JoinHandle;
 pub struct Handle {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// The UDP port, which the system chose if the configuration named
+    /// none.
+    port: u16,
 }
 
 /// Copies as much of the text as fits into the buffer, in whole
@@ -55,10 +58,11 @@ fn open(conf: &str) -> Result<Handle, (c_int, String)> {
         port => format!("UDP port {port}"),
     };
     let udp = sys::udp_socket(cfg.listen_port).map_err(|e| refused(&what, e))?;
+    let port = udp.0.local_addr().map_err(|e| refused(&what, e))?.port();
     let wake = sys::pipe().map_err(|e| refused("a pipe", e))?;
     let (engine, shared) = Engine::new(&cfg, udp, wake).map_err(fault)?;
     let thread = std::thread::Builder::new().name("sallyport".into()).spawn(move || engine.run());
-    Ok(Handle { shared, thread: Some(thread.map_err(|e| refused("a thread", e))?) })
+    Ok(Handle { shared, thread: Some(thread.map_err(|e| refused("a thread", e))?), port })
 }
 
 /// Returns the library's version, which the gem checks against its own.
@@ -108,6 +112,31 @@ pub unsafe extern "C" fn sp_close(h: *mut c_void) {
     }
     // The pipe is closed here, as the handle is dropped. The thread has
     // ended, and nothing else can write to the pipe or wait on it.
+}
+
+/// Returns the tunnel's UDP port.
+///
+/// # Safety
+/// `h` came from sp_open.
+#[no_mangle]
+pub unsafe extern "C" fn sp_port(h: *mut c_void) -> c_int {
+    let h = &*h.cast::<Handle>();
+    h.port.into()
+}
+
+/// Writes the state of the peers, as Peers::stats gives it and as it was
+/// at most a quarter of a second ago, into `buf`. Returns how many bytes
+/// the whole of it needs. If that is more than `len`, what was written
+/// is cut short.
+///
+/// # Safety
+/// `h` came from sp_open, and `buf` has room for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sp_stats(h: *mut c_void, buf: *mut c_char, len: usize) -> usize {
+    let h = &*h.cast::<Handle>();
+    let stats = h.shared.stats.lock().unwrap_or_else(|e| e.into_inner());
+    put(buf, len, &stats);
+    stats.len() + 1
 }
 
 /// Writes a new private key, in base64, into 45 bytes. Returns 0, or -1

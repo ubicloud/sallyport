@@ -3,10 +3,11 @@
 //! packet goes to.
 
 use crate::config::{contains, Config, Net};
-use crate::keys::Key;
+use crate::keys::{self, Key};
 use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use std::fmt::Write;
 use std::net::{IpAddr, SocketAddr};
 
 /// A Sender is how a datagram leaves. A tunnel gives one that writes to its
@@ -177,6 +178,18 @@ impl Peers {
             }
         }
     }
+
+    /// Writes a line for each peer: its public key, its endpoint or "-",
+    /// the milliseconds since its last handshake or -1, and the bytes of
+    /// the packets sent to it and received from it.
+    pub fn stats(&self, out: &mut String) {
+        for peer in &self.list {
+            let (age, sent, received, _, _) = peer.tunn.stats();
+            let endpoint = peer.endpoint.map_or("-".into(), |e| e.to_string());
+            let age = age.map_or(-1, |age| age.as_millis() as i64);
+            let _ = writeln!(out, "{} {endpoint} {age} {sent} {received}", keys::encode(&peer.public));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +288,25 @@ mod tests {
         let mut datagrams = sent(&mut b, &ip(B, A));
         settle(&mut a, &mut b, &mut datagrams, 7);
         assert_eq!(a.list[0].endpoint, Some(at(7)));
+    }
+
+    #[test]
+    fn a_peer_is_described_in_a_line() {
+        let (mut a, mut b) = pair();
+        let described = |peers: &Peers| {
+            let mut text = String::new();
+            peers.stats(&mut text);
+            text
+        };
+        assert_eq!(described(&a), format!("{} - -1 0 0\n", key(2).1));
+        assert_eq!(described(&b), format!("{} 192.0.2.1:1 -1 0 0\n", key(1).1));
+        let mut datagrams = sent(&mut b, &ip(B, A));
+        settle(&mut a, &mut b, &mut datagrams, 2);
+        let text = described(&a);
+        let fields: Vec<&str> = text.split(' ').collect();
+        assert_eq!(fields[..2], [key(2).1.as_str(), "192.0.2.1:2"]);
+        assert!(fields[2].parse::<u32>().unwrap() < 60_000, "the handshake was a moment ago");
+        assert_eq!(fields[3..], ["0", "24\n"], "A received the 24 bytes of the packet");
     }
 
     #[test]

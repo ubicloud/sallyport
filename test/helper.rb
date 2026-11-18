@@ -34,6 +34,29 @@ module Helper
     t
   end
 
+  # Starts two tunnels that are each other's peer: a at 10.9.0.1 and
+  # fd09::1, and b at 10.9.0.2 and fd09::2. Only b is told where its peer
+  # is, and +peer+ adds to what b is told of it.
+  def pair(**peer)
+    (a_key, a_public), (b_key, b_public) = keypair, keypair
+    a_is = {public_key: a_public, allowed_ips: ["10.9.0.1/32", "fd09::1/128"]}
+    b_is = {public_key: b_public, allowed_ips: ["10.9.0.2/32", "fd09::2/128"]}
+    a = tunnel(private_key: a_key, addresses: ["10.9.0.1", "fd09::1"], peers: [b_is])
+    b_peer = a_is.merge(endpoint: "127.0.0.1:#{a.listen_port}", **peer)
+    [a, tunnel(private_key: b_key, addresses: ["10.9.0.2", "fd09::2"], peers: [b_peer])]
+  end
+
+  # Waits until the block returns a true value, and returns it. Fails the
+  # test if that takes more than +within+ seconds.
+  def eventually(within: 10)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + within
+    until (value = yield)
+      flunk "it did not happen in #{within} seconds" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.02
+    end
+    value
+  end
+
   # Returns a UDP port that was free a moment ago.
   def free_udp_port
     socket = UDPSocket.new

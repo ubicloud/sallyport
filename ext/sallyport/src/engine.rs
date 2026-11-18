@@ -7,7 +7,7 @@ use crate::sys;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// boringtun's timers run this often.
@@ -24,6 +24,9 @@ pub struct Shared {
     pub wake_r: OwnedFd,
     pub wake_w: OwnedFd,
     pub stop: AtomicBool,
+    /// The state of the peers as Peers::stats writes it, and as it was
+    /// when the timers last ran.
+    pub stats: Mutex<String>,
 }
 
 impl Shared {
@@ -53,10 +56,18 @@ impl Engine {
         (wake_r, wake_w): (OwnedFd, OwnedFd),
     ) -> Result<(Engine, Arc<Shared>), String> {
         let peers = Peers::new(cfg)?;
-        let shared = Arc::new(Shared { wake_r, wake_w, stop: AtomicBool::new(false) });
+        let shared = Arc::new(Shared { wake_r, wake_w, stop: AtomicBool::new(false), stats: Mutex::default() });
         let engine =
             Engine { shared: shared.clone(), udp, udp_v6, peers, next_tick: Instant::now(), buf: vec![0; 65536] };
+        engine.publish();
         Ok((engine, shared))
+    }
+
+    /// Writes the state of the peers where sp_stats reads it.
+    fn publish(&self) {
+        let mut text = String::new();
+        self.peers.stats(&mut text);
+        *self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = text;
     }
 
     /// Takes datagrams from the UDP socket and gives them to the peers.
@@ -75,6 +86,7 @@ impl Engine {
     fn tick(&mut self) {
         let (udp, v6) = (&self.udp, self.udp_v6);
         self.peers.tick(&mut |d, to| sys::udp_send(udp, v6, d, to));
+        self.publish();
     }
 
     pub fn run(mut self) {
