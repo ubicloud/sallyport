@@ -737,13 +737,18 @@ impl Stack {
         }
     }
 
-    /// Takes in the packets that arrived, has every socket send what it
-    /// has to send, and then moves each connection on. Returns whether a
-    /// connection moved, in which case the stack has more to do.
+    /// Takes in the packets that arrived, moves each connection on, and
+    /// then has every socket send what it has to send. So an ACK tells the
+    /// peer of the room that there is once Ruby has been given its bytes,
+    /// and what Ruby wrote leaves in the turn that took it. Returns
+    /// whether a connection moved, in which case the stack has more to do.
     pub fn turn(&mut self) -> bool {
+        // The connections' times are judged by the clock as it is now.
+        self.now();
         self.ingress();
+        let moved = self.pump();
         self.poll();
-        self.pump()
+        moved
     }
 
     // TLA-conn> \* The tunnel is closing. orphan shuts down our end of the pair, and the

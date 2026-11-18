@@ -320,8 +320,8 @@ impl Engine {
         if let Some(delay) = self.stack.poll_delay() {
             wait = wait.min(delay);
         }
-        // A connection that moved may have given its socket something to
-        // send, which the next turn sends.
+        // A connection that moved may have more to move: the pair or the
+        // socket may have room again for what was left.
         if more || moved {
             wait = Duration::ZERO;
         }
