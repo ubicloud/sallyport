@@ -7,6 +7,10 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[dependencies]
+base64 = "0.22"
+boringtun = { version = "0.7", default-features = false }
+
 [profile.release]
 # Keep line tables, so that a panic's backtrace names lines.
 debug = 1

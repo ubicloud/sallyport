@@ -19,6 +19,7 @@ module Sallyport
 
     LIB = Fiddle.dlopen(path)
     P = Fiddle::TYPE_VOIDP
+    I = Fiddle::TYPE_INT
 
     # Binds a function of the library. Ruby keeps the GVL for a call
     # unless the function +waits+. A thread that lets the GVL go has to
@@ -29,6 +30,8 @@ module Sallyport
     end
 
     VERSION = bind("sp_version", [], P)
+    PRIVATE_KEY = bind("sp_private_key", [P], I)
+    PUBLIC_KEY = bind("sp_public_key", [P, P], I)
 
     unless VERSION.call.to_s == Sallyport::VERSION
       raise LoadError, "#{NAME} is version #{VERSION.call}, and the gem is #{Sallyport::VERSION}: run `rake compile`"
