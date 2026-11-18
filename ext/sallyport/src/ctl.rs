@@ -16,16 +16,6 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 /// status with them (`the_pair_holds_the_messages_of_the_largest_backlog`).
 pub const MAX_BACKLOG: usize = 128;
 
-/// What became of a connection that the stack sent.
-#[derive(Debug, PartialEq)]
-pub enum Sent {
-    Ok,
-    /// The pair has no room for it until Ruby takes a connection.
-    Full,
-    /// Ruby has closed the listener.
-    Gone,
-}
-
 /// A Ctl is our end of a listener's pair.
 pub struct Ctl {
     fd: OwnedFd,
@@ -42,16 +32,15 @@ impl Ctl {
     }
 
     /// Sends Ruby a connection: the words that name its peer, and Ruby's
-    /// end of the connection's pair. If Ruby closes the listener and has
-    /// not taken the connection, the kernel closes that end, and the
-    /// connection is then one whose Ruby has closed
+    /// end of the connection's pair. Returns whether the pair took it.
+    /// The pair has room for it, so it takes it unless Ruby has closed
+    /// the listener (`a_listener_that_ruby_closed_has_ended`). If Ruby
+    /// closes the listener and has not taken the connection, the kernel
+    /// closes that end, and the connection is then one whose Ruby has
+    /// closed
     /// (`a_connection_that_ruby_never_took_is_closed_with_the_listener`).
-    pub fn send(&self, peer: &str, theirs: &OwnedFd) -> Sent {
-        match sys::send_fd(self.fd.as_raw_fd(), peer.as_bytes(), theirs.as_raw_fd()) {
-            sys::AGAIN => Sent::Full,
-            n if n >= 0 => Sent::Ok,
-            _ => Sent::Gone,
-        }
+    pub fn send(&self, peer: &str, theirs: &OwnedFd) -> bool {
+        sys::send_fd(self.fd.as_raw_fd(), peer.as_bytes(), theirs.as_raw_fd()) >= 0
     }
 
     /// Takes the answers that Ruby has sent, and returns how many there
@@ -95,8 +84,9 @@ mod tests {
         (Ctl::new(ours), ruby)
     }
 
-    /// Sends a connection on the pair, and returns our end of it.
-    fn connection(ours: &Ctl) -> (Sent, Pair) {
+    /// Sends a connection on the pair. Returns whether the pair took it,
+    /// and our end of the connection.
+    fn connection(ours: &Ctl) -> (bool, Pair) {
         let (mine, theirs) = sys::socketpair(libc::SOCK_STREAM).unwrap();
         // The longest words that name a peer.
         (ours.send("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff 65535", &theirs), Pair::new(mine))
@@ -106,28 +96,12 @@ mod tests {
     fn the_pair_holds_the_messages_of_the_largest_backlog() {
         let (ours, ruby) = ctl();
         ours.say(0);
-        let sent: Vec<(Sent, Pair)> = (0..MAX_BACKLOG).map(|_| connection(&ours)).collect();
-        assert!(sent.iter().all(|(sent, _)| *sent == Sent::Ok));
+        let sent: Vec<(bool, Pair)> = (0..MAX_BACKLOG).map(|_| connection(&ours)).collect();
+        assert!(sent.iter().all(|(sent, _)| *sent));
         for _ in 0..MAX_BACKLOG {
             ruby.send(&[0]).unwrap();
         }
         assert_eq!(ours.answers(), MAX_BACKLOG);
-    }
-
-    #[test]
-    fn a_pair_that_is_full_takes_no_more_until_ruby_takes_a_connection() {
-        let (ours, ruby) = ctl();
-        let mut held = Vec::new();
-        loop {
-            let (sent, mine) = connection(&ours);
-            held.push(mine);
-            if sent != Sent::Ok {
-                assert_eq!(sent, Sent::Full);
-                break;
-            }
-        }
-        ruby.recv(&mut [0; 64]).unwrap();
-        assert_eq!(connection(&ours).0, Sent::Ok);
     }
 
     #[test]
@@ -143,16 +117,16 @@ mod tests {
     #[test]
     fn a_listener_that_ruby_closed_has_ended() {
         let (ours, ruby) = ctl();
-        assert!(!ours.ended() && connection(&ours).0 == Sent::Ok && !ours.ended());
+        assert!(!ours.ended() && connection(&ours).0 && !ours.ended());
         drop(ruby);
-        assert!(ours.ended() && connection(&ours).0 == Sent::Gone);
+        assert!(ours.ended() && !connection(&ours).0);
     }
 
     #[test]
     fn a_connection_that_ruby_never_took_is_closed_with_the_listener() {
         let (ours, ruby) = ctl();
         let (sent, mut mine) = connection(&ours);
-        assert!(sent == Sent::Ok && mine.hangup() == Hangup::No);
+        assert!(sent && mine.hangup() == Hangup::No);
         drop(ruby);
         assert!(mine.hangup() == Hangup::Yes && mine.read(&mut [0; 16]) == Took::End);
     }

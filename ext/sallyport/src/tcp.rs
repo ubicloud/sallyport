@@ -6,7 +6,7 @@
 //! control from end to end.
 
 use crate::config::Config;
-use crate::ctl::{Ctl, Sent};
+use crate::ctl::Ctl;
 use crate::packet::{rst, split_fin, syn, without_sack};
 use crate::pair::{Gave, Hangup, Pair, Took};
 use crate::sock::{Opening, Sock, Socket, Up, ACK_DELAY, TCP_TIMEOUT};
@@ -112,13 +112,6 @@ enum Phase {
     /// pair yet.
     Listening {
         listener: u64,
-    },
-    /// The connection is established. `theirs` is the end of the pair
-    /// that the listener has yet to send to Ruby.
-    Accepting {
-        listener: u64,
-        pair: Pair,
-        theirs: OwnedFd,
     },
     Open(Open),
     /// The connection is closed to Ruby and has no pair. Its socket stays
@@ -228,20 +221,19 @@ struct Conn {
 // TLA-conn@0> VARIABLE s
 // TLA-conn@0> \* A connection begins when Ruby makes it, or when a SYN arrives for a
 // TLA-conn@0> \* listener.
-// TLA-conn@0> Init == \E first \in {"connecting", "listening"}, r \in BOOLEAN : s = [
+// TLA-conn@0> Init == \E first \in {"connecting", "listening"} : s = [
 // TLA-conn@0>   p       |-> P!New,    \* the pair
 // TLA-conn@0>   k       |-> K!New,    \* the socket
-// TLA-conn@0>   phase   |-> first,    \* "connecting", "listening", "accepting", "open", "dead" or "removed"
+// TLA-conn@0>   phase   |-> first,    \* "connecting", "listening", "open", "dead" or "removed"
 // TLA-conn@0>   old     |-> FALSE,    \* the phase is old: an attempt as smoltcp's timeout, a dead socket as LINGER
 // TLA-conn@0>   said    |-> "none",   \* what Ruby was told of the attempt: "ok", "refused" or "timedout"
 // TLA-conn@0>   listens |-> TRUE,     \* Ruby has not closed the listener
-// TLA-conn@0>   room    |-> first = "connecting" \/ r,  \* the listener's pair has room for a message
 // TLA-conn@0>   left    |-> "no",     \* Open.left is "no", "yes" or "late" (TCP_TIMEOUT ago)
 // TLA-conn@0>   wait    |-> "no",     \* Open.wait is "no", "yes" or "late" (FIN_WAIT ago)
 // TLA-conn@0>   closing |-> FALSE,    \* Stack.closing
 // TLA-conn@0>   at      |-> "idle",   \* where the thread is in a pass over the connection
 // TLA-conn@0>   kick    |-> FALSE]    \* poll will return, whatever it reports of the pair
-// TLA-conn@0> Early == {"connecting", "listening", "accepting"}
+// TLA-conn@0> Early == {"connecting", "listening"}
 // TLA-conn@0> Live == Early \cup {"open"}
 //
 // The model takes this much of Ruby, of the peer and of time.
@@ -257,14 +249,10 @@ struct Conn {
 // TLA-conn@10> RubyActs == \E p \in RubyMoves : s' = [s EXCEPT !.p = p]
 // TLA-conn@10> \* The reads among Ruby's moves, which ToRuby has Ruby go on making.
 // TLA-conn@10> RubyReads == s.phase = "open" /\ \E p \in P!Reads(s.p) : s' = [s EXCEPT !.p = p]
-// TLA-conn@10> \* Ruby may close the listener while a connection waits for it. When Ruby
-// TLA-conn@10> \* accepts another connection, the listener's pair has room again, and
-// TLA-conn@10> \* the message that Ruby answers with wakes the loop. Other connections
-// TLA-conn@10> \* take the room.
-// TLA-conn@10> Waiting == s.phase \in {"listening", "accepting"} /\ s.listens
-// TLA-conn@10> ListenerCloses == Waiting /\ s' = [s EXCEPT !.listens = FALSE, !.kick = TRUE]
-// TLA-conn@10> RubyAccepts == Waiting /\ ~s.room /\ s' = [s EXCEPT !.room = TRUE, !.kick = TRUE]
-// TLA-conn@10> RoomGoes == Waiting /\ s.room /\ s' = [s EXCEPT !.room = FALSE]
+// TLA-conn@10> \* Ruby may close the listener while a handshake is under way, and poll
+// TLA-conn@10> \* reports that.
+// TLA-conn@10> ListenerCloses == /\ s.phase = "listening" /\ s.listens
+// TLA-conn@10>                   /\ s' = [s EXCEPT !.listens = FALSE, !.kick = TRUE]
 // TLA-conn@10> \* A packet is taken in between two passes, and it wakes the loop.
 // TLA-conn@10> \* Stack::unlisten removes a socket whose handshake the peer reset, before
 // TLA-conn@10> \* step sees it.
@@ -327,8 +315,7 @@ enum Welcome {
 // TLA-listen@0> When(cond, x) == IF cond THEN {x} ELSE {}
 // TLA-listen@0> RECURSIVE Sum(_, _)
 // TLA-listen@0> Sum(f, S) == IF S = {} THEN 0 ELSE LET p == CHOOSE p \in S : TRUE IN f[p] + Sum(f, S \ {p})
-// TLA-listen@0> \* The connections that wait for the listener are those of Phase::Listening
-// TLA-listen@0> \* and of Phase::Accepting.
+// TLA-listen@0> \* The connections that wait for the listener are those of Phase::Listening.
 // TLA-listen@0> Waiting(t) == t.listening + Sum(t.shaking, Peers) + Sum(t.made, Peers)
 
 struct Listener {
@@ -523,7 +510,7 @@ impl Stack {
             return Welcome::Nobody;
         }
         l.credit();
-        let waits = |c: &&Conn| matches!(c.phase, Phase::Listening { listener } | Phase::Accepting { listener, .. } if listener == l.id);
+        let waits = |c: &&Conn| matches!(c.phase, Phase::Listening { listener } if listener == l.id);
         let pending = l.unaccepted + self.conns.iter().filter(waits).count();
         if pending >= l.backlog {
             return Welcome::Full;
@@ -652,7 +639,6 @@ impl Stack {
             let (phase, pair) = match &c.phase {
                 Phase::Connecting { pair, .. } => ("connecting", Some(pair)),
                 Phase::Listening { .. } => ("listening", None),
-                Phase::Accepting { pair, .. } => ("accepting", Some(pair)),
                 Phase::Open(open) => ("open", Some(&open.pair)),
                 Phase::Dead { .. } => ("dead", None),
             };
@@ -719,7 +705,7 @@ impl Stack {
     // TLA-conn> \* leaves no listener. The loop turns at once.
     // TLA-conn> Orphan == /\ s.at = "idle" /\ ~s.closing /\ s.phase # "removed"
     // TLA-conn>           /\ s' = [s EXCEPT !.closing = TRUE, !.kick = TRUE,
-    // TLA-conn>                             !.listens = @ /\ s.phase \notin {"listening", "accepting"},
+    // TLA-conn>                             !.listens = @ /\ s.phase # "listening",
     // TLA-conn>                             !.p = IF s.phase \in {"connecting", "open"} THEN P!Shut(@) ELSE @]
     /// Stops the listening, and leaves every connection as it would be if
     /// Ruby had closed its end. The tunnel is closing.
@@ -779,10 +765,8 @@ impl Stack {
             let s = self.sockets.get_mut::<Socket>(c.handle);
             // The step takes the phase and gives back the phase to go on
             // in. If it gives none back, the connection is over for Ruby,
-            // and what the phase held is closed: our end of the pair, and
-            // the other end if the listener had yet to send it. The
-            // socket has a reset or a last ACK to send, and must stay
-            // until it has sent it.
+            // and our end of the pair is closed. The socket has a reset
+            // or a last ACK to send, and must stay until it has sent it.
             let phase = std::mem::replace(&mut c.phase, Phase::Dead { since: self.clock });
             match step(phase, s, &mut self.listeners, self.clock, self.closing) {
                 Fate::Keep(phase) => c.phase = phase,
@@ -852,7 +836,7 @@ impl Stack {
             // with no events asked of it is watched for Ruby closing its
             // end, and for nothing else.
             let (pair, events) = match &c.phase {
-                Phase::Listening { .. } | Phase::Accepting { .. } | Phase::Dead { .. } => continue,
+                Phase::Listening { .. } | Phase::Dead { .. } => continue,
                 // Ruby may write before it has the status, and nothing
                 // reads that yet. So poll is not asked whether there is
                 // anything to read, for which it would return for ever.
@@ -886,8 +870,9 @@ impl Stack {
 // TLA-conn@20> Abort(t) == Dead([t EXCEPT !.k = K!Abort(@)])
 // TLA-conn> \* step, for a connection that is not open yet. Ruby is told of a
 // TLA-conn> \* connection once, when its handshake is over: with the status of one
-// TLA-conn> \* that it makes, or with the descriptor of one that it accepts. A
-// TLA-conn> \* connection that becomes open is carried in the same pass.
+// TLA-conn> \* that it makes, or with the descriptor of one that it accepts. The
+// TLA-conn> \* listener's pair has room for the descriptor, as the model "listen"
+// TLA-conn> \* shows. A connection that becomes open is carried in the same pass.
 // TLA-conn> Begin(t) ==
 // TLA-conn>   CASE t.phase = "connecting" ->
 // TLA-conn>          IF P!HungUp(t.p) THEN Abort(t)
@@ -898,12 +883,8 @@ impl Stack {
 // TLA-conn>          ELSE Rest(t)
 // TLA-conn>     [] t.phase = "listening" ->
 // TLA-conn>          IF ~t.listens THEN Abort(t)
-// TLA-conn>          ELSE IF K!Opening(t.k) = "done" THEN [t EXCEPT !.phase = "accepting"]
+// TLA-conn>          ELSE IF K!Opening(t.k) = "done" THEN [t EXCEPT !.said = "ok", !.phase = "open", !.at = "take"]
 // TLA-conn>          ELSE IF K!Opening(t.k) = "failed" /\ Fault # "keeps a failure" THEN Close(t)
-// TLA-conn>          ELSE Rest(t)
-// TLA-conn>     [] t.phase = "accepting" ->
-// TLA-conn>          IF ~t.listens \/ K!Opening(t.k) = "failed" THEN Abort(t)
-// TLA-conn>          ELSE IF t.room THEN [t EXCEPT !.said = "ok", !.phase = "open", !.at = "take"]
 // TLA-conn>          ELSE Rest(t)
 /// Moves one connection as far as it will go, through each phase that it
 /// can leave now, and says what becomes of it.
@@ -932,35 +913,26 @@ fn step(mut phase: Phase, s: &mut Socket, listeners: &mut [Listener], now: Durat
                     Phase::open(pair)
                 }
             },
-            Phase::Listening { listener } => match Sock::opening(s) {
+            Phase::Listening { listener } => {
                 // Ruby closed the listener.
-                _ if listeners.iter().all(|l| l.id != listener) => return Fate::Abort,
-                Opening::Pending => return Fate::Keep(phase),
-                // The peer left the handshake unfinished, or it finished
-                // the handshake and reset the connection at once.
-                Opening::Failed => return Fate::Close,
-                Opening::Done => match sys::socketpair(libc::SOCK_STREAM) {
-                    Ok((ours, theirs)) => Phase::Accepting { listener, pair: Pair::new(ours), theirs },
-                    // The system has no descriptors to spare.
-                    Err(_) => return Fate::Abort,
-                },
-            },
-            Phase::Accepting { listener, pair, theirs } => {
-                // Ruby may have closed the listener, and the peer may have
-                // reset the connection already.
-                let l = listeners.iter_mut().find(|l| l.id == listener);
-                let (Some(l), Some(from)) = (l, Sock::peer(s)) else { return Fate::Abort };
-                let message = format!("{} {}", from.addr, from.port);
-                match l.ctl.send(&message, &theirs) {
-                    Sent::Ok => {
+                let Some(l) = listeners.iter_mut().find(|l| l.id == listener) else { return Fate::Abort };
+                match Sock::opening(s) {
+                    Opening::Pending => return Fate::Keep(phase),
+                    // The peer left the handshake unfinished, or it
+                    // finished the handshake and reset the connection at
+                    // once.
+                    Opening::Failed => return Fate::Close,
+                    Opening::Done => {
+                        // The system may have no descriptors to spare.
+                        let Ok((ours, theirs)) = sys::socketpair(libc::SOCK_STREAM) else { return Fate::Abort };
+                        let Some(from) = Sock::peer(s) else { return Fate::Abort };
+                        // Ruby may have closed the listener a moment ago.
+                        if !l.ctl.send(&format!("{} {}", from.addr, from.port), &theirs) {
+                            return Fate::Abort;
+                        }
                         l.unaccepted += 1;
-                        Phase::open(pair)
+                        Phase::open(Pair::new(ours))
                     }
-                    // The listener's pair has no room. Ruby makes room
-                    // when it accepts a connection, and poll reports the
-                    // answer that it then sends.
-                    Sent::Full => return Fate::Keep(Phase::Accepting { listener, pair, theirs }),
-                    Sent::Gone => return Fate::Abort,
                 }
             }
             Phase::Open(open) => return carry(open, s, now, closing),
@@ -1102,7 +1074,7 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 // TLA-conn@90> Loop == Wake \/ Step \/ Dispatch \/ Sweep
 // TLA-conn@90> Clock == Ages \/ Late
 // TLA-conn@90> Timers == TimesOut \/ Forgets \/ Finish
-// TLA-conn@90> Next == \/ RubyActs \/ ListenerCloses \/ RubyAccepts \/ RoomGoes \/ PeerPacket \/ PeerSilent
+// TLA-conn@90> Next == \/ RubyActs \/ ListenerCloses \/ PeerPacket \/ PeerSilent
 // TLA-conn@90>         \/ Orphan \/ Timers \/ Clock \/ Loop \/ Turn \/ SweepEarly
 // TLA-conn@90> \* The loop and the clock run when they can. A timer of smoltcp takes
 // TLA-conn@90> \* effect between two passes, and it does in the end, however often the
@@ -1292,6 +1264,9 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 // TLA-listen@90> \* The listener's count is of the connections that Ruby has yet to take,
 // TLA-listen@90> \* and of those that it has taken and credit has yet to count.
 // TLA-listen@90> Exact == s.unaccepted = s.queued + s.answers
+// TLA-listen@90> \* Neither side waits to send a message on the listener's pair, which
+// TLA-listen@90> \* holds as many each way as the largest backlog, as ctl.rs shows.
+// TLA-listen@90> Fits == s.queued <= Backlog /\ s.answers <= Backlog
 // TLA-listen@90> \* No socket listens between two packets. One that did would take the
 // TLA-listen@90> \* next SYN to the port, whatever connection that SYN belonged to.
 // TLA-listen@90> NoStray == s.listening = 0
@@ -1311,7 +1286,7 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 // TLA-listen.cfg> CONSTANTS Peers = {p1, p2}
 // TLA-listen.cfg>   Backlog = 1
 // TLA-listen.cfg>   Fault = "none"
-// TLA-listen.cfg> INVARIANTS Bounded Exact NoStray OnePerPeer
+// TLA-listen.cfg> INVARIANTS Bounded Exact Fits NoStray OnePerPeer
 // TLA-listen.cfg> PROPERTIES FullIsSilent Shaken Handed Counted
 // TLA-listen.cfg> CHECK_DEADLOCK FALSE
 //
