@@ -2,6 +2,7 @@
 
 require_relative "sallyport/version"
 require_relative "sallyport/native"
+require_relative "sallyport/tunnel"
 
 # WireGuard and TCP in user space: connections through a WireGuard tunnel,
 # as sockets with real descriptors, without a TUN device.

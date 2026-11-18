@@ -167,6 +167,16 @@ impl Peers {
             send(b, to);
         }
     }
+
+    /// Runs boringtun's timers, which rekey, keep alive and retry
+    /// handshakes.
+    pub fn tick(&mut self, send: Sender) {
+        for peer in &mut self.list {
+            if let (TunnResult::WriteToNetwork(b), Some(to)) = (peer.tunn.update_timers(&mut self.buf), peer.endpoint) {
+                send(b, to);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
