@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use crate::packet::{rst, split_fin, syn, without_sack};
+use crate::sock::{Sock, Up};
 use crate::sys::{self, Sent};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -287,7 +288,10 @@ impl Conn {
 // TLA-conn@0>   u2r     |-> 0,        \* the bytes that carry wrote and Ruby has not read
 // TLA-conn@0>   rerr    |-> FALSE,    \* Ruby closed with bytes unread, and a read of the pair will fail
 // TLA-conn@0>   wleft   |-> Budget,   \* the bytes that Ruby may still write
-// TLA-conn@0>   st      |-> "Established",  \* the state that the socket is in
+// TLA-conn@0>   up      |-> "open",   \* Sock::up: "open", "ending" (our FIN is queued) or "ended"
+// TLA-conn@0>   down    |-> TRUE,     \* Sock::down_open: the peer may still send
+// TLA-conn@0>   quiet   |-> FALSE,    \* the socket is closed: it is silent once it owes nothing
+// TLA-conn@0>   last    |-> FALSE,    \* our FIN was queued after the peer's FIN had arrived
 // TLA-conn@0>   tx      |-> 0,        \* the bytes that the socket holds and the peer has not acknowledged
 // TLA-conn@0>   rx      |-> 0,        \* the bytes that the socket holds for Ruby
 // TLA-conn@0>   owed    |-> "none",   \* what the socket has yet to send: "none", "ack" or "rst"
@@ -297,7 +301,6 @@ impl Conn {
 // TLA-conn@0>   finRcvd |-> FALSE,    \* the peer's FIN has arrived
 // TLA-conn@0>   fdEof   |-> FALSE,    \* Conn.fd_eof
 // TLA-conn@0>   rxShut  |-> FALSE,    \* Conn.rx_shut
-// TLA-conn@0>   tail    |-> 0,        \* how many bytes Conn.tail holds
 // TLA-conn@0>   orphan  |-> FALSE,    \* Conn.orphan
 // TLA-conn@0>   gone    |-> "no",     \* Conn.app_gone: "no", "yes" or "timeout" (TCP_TIMEOUT ago)
 // TLA-conn@0>   wait    |-> "no",     \* Conn.fin_wait: "no", "yes" or "over" (FIN_WAIT ago)
@@ -308,11 +311,8 @@ impl Conn {
 // TLA-conn@0>   fate    |-> "keep"]   \* and what becomes of the connection
 // TLA-conn@0>
 // TLA-conn@0> Min(a, b) == IF a < b THEN a ELSE b
-// TLA-conn@0> \* These are may_send and may_recv of smoltcp's socket. may_recv is also
-// TLA-conn@0> \* true while the socket holds bytes for Ruby, which the model writes as
-// TLA-conn@0> \* rx > 0.
-// TLA-conn@0> MaySend(t) == t.st \in {"Established", "CloseWait"}
-// TLA-conn@0> MayRecv(t) == t.st \in {"Established", "FinWait1", "FinWait2"}
+// TLA-conn@0> \* The socket is the one that sock.rs describes, and no more of smoltcp
+// TLA-conn@0> \* shows here than that file lets carry see.
 // TLA-conn@0> \* sys::hung_up. poll reports a hangup on our end when Ruby has closed its
 // TLA-conn@0> \* end, and when each end has shut down its writing. carry shuts ours down
 // TLA-conn@0> \* to pass on the peer's FIN, and orphan shuts it down when the tunnel
@@ -337,30 +337,27 @@ impl Conn {
 // TLA-conn@10>
 // TLA-conn@10> \* The peer may send, acknowledge, end its stream, reset the connection,
 // TLA-conn@10> \* go silent and hold its window shut. A packet from it wakes the loop.
-// TLA-conn@10> PeerData == /\ s.peer = "up" /\ s.pleft > 0 /\ MayRecv(s) /\ s.rx < RxCap
+// TLA-conn@10> PeerData == /\ s.peer = "up" /\ s.pleft > 0 /\ s.down /\ s.rx < RxCap
 // TLA-conn@10>             /\ s' = [s EXCEPT !.rx = @ + 1, !.pleft = @ - 1, !.kick = TRUE]
-// TLA-conn@10> PeerAck == /\ s.peer # "gone" /\ ~s.stuck /\ s.tx > 0 /\ s.st # "Closed"
+// TLA-conn@10> PeerAck == /\ s.peer # "gone" /\ ~s.stuck /\ s.tx > 0
 // TLA-conn@10>            /\ s' = [s EXCEPT !.tx = @ - 1, !.kick = TRUE]
 // TLA-conn@10> \* Our FIN follows our data, so it is acknowledged after the data.
-// TLA-conn@10> PeerAckFin == /\ s.peer # "gone" /\ s.tx = 0 /\ s.st \in {"FinWait1", "Closing", "LastAck"}
-// TLA-conn@10>               /\ s' = CASE s.st = "FinWait1" -> [s EXCEPT !.st = "FinWait2", !.kick = TRUE]
-// TLA-conn@10>                         [] s.st = "Closing" -> [s EXCEPT !.st = "TimeWait", !.kick = TRUE]
-// TLA-conn@10>                         [] s.st = "LastAck" -> [s EXCEPT !.st = "Closed", !.owed = "none", !.kick = TRUE]
+// TLA-conn@10> \* A socket that queued its FIN after the peer's FIN is closed by this, and
+// TLA-conn@10> \* one that queued it before waits out TIME-WAIT.
+// TLA-conn@10> PeerAckFin == /\ s.peer # "gone" /\ s.tx = 0 /\ s.up = "ending"
+// TLA-conn@10>               /\ s' = [s EXCEPT !.up = "ended", !.quiet = s.last, !.kick = TRUE]
 // TLA-conn@10> \* The model takes it that the socket takes the peer's FIN only when it
 // TLA-conn@10> \* has taken all that the peer sent before it. smoltcp does not see to
 // TLA-conn@10> \* that, so receive gives it each FIN in a packet of its own.
 // TLA-conn@10> PeerFin == /\ s.peer = "up"
-// TLA-conn@10>            /\ s' = CASE s.st = "Established" -> [s EXCEPT !.st = "CloseWait", !.owed = "ack", !.finRcvd = TRUE,
-// TLA-conn@10>                                                           !.peer = "fin", !.kick = TRUE]
-// TLA-conn@10>                      [] s.st = "FinWait1" -> [s EXCEPT !.st = "Closing", !.owed = "ack", !.finRcvd = TRUE,
-// TLA-conn@10>                                                        !.peer = "fin", !.kick = TRUE]
-// TLA-conn@10>                      [] s.st = "FinWait2" -> [s EXCEPT !.st = "TimeWait", !.owed = "ack", !.finRcvd = TRUE,
-// TLA-conn@10>                                                        !.peer = "fin", !.kick = TRUE]
-// TLA-conn@10>                      [] OTHER -> [s EXCEPT !.peer = "fin", !.kick = TRUE]
+// TLA-conn@10>            /\ s' = IF s.down THEN [s EXCEPT !.down = FALSE, !.owed = "ack", !.finRcvd = TRUE,
+// TLA-conn@10>                                             !.peer = "fin", !.kick = TRUE]
+// TLA-conn@10>                    ELSE [s EXCEPT !.peer = "fin", !.kick = TRUE]
 // TLA-conn@10> \* A reset leaves what was received for Ruby to read, and leaves nothing
 // TLA-conn@10> \* to send.
-// TLA-conn@10> PeerRst == /\ s.peer # "gone" /\ s.st # "Closed"
-// TLA-conn@10>            /\ s' = [s EXCEPT !.peer = "gone", !.st = "Closed", !.owed = "none", !.tx = 0, !.kick = TRUE]
+// TLA-conn@10> PeerRst == /\ s.peer # "gone" /\ ~s.quiet
+// TLA-conn@10>            /\ s' = [s EXCEPT !.peer = "gone", !.up = "ended", !.down = FALSE, !.quiet = TRUE,
+// TLA-conn@10>                              !.owed = "none", !.tx = 0, !.kick = TRUE]
 // TLA-conn@10> PeerGone == /\ s.peer # "gone" /\ s' = [s EXCEPT !.peer = "gone"]
 // TLA-conn@10> PeerStuck == /\ s.peer # "gone" /\ ~s.stuck /\ s' = [s EXCEPT !.stuck = TRUE]
 // TLA-conn@10> Peer == PeerData \/ PeerAck \/ PeerAckFin \/ PeerFin \/ PeerRst \/ PeerGone \/ PeerStuck
@@ -373,14 +370,15 @@ impl Conn {
 // TLA-conn@10> \* that the thread stood still, so the socket has asked by then. And
 // TLA-conn@10> \* with a window that has no scale, a peer that has sent past the end
 // TLA-conn@10> \* that smoltcp has on record is heard when it sends those bytes again.
-// TLA-conn@10> TcpTimeout == /\ s.st \notin {"Closed", "TimeWait"} /\ s.phase # "removed"
+// TLA-conn@10> TcpTimeout == /\ ~(s.up = "ended" /\ ~s.down) /\ s.phase # "removed"
 // TLA-conn@10>               /\ (s.peer = "gone" \/ Fault = "no keep-alive")
-// TLA-conn@10>               /\ s' = [s EXCEPT !.st = "Closed", !.owed = "rst", !.tx = 0, !.kick = TRUE]
-// TLA-conn@10> \* smoltcp clears a socket that has been in TIME-WAIT for ten seconds, and
-// TLA-conn@10> \* the bytes that it holds for Ruby with it. The loop has turned many
-// TLA-conn@10> \* times by then.
-// TLA-conn@10> TimeWaitOver == /\ s.st = "TimeWait" /\ s.phase = "open" /\ s.owed = "none" /\ ~s.kick
-// TLA-conn@10>                 /\ s' = [s EXCEPT !.st = "Closed", !.rx = 0, !.kick = TRUE]
+// TLA-conn@10>               /\ s' = [s EXCEPT !.up = "ended", !.down = FALSE, !.quiet = TRUE,
+// TLA-conn@10>                                 !.owed = "rst", !.tx = 0, !.kick = TRUE]
+// TLA-conn@10> \* The socket keeps what it holds for Ruby until Ruby is given it. smoltcp
+// TLA-conn@10> \* alone would clear it ten seconds after both streams have ended, and
+// TLA-conn@10> \* sock.rs sees to it. This step is that fault.
+// TLA-conn@10> Forgets == /\ Fault = "no tail" /\ s.up = "ended" /\ ~s.down /\ s.phase = "open" /\ s.rx > 0
+// TLA-conn@10>            /\ s' = [s EXCEPT !.rx = 0, !.kick = TRUE]
 // TLA-conn@10> \* Time passes for a connection that Ruby has left. The code has no timer
 // TLA-conn@10> \* for that, and nothing wakes the loop: the tick turns it, and carry
 // TLA-conn@10> \* looks at the clock.
@@ -776,7 +774,8 @@ impl Stack {
     // TLA-conn> \* poll that follows sends what every socket owes, an ACK that was
     // TLA-conn> \* delayed among it, and the thread ends.
     // TLA-conn> Finish == /\ s.orphan /\ s.phase # "removed"
-    // TLA-conn>           /\ s' = [s EXCEPT !.phase = "removed", !.st = "Closed", !.owed = "none"]
+    // TLA-conn>           /\ s' = [s EXCEPT !.phase = "removed", !.up = "ended", !.down = FALSE, !.quiet = TRUE,
+    // TLA-conn>                             !.owed = "none"]
     /// Resets every connection that has not ended. The resets leave at
     /// the next poll.
     pub fn abort(&mut self) {
@@ -802,8 +801,10 @@ impl Stack {
     // TLA-conn@70>   /\ s.phase = "open" /\ woken
     // TLA-conn@70>   /\ \E p \in {Pass(s)} :
     // TLA-conn@70>      s' = IF p.fate = "keep" THEN [p EXCEPT !.kick = p.moved, !.moved = FALSE]
-    // TLA-conn@70>           ELSE [p EXCEPT !.st = IF p.fate = "abort" THEN "Closed" ELSE @,
-    // TLA-conn@70>                          !.owed = IF p.fate = "abort" /\ p.st # "Closed" THEN "rst" ELSE @,
+    // TLA-conn@70>           ELSE [p EXCEPT !.up = IF p.fate = "abort" THEN "ended" ELSE @,
+    // TLA-conn@70>                          !.down = IF p.fate = "abort" THEN FALSE ELSE @,
+    // TLA-conn@70>                          !.quiet = IF p.fate = "abort" THEN TRUE ELSE @,
+    // TLA-conn@70>                          !.owed = IF p.fate = "abort" /\ ~p.quiet THEN "rst" ELSE @,
     // TLA-conn@70>                          !.tx = IF p.fate = "abort" THEN 0 ELSE @,
     // TLA-conn@70>                          !.phase = IF Fault = "remove at once" THEN "removed" ELSE "dead",
     // TLA-conn@70>                          !.age = 0, !.kick = FALSE, !.moved = FALSE, !.fate = "keep"]
@@ -850,8 +851,8 @@ impl Stack {
     // TLA-conn> \* poll_fds. The pair is read while the socket has room, and written
     // TLA-conn> \* while there are bytes for Ruby. A descriptor with neither asked of it
     // TLA-conn> \* is watched for a hangup, until the hangup has been seen.
-    // TLA-conn> Reads(t) == ~t.fdEof /\ MaySend(t) /\ t.tx < TxCap
-    // TLA-conn> Writes(t) == t.rx > 0 \/ t.tail > 0
+    // TLA-conn> Reads(t) == ~t.fdEof /\ t.up = "open" /\ t.tx < TxCap
+    // TLA-conn> Writes(t) == t.rx > 0
     // TLA-conn> Watched(t) == \/ Reads(t) \/ Writes(t)
     // TLA-conn>               \/ t.gone = "no" /\ Fault # "hangup unwatched"
     // TLA-conn>               \/ Fault = "hangup always watched"
@@ -885,8 +886,9 @@ impl Stack {
                 Phase::Open => {
                     // The pair is read while the socket has room, and
                     // written while the socket has bytes for Ruby.
-                    let read = if !c.fd_eof && s.can_send() { libc::POLLIN } else { 0 };
-                    let write = if s.can_recv() || !c.tail.is_empty() { libc::POLLOUT } else { 0 };
+                    let (room, holds) = Sock::asks(s, &c.tail);
+                    let read = if !c.fd_eof && room { libc::POLLIN } else { 0 };
+                    let write = if holds { libc::POLLOUT } else { 0 };
                     // Once the hangup has been seen, poll would return
                     // for it for ever.
                     if read | write == 0 && c.app_gone.is_some() {
@@ -903,19 +905,15 @@ impl Stack {
 // TLA-conn> \* step removes a dead connection when its socket has sent what it owed,
 // TLA-conn> \* or when the peer's FIN has had long enough to be acknowledged.
 // TLA-conn> PumpDead == /\ s.phase = "dead"
-// TLA-conn>             /\ (s.st = "Closed" /\ s.owed = "none") \/ s.age >= Linger
+// TLA-conn>             /\ (s.quiet /\ s.owed = "none") \/ s.age >= Linger
 // TLA-conn>             /\ s' = [s EXCEPT !.phase = "removed"]
 /// Moves one connection as far as it will go. Returns whether it moved,
 /// and what becomes of it.
 fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Duration) -> (bool, Fate) {
     match c.phase {
         Phase::Dead(since) => {
-            let sent = match s.state() {
-                // smoltcp forgets the peer once it has no more to send it.
-                tcp::State::Closed => s.remote_endpoint().is_none(),
-                // The peer's FIN is owed an ACK.
-                _ => now - since >= LINGER,
-            };
+            // A socket in TIME-WAIT may still owe the peer's FIN an ACK.
+            let sent = Sock::silent(s) || now - since >= LINGER;
             (false, if sent { Fate::Remove } else { Fate::Keep })
         }
         // Ruby gave up waiting, and closed its end.
@@ -975,13 +973,19 @@ fn step(c: &mut Conn, s: &mut tcp::Socket, listeners: &mut [Listener], now: Dura
                 (true, Fate::Keep)
             }
         },
-        Phase::Open => carry(c, s, now),
+        Phase::Open => {
+            // The socket's contract has the tail, and carry has the rest.
+            let mut tail = std::mem::take(&mut c.tail);
+            let done = carry(c, &mut Sock::new(s, &mut tail), now);
+            c.tail = tail;
+            done
+        }
     }
 }
 
 /// Moves bytes each way for an open connection, and passes on the end of
 /// each direction.
-fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
+fn carry(c: &mut Conn, s: &mut Sock, now: Duration) -> (bool, Fate) {
     let mut moved = false;
     let was_deaf = c.deaf;
 
@@ -992,111 +996,71 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
     // TLA-conn> \* loop reads once more than there are bytes, that read says why there
     // TLA-conn> \* are none: an error, the end of what Ruby will write, or nothing yet.
     // TLA-conn> \* An orphan's pair is read until it is empty, and no more.
-    // TLA-conn> Read(t) == LET eof == t.fdEof \/ ~MaySend(t)
+    // TLA-conn> Read(t) == LET eof == t.fdEof \/ t.up # "open"
     // TLA-conn>                n == IF eof THEN 0 ELSE Min(t.r2u, TxCap - t.tx)
     // TLA-conn>                more == ~eof /\ t.tx + n < TxCap
     // TLA-conn>                end == more /\ ~t.rerr /\ (t.ruby # "open" \/ t.orphan)
     // TLA-conn>            IN [t EXCEPT !.fdEof = eof \/ end, !.tx = @ + n, !.r2u = @ - n,
     // TLA-conn>                         !.moved = n > 0 \/ end, !.fate = IF more /\ t.rerr THEN "abort" ELSE "keep"]
-    if !c.fd_eof && !s.may_send() {
+    if !c.fd_eof && s.up() != Up::Open {
         // The peer reset the connection, or it timed out.
         c.fd_eof = true;
     }
     let fd = c.raw();
-    while !c.fd_eof && s.can_send() {
-        // The bytes are read from the pair into the socket's buffer.
-        match s.send(|buf| {
-            let n = sys::read(fd, buf);
-            (n.max(0) as usize, n)
-        }) {
-            Ok(n) if n > 0 => moved = true,
-            Ok(0) => {
+    while !c.fd_eof && s.has_room() {
+        match s.fill(|buf| sys::read(fd, buf)) {
+            n if n > 0 => moved = true,
+            0 => {
                 c.fd_eof = true;
                 moved = true;
             }
             // An orphan's pair is read until it is empty, and no more.
-            Ok(sys::AGAIN) if c.orphan => {
+            sys::AGAIN if c.orphan => {
                 c.fd_eof = true;
                 moved = true;
             }
-            Ok(sys::AGAIN) => break,
+            sys::AGAIN => break,
             // Ruby closed its end with bytes from us unread.
             _ => return (true, Fate::Abort),
         }
     }
-    // TLA-conn> Fin(t) == IF MaySend(t) /\ t.fdEof /\ (t.tx = 0 \/ Fault = "early fin")
-    // TLA-conn>           THEN [t EXCEPT !.st = IF @ = "Established" THEN "FinWait1" ELSE "LastAck", !.moved = TRUE]
-    // TLA-conn>           ELSE t
     // Our FIN follows what Ruby wrote, and it waits until the peer has
-    // taken all of that. smoltcp does not send a FIN well behind data that
-    // a shut window holds back. Its probe of the window can carry the FIN
-    // with the last byte, and the timer of the probe then outlives the
-    // data: smoltcp sends an ACK each time that it is asked, and its poll
-    // never ends. And in LAST-ACK it passes over an ACK that acknowledges
-    // nothing new, and so would learn that the window was open again only
-    // when its next probe was answered.
-    let fin_due = matches!(s.state(), tcp::State::Established | tcp::State::CloseWait);
-    if fin_due && c.fd_eof && s.send_queue() == 0 {
-        s.close();
+    // acknowledged all of that.
+    // TLA-conn> Fin(t) == IF t.up = "open" /\ t.fdEof /\ (t.tx = 0 \/ Fault = "early fin")
+    // TLA-conn>           THEN [t EXCEPT !.up = "ending", !.last = ~t.down, !.moved = TRUE]
+    // TLA-conn>           ELSE t
+    if s.up() == Up::Open && c.fd_eof && s.all_acknowledged() {
+        s.end();
         moved = true;
     }
     // TLA-conn> Hung(t) == IF t.gone = "no" /\ HungUp(t) THEN [t EXCEPT !.gone = "yes"] ELSE t
     if c.app_gone.is_none() && sys::hung_up(fd) {
         c.app_gone = Some(now);
     }
-    // TLA-conn> Waits(t) == IF t.wait = "no" /\ t.gone # "no" /\ t.st = "FinWait2" THEN [t EXCEPT !.wait = "yes"] ELSE t
+    // TLA-conn> Waits(t) == IF t.wait = "no" /\ t.gone # "no" /\ t.up = "ended" /\ t.down
+    // TLA-conn>             THEN [t EXCEPT !.wait = "yes"] ELSE t
     // The peer's time to end its stream begins when Ruby has left and the
     // peer has acknowledged our FIN, whichever comes later.
-    if c.fin_wait.is_none() && c.app_gone.is_some() && s.state() == tcp::State::FinWait2 {
+    if c.fin_wait.is_none() && c.app_gone.is_some() && s.up() == Up::Ended && s.down_open() {
         c.fin_wait = Some(now);
     }
 
-    // TLA-conn> Tail(t) == IF t.st = "TimeWait" /\ Fault # "no tail"
-    // TLA-conn>            THEN [t EXCEPT !.tail = @ + t.rx, !.rx = 0] ELSE t
-    // smoltcp clears a socket when it has been in TIME-WAIT for ten
-    // seconds, and its receive buffer with it. So what Ruby has not been
-    // given by then is taken out of the buffer as soon as the peer's FIN
-    // has arrived, and Ruby is given it from here.
-    if s.state() == tcp::State::TimeWait {
-        while s.can_recv() {
-            let tail = &mut c.tail;
-            let _ = s.recv(|buf| {
-                tail.extend(buf.iter());
-                (buf.len(), ())
-            });
-        }
-    }
-    // TLA-conn> \* Ruby is given the tail and then what the socket holds, for as much as
-    // TLA-conn> \* the pair has room. The write fails if Ruby has closed its end, or if
-    // TLA-conn> \* orphan has shut ours down.
-    // TLA-conn> Give(t) == LET n == Min(t.tail + t.rx, PairCap - t.u2r)
-    // TLA-conn>                k == Min(n, t.tail)
-    // TLA-conn>            IN IF t.tail + t.rx = 0 THEN t
+    // TLA-conn> \* Ruby is given what the socket holds, for as much as the pair has
+    // TLA-conn> \* room. The write fails if Ruby has closed its end, or if orphan has
+    // TLA-conn> \* shut ours down.
+    // TLA-conn> Give(t) == LET n == Min(t.rx, PairCap - t.u2r)
+    // TLA-conn>            IN IF t.rx = 0 THEN t
     // TLA-conn>               ELSE IF t.ruby = "closed" \/ t.orphan THEN [t EXCEPT !.fate = "abort"]
-    // TLA-conn>               ELSE [t EXCEPT !.tail = @ - k, !.rx = @ - (n - k), !.u2r = @ + n, !.moved = @ \/ n > 0]
+    // TLA-conn>               ELSE [t EXCEPT !.rx = @ - n, !.u2r = @ + n, !.moved = @ \/ n > 0]
     // A write to the pair fails when Ruby has closed its end, and also
     // when Ruby has only shut down its reading. poll reports a hangup for
     // the first and none for the second.
     let deafened = |n: isize, c: &Conn| n == sys::PIPE && !c.orphan && !sys::hung_up(fd);
-    while !c.deaf && !c.tail.is_empty() {
-        match sys::send(fd, c.tail.as_slices().0) {
-            n if n > 0 => {
-                c.tail.drain(..n as usize);
-                moved = true;
-            }
+    while !c.deaf && s.holds() {
+        match s.drain(|buf| sys::send(fd, buf)) {
+            n if n > 0 => moved = true,
             sys::AGAIN => break,
             n if deafened(n, c) => c.deaf = true,
-            _ => return (true, Fate::Abort),
-        }
-    }
-    while !c.deaf && s.can_recv() {
-        match s.recv(|buf| {
-            let n = sys::send(fd, buf);
-            (n.max(0) as usize, n)
-        }) {
-            Ok(n) if n > 0 => moved = true,
-            Ok(sys::AGAIN) => break,
-            Ok(n) if deafened(n, c) => c.deaf = true,
             // Ruby closed its end with bytes still to come.
             _ => return (true, Fate::Abort),
         }
@@ -1107,20 +1071,17 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
         // way, which looks the same for a moment. The bytes stay, and the
         // next pass tells which it was.
         moved = true;
-    } else if c.deaf && c.app_gone.is_some() && (s.can_recv() || !c.tail.is_empty()) {
+    } else if c.deaf && c.app_gone.is_some() && s.holds() {
         // A hangup has shown since, so Ruby has left. What the peer sends
         // is reset, as it is for any end that is closed.
         return (true, Fate::Abort);
-    } else if c.deaf {
-        c.tail.clear();
-        while s.can_recv() {
-            let _ = s.recv(|buf| (buf.len(), ()));
-            moved = true;
-        }
+    } else if c.deaf && s.holds() {
+        s.discard();
+        moved = true;
     }
-    // TLA-conn> End(t) == IF ~MayRecv(t) /\ t.rx = 0 /\ t.tail = 0 /\ (~t.rxShut \/ Fault = "restless")
+    // TLA-conn> End(t) == IF ~t.down /\ t.rx = 0 /\ (~t.rxShut \/ Fault = "restless")
     // TLA-conn>           THEN [t EXCEPT !.rxShut = TRUE, !.moved = TRUE] ELSE t
-    if !c.rx_shut && !s.may_recv() && !s.can_recv() && c.tail.is_empty() {
+    if !c.rx_shut && !s.down_open() && !s.holds() {
         // The peer will send no more, and Ruby has been given all of it.
         sys::shutdown_write(fd);
         c.rx_shut = true;
@@ -1128,20 +1089,21 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
     }
 
     // TLA-conn> Fated(t) == [t EXCEPT !.fate =
-    // TLA-conn>     IF t.st \in {"Closed", "TimeWait"} /\ t.fdEof /\ (t.rxShut \/ Fault = "early close") THEN "close"
-    // TLA-conn>     ELSE IF t.st = "FinWait2" /\ (t.orphan \/ t.wait = "over") THEN "abort"
+    // TLA-conn>     IF t.up = "ended" /\ ~t.down /\ t.fdEof /\ (t.rxShut \/ Fault = "early close") THEN "close"
+    // TLA-conn>     ELSE IF t.up = "ended" /\ t.down /\ (t.orphan \/ t.wait = "over") THEN "abort"
     // TLA-conn>     ELSE IF t.gone = "timeout" /\ Fault # "no deadline" THEN "abort"
     // TLA-conn>     ELSE "keep"]
     // An orphan is a connection that nobody is left to use on Ruby's side.
     let orphaned = c.app_gone.map(|since| now - since);
     let waited = c.fin_wait.map(|since| now - since);
-    let fate = match s.state() {
-        tcp::State::Closed | tcp::State::TimeWait if c.fd_eof && c.rx_shut => Fate::Close,
+    let fate = match (s.up(), s.down_open()) {
+        // Each stream has ended, and each end has been told.
+        (Up::Ended, false) if c.fd_eof && c.rx_shut => Fate::Close,
         // The peer has all that Ruby wrote, and is given a while to end
         // its stream too. What it sends in that time is reset above, for
         // want of anyone to read it. A tunnel that is closing does not
         // wait.
-        tcp::State::FinWait2 if c.orphan || waited.is_some_and(|age| age >= FIN_WAIT) => Fate::Abort,
+        (Up::Ended, true) if c.orphan || waited.is_some_and(|age| age >= FIN_WAIT) => Fate::Abort,
         // TCP waits for as long as the peer answers, and a peer may hold
         // its window shut for ever, or take a byte at a time. An orphan is
         // not kept that long: it has as long as a silent peer is given.
@@ -1155,12 +1117,12 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 // TLA-conn@60> \* later step. The set of one element has TLC work out t once, where it
 // TLA-conn@60> \* would otherwise work it out again for each place that names it.
 // TLA-conn@60> Then(t, Step(_)) == CHOOSE r \in {IF v.fate = "abort" THEN v ELSE Step(v) : v \in {t}} : TRUE
-// TLA-conn@60> Pass(t) == Then(Then(Then(Then(Then(Then(Then(Read(t), Fin), Hung), Waits), Tail), Give), End), Fated)
+// TLA-conn@60> Pass(t) == Then(Then(Then(Then(Then(Then(Read(t), Fin), Hung), Waits), Give), End), Fated)
 //
 // TLA-conn@90> Loop == PumpOpen(s.kick \/ FdReady(s)) \/ PumpDead \/ Dispatch \/ Tick
 // TLA-conn@90> \* The tick turns the loop four times a second, whatever else happens.
 // TLA-conn@90> TickPump == PumpOpen(TRUE)
-// TLA-conn@90> Timers == TcpTimeout \/ TimeWaitOver \/ Leaves \/ Finish
+// TLA-conn@90> Timers == TcpTimeout \/ Forgets \/ Leaves \/ Finish
 // TLA-conn@90> Next == Ruby \/ Peer \/ Orphan \/ Timers \/ Loop \/ TickPump
 // TLA-conn@90> \* The loop and the timers run when they can. Ruby and the peer owe
 // TLA-conn@90> \* nothing: each may stop at any point and never move again.
@@ -1168,21 +1130,15 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 // TLA-conn@90>
 // TLA-conn@90> \* A socket is not removed while it owes the peer a reset or an ACK.
 // TLA-conn@90> RemovedClean == s.phase = "removed" => s.owed = "none"
-// TLA-conn@90> \* A dead connection's socket is closed, or waits out its TIME-WAIT.
-// TLA-conn@90> DeadEnds == s.phase = "dead" => s.st \in {"Closed", "TimeWait"}
+// TLA-conn@90> \* Both streams of a dead connection's socket have ended.
+// TLA-conn@90> DeadEnds == s.phase = "dead" => s.up = "ended" /\ ~s.down
 // TLA-conn@90> \* carry passes on the end of the peer's stream only when Ruby has been
 // TLA-conn@90> \* given all that the peer sent. A tunnel that closes ends what Ruby
 // TLA-conn@90> \* reads at once, with orphan, whatever the socket holds.
-// TLA-conn@90> NoneWithheld == s.rxShut => s.rx = 0 /\ s.tail = 0
-// TLA-conn@90> \* Our FIN is sent only when carry has taken all that Ruby wrote.
-// TLA-conn@90> FinIsLast == s.phase = "open" /\ s.st \in {"FinWait1", "FinWait2", "Closing", "LastAck", "TimeWait"}
-// TLA-conn@90>                => s.fdEof /\ s.r2u = 0
+// TLA-conn@90> NoneWithheld == s.rxShut => s.rx = 0
 // TLA-conn@90> \* The socket has nothing left to send when its FIN is queued. smoltcp
 // TLA-conn@90> \* does not send a FIN well behind data that a shut window holds back.
-// TLA-conn@90> FinIsBare == s.st \in {"FinWait1", "Closing", "LastAck"} => s.tx = 0
-// TLA-conn@90> \* The tail is older than what the socket holds, and Ruby is given the
-// TLA-conn@90> \* tail first. The socket holds nothing for Ruby while the tail has bytes.
-// TLA-conn@90> TailIsFirst == s.tail > 0 => s.rx = 0
+// TLA-conn@90> FinIsBare == s.up = "ending" => s.tx = 0
 // TLA-conn@90> \* When poll would wait, a pass of carry would change nothing. So nothing
 // TLA-conn@90> \* that poll can report waits for the tick. Two things do wait for it, or
 // TLA-conn@90> \* for the next packet. One is room in the pair that poll does not report
@@ -1201,32 +1157,32 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 // TLA-conn@90> \* A state that the loop has seen owes none of these: the end of the
 // TLA-conn@90> \* peer's stream to Ruby, our FIN to the peer, the close, and the read
 // TLA-conn@90> \* that finds the end of what Ruby wrote to a tunnel that is closing.
-// TLA-conn@90> EndPassedOn == s.phase = "open" /\ ~s.kick /\ ~MayRecv(s) /\ s.rx = 0 /\ s.tail = 0 => s.rxShut
-// TLA-conn@90> FinQueued == s.phase = "open" /\ ~s.kick /\ s.fdEof /\ MaySend(s) => s.tx > 0
-// TLA-conn@90> ClosedWhenDone == s.phase = "open" /\ ~s.kick => ~(s.st \in {"Closed", "TimeWait"} /\ s.fdEof /\ s.rxShut)
-// TLA-conn@90> OrphanRead == s.phase = "open" /\ ~s.kick /\ s.orphan /\ MaySend(s) /\ s.tx < TxCap => s.fdEof
+// TLA-conn@90> EndPassedOn == s.phase = "open" /\ ~s.kick /\ ~s.down /\ s.rx = 0 => s.rxShut
+// TLA-conn@90> FinQueued == s.phase = "open" /\ ~s.kick /\ s.fdEof /\ s.up = "open" => s.tx > 0
+// TLA-conn@90> ClosedWhenDone == s.phase = "open" /\ ~s.kick => ~(s.up = "ended" /\ ~s.down /\ s.fdEof /\ s.rxShut)
+// TLA-conn@90> OrphanRead == s.phase = "open" /\ ~s.kick /\ s.orphan /\ s.up = "open" /\ s.tx < TxCap => s.fdEof
 // TLA-conn@90> \* What the promise sees of this model. Ruby has had its time when the
 // TLA-conn@90> \* tunnel closes, when a deadline of carry is over, and when it closed
 // TLA-conn@90> \* its end with bytes that it had yet to read or to be given.
-// TLA-conn@90> Seen == [dn    |-> IF s.phase = "open" THEN s.rx + s.tail ELSE 0,
+// TLA-conn@90> Seen == [dn    |-> IF s.phase = "open" THEN s.rx ELSE 0,
 // TLA-conn@90>          dq    |-> s.u2r,
 // TLA-conn@90>          dOpen |-> s.phase = "open" /\ ~s.rxShut /\ ~s.orphan,
-// TLA-conn@90>          dDone |-> ~MayRecv(s),
+// TLA-conn@90>          dDone |-> ~s.down,
 // TLA-conn@90>          rGone |-> s.ruby = "closed" \/ s.orphan,
 // TLA-conn@90>          un    |-> s.r2u,
 // TLA-conn@90>          uq    |-> s.tx,
-// TLA-conn@90>          uOpen |-> s.phase = "open" /\ MaySend(s),
+// TLA-conn@90>          uOpen |-> s.phase = "open" /\ s.up = "open",
 // TLA-conn@90>          uDone |-> s.fdEof,
 // TLA-conn@90>          pGone |-> s.peer = "gone",
 // TLA-conn@90>          late  |-> \/ s.orphan \/ s.gone = "timeout" \/ s.wait = "over"
-// TLA-conn@90>                    \/ s.ruby = "closed" /\ (s.rerr \/ s.rx + s.tail > 0)]
+// TLA-conn@90>                    \/ s.ruby = "closed" /\ (s.rerr \/ s.rx > 0)]
 // TLA-conn@90> Promise == INSTANCE stream
 // TLA-conn@90> \* Every step of this model is a step that the promise allows.
 // TLA-conn@90> Kept == [][Promise!Step(Seen, Seen')]_s
 // TLA-conn@90> \* A dead connection's socket goes, whether or not Ruby ever closes its end.
 // TLA-conn@90> DeadGoes == s.phase = "dead" ~> s.phase = "removed"
-// TLA-conn@90> \* If a peer is silent for good, its socket is closed, or goes.
-// TLA-conn@90> SilenceEnds == s.peer = "gone" ~> s.st = "Closed" \/ s.phase = "removed"
+// TLA-conn@90> \* If a peer is silent for good, both streams of its socket end, or it goes.
+// TLA-conn@90> SilenceEnds == s.peer = "gone" ~> (s.up = "ended" /\ ~s.down) \/ s.phase = "removed"
 // TLA-conn@90> \* Once Ruby has closed its end, the connection is let go, whatever the
 // TLA-conn@90> \* peer does or fails to do.
 // TLA-conn@90> LetGo == s.ruby = "closed" ~> s.phase = "removed"
@@ -1246,7 +1202,7 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 // TLA-conn.cfg>   PairCap = 1
 // TLA-conn.cfg>   Linger = 2
 // TLA-conn.cfg>   Fault = "none"
-// TLA-conn.cfg> INVARIANTS RemovedClean DeadEnds NoneWithheld FinIsLast FinIsBare TailIsFirst
+// TLA-conn.cfg> INVARIANTS RemovedClean DeadEnds NoneWithheld FinIsBare
 // TLA-conn.cfg>   NoMissedWake NoSpin Settles EndPassedOn FinQueued ClosedWhenDone OrphanRead
 // TLA-conn.cfg> PROPERTIES Kept DeadGoes SilenceEnds LetGo
 // TLA-conn.cfg> CHECK_DEADLOCK FALSE
@@ -1285,7 +1241,7 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket, now: Duration) -> (bool, Fate) {
 //
 // TLA-conn.cfg/no-keep-alive!Kept> Fault = "no keep-alive"
 //
-// What Ruby has yet to be given stays in the socket through TIME-WAIT:
+// The socket forgets what it holds for Ruby once both streams have ended:
 //
 // TLA-conn.cfg/no-tail!Kept> Fault = "no tail"
 //

@@ -11,6 +11,7 @@ mod engine;
 mod keys;
 mod packet;
 mod peers;
+mod sock;
 mod sys;
 mod tcp;
 
