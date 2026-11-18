@@ -31,6 +31,9 @@ const KEEP_ALIVE: Duration = Duration::from_secs(75);
 /// A closed connection's socket stays this long to acknowledge the
 /// peer's FIN. smoltcp delays an ACK by 10 ms at most.
 const LINGER: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 500 });
+/// A connection that Ruby has closed is given this long to hear the
+/// peer's FIN, once the peer has acknowledged ours. Linux gives as long.
+const FIN_WAIT: Duration = Duration::from_secs(60);
 /// smoltcp delays an ACK for this long at the most.
 const ACK_DELAY: Duration = Duration::from_millis(10);
 /// A connection that has ended is given this long to send its last ACK
@@ -146,11 +149,14 @@ struct Conn {
     /// The peer's FIN has been passed on to Ruby, as a shutdown of our
     /// end.
     rx_shut: bool,
-    /// poll reports a hangup on our end. Either Ruby has closed its end,
-    /// or each side has shut down its writing, which poll does not tell
-    /// apart. In both cases Ruby has no more to say, and has been told
-    /// all that it will be.
-    app_gone: bool,
+    /// When poll first reported a hangup on our end. Either Ruby has
+    /// closed its end, or each side has shut down its writing, which poll
+    /// does not tell apart. In both cases Ruby has no more to say, and
+    /// has been told all that it will be.
+    app_gone: Option<Instant>,
+    /// Since when the connection has waited for nothing but the peer's
+    /// FIN: Ruby has left, and the peer has acknowledged our FIN.
+    fin_wait: Option<Instant>,
     /// The tail holds what the peer sent last and Ruby has yet to be
     /// given, once that is taken out of the socket's buffer.
     tail: VecDeque<u8>,
@@ -170,7 +176,8 @@ impl Conn {
             local_port: None,
             fd_eof: false,
             rx_shut: false,
-            app_gone: false,
+            app_gone: None,
+            fin_wait: None,
             tail: VecDeque::new(),
             orphan: false,
         }
@@ -441,7 +448,7 @@ impl Stack {
                 // Ruby reads the end of its stream, and what the peer
                 // sends from now on has nobody to read it.
                 sys::shutdown_write(c.raw());
-                c.app_gone = true;
+                c.app_gone = c.app_gone.or(Some(Instant::now()));
             }
         }
     }
@@ -536,7 +543,7 @@ impl Stack {
                     let write = if s.can_recv() || !c.tail.is_empty() { libc::POLLOUT } else { 0 };
                     // Once the hangup has been seen, poll would return
                     // for it for ever.
-                    if read | write == 0 && c.app_gone {
+                    if read | write == 0 && c.app_gone.is_some() {
                         continue;
                     }
                     read | write
@@ -665,8 +672,13 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
         s.close();
         moved = true;
     }
-    if !c.app_gone && sys::hung_up(fd) {
-        c.app_gone = true;
+    if c.app_gone.is_none() && sys::hung_up(fd) {
+        c.app_gone = Some(Instant::now());
+    }
+    // The peer's time to end its stream begins when Ruby has left and the
+    // peer has acknowledged our FIN, whichever comes later.
+    if c.fin_wait.is_none() && c.app_gone.is_some() && s.state() == tcp::State::FinWait2 {
+        c.fin_wait = Some(Instant::now());
     }
 
     // smoltcp clears a socket when it has been in TIME-WAIT for ten
@@ -710,11 +722,20 @@ fn carry(c: &mut Conn, s: &mut tcp::Socket) -> (bool, Fate) {
         moved = true;
     }
 
+    // An orphan is a connection that nobody is left to use on Ruby's side.
+    let orphaned = c.app_gone.map(|since| since.elapsed());
+    let waited = c.fin_wait.map(|since| since.elapsed());
     let fate = match s.state() {
         tcp::State::Closed | tcp::State::TimeWait if c.fd_eof && c.rx_shut => Fate::Close,
-        // Our FIN is acknowledged and the peer may have more to say, but
-        // nobody is left to hear it.
-        tcp::State::FinWait2 if c.app_gone => Fate::Abort,
+        // The peer has all that Ruby wrote, and is given a while to end
+        // its stream too. What it sends in that time is reset above, for
+        // want of anyone to read it. A tunnel that is closing does not
+        // wait.
+        tcp::State::FinWait2 if c.orphan || waited.is_some_and(|age| age >= FIN_WAIT) => Fate::Abort,
+        // TCP waits for as long as the peer answers, and a peer may hold
+        // its window shut for ever, or take a byte at a time. An orphan is
+        // not kept that long: it has as long as a silent peer is given.
+        _ if orphaned.is_some_and(|age| age >= TCP_TIMEOUT) => Fate::Abort,
         _ => Fate::Keep,
     };
     (moved, fate)
@@ -920,9 +941,13 @@ mod tests {
         let from = format!("{A} {}", a.conns[0].local_port.unwrap());
         assert_eq!(message(&listener), Some(from.into_bytes()));
         // The message was read here without its descriptor. So the pair's
-        // other end is closed, and the connection is reset.
+        // other end is closed, and B ends the connection.
         settle(&mut a, &mut b);
         assert_eq!(read(&mut ruby), (vec![], true));
+        drop(ruby);
+        settle(&mut a, &mut b);
+        std::thread::sleep(LINGER);
+        settle(&mut a, &mut b);
         assert!(a.conns.is_empty() && b.conns.is_empty());
     }
 
@@ -1058,8 +1083,111 @@ mod tests {
         drop(client);
         settle(&mut a, &mut b);
         assert_eq!(read(&mut server), (b"last words".to_vec(), true));
-        // B acknowledged the FIN, and nobody was left on A's side to hear
-        // more, so A reset the connection.
+        // B has acknowledged the FIN, and has yet to end its stream.
+        assert!(a.conns.len() == 1 && b.conns.len() == 1);
+        drop(server);
+        settle(&mut a, &mut b);
+        std::thread::sleep(LINGER);
+        settle(&mut a, &mut b);
+        assert!(a.conns.is_empty() && b.conns.is_empty());
+    }
+
+    /// Makes an orphan as old as it would be after this long.
+    fn age(stack: &mut Stack, by: Duration) {
+        let c = &mut stack.conns[0];
+        c.app_gone = Some(c.app_gone.unwrap() - by);
+        c.fin_wait = c.fin_wait.map(|since| since - by);
+    }
+
+    #[test]
+    fn a_closed_end_waits_a_while_for_the_peer_to_end_its_stream() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (client, mut server) = connected(&mut a, &mut b);
+        drop(client);
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (vec![], true));
+        age(&mut a, FIN_WAIT - Duration::from_secs(1));
+        settle(&mut a, &mut b);
+        assert!(a.conns.len() == 1 && b.conns.len() == 1, "the peer still has its time");
+        age(&mut a, Duration::from_secs(1));
+        settle(&mut a, &mut b);
+        assert!(a.conns.is_empty() && b.conns.is_empty(), "and then it is reset");
+        assert!(server.write(b"too late").is_err());
+    }
+
+    #[test]
+    fn a_closed_end_is_reset_by_what_the_peer_sends_then() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (client, mut server) = connected(&mut a, &mut b);
+        drop(client);
+        settle(&mut a, &mut b);
+        server.write_all(b"is anyone there?").unwrap();
+        settle(&mut a, &mut b);
+        assert!(a.conns.is_empty() && b.conns.is_empty());
+    }
+
+    #[test]
+    fn a_closed_end_is_not_kept_for_a_peer_that_takes_nothing() {
+        const END: usize = 700 << 10;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // The server reads nothing, so its window shuts with part of this
+        // still to send.
+        let mut at = 0;
+        while at < END {
+            at = write_from(&mut client, at, END);
+            settle(&mut a, &mut b);
+        }
+        drop(client);
+        settle(&mut a, &mut b);
+        age(&mut a, TCP_TIMEOUT - Duration::from_secs(1));
+        settle(&mut a, &mut b);
+        assert_eq!(a.conns.len(), 1, "the orphan still has its time");
+        age(&mut a, Duration::from_secs(1));
+        settle(&mut a, &mut b);
+        assert!(a.conns.is_empty());
+        // The server can still read what reached it, and then the end.
+        let mut got = 0;
+        for _ in 0..100 {
+            let (bytes, end) = read(&mut server);
+            got += bytes.len();
+            if end {
+                break;
+            }
+            settle(&mut a, &mut b);
+        }
+        assert!(got > TCP_BUF && got < END && b.conns.is_empty(), "{got} bytes arrived");
+    }
+
+    #[test]
+    fn the_peer_has_its_time_from_when_it_has_taken_everything() {
+        const END: usize = 700 << 10;
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        // The server reads nothing yet, so part of this is still to send
+        // when Ruby closes its end.
+        let mut at = 0;
+        while at < END {
+            at = write_from(&mut client, at, END);
+            settle(&mut a, &mut b);
+        }
+        drop(client);
+        settle(&mut a, &mut b);
+        // The rest takes longer to deliver than the peer is given.
+        age(&mut a, FIN_WAIT + Duration::from_secs(1));
+        let mut got = 0;
+        for _ in 0..200 {
+            let (bytes, end) = read(&mut server);
+            got += bytes.len();
+            settle(&mut a, &mut b);
+            if end {
+                break;
+            }
+        }
+        assert_eq!(got, END);
+        assert!(a.conns.len() == 1 && b.conns.len() == 1, "the peer has its time from now");
+        age(&mut a, FIN_WAIT);
+        settle(&mut a, &mut b);
         assert!(a.conns.is_empty() && b.conns.is_empty());
     }
 
