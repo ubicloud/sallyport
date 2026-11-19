@@ -38,6 +38,7 @@ table of classes follows it.
 
 | Copy | Deviation | Class | What it changes |
 | --- | --- | --- | --- |
+| `smoltcp` | `receive-window` | `fix` | A socket takes a segment as far as any edge of the receive window that it advertised, and passes over the FIN of a segment that it cut there. |
 | `smoltcp` | `sends-now` | `addition` | `Socket::sends_now` says whether a socket has a segment to send at once. |
 | `smoltcp` | `lock` | `build` | `Cargo.lock` names the crates that the tests of smoltcp are built with here. |
 

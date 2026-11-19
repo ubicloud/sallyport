@@ -531,6 +531,11 @@ pub struct Socket<'a> {
     remote_last_ack: Option<TcpSeqNumber>,
     /// The last window length sent.
     remote_last_win: u16,
+    /// The furthest right edge of the receive window that was ever advertised.
+    /// The window field is rounded down to the window scale, so the edge that
+    /// the last segment advertised can be up to `(1 << shift) - 1` octets short
+    /// of an earlier one. The remote may have sent up to the earlier one.
+    remote_adv_edge: Option<TcpSeqNumber>,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -635,6 +640,7 @@ impl<'a> Socket<'a> {
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
+            remote_adv_edge: None,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
@@ -1004,6 +1010,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        self.remote_adv_edge = None;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
@@ -1576,6 +1583,7 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
+        self.note_advertised_edge();
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -1619,6 +1627,18 @@ impl<'a> Socket<'a> {
         // Since the sACK option may have changed the length of the payload, update that.
         ip_reply_repr.set_payload_len(reply_repr.buffer_len());
         (ip_reply_repr, reply_repr)
+    }
+
+    /// Remember the right edge of the receive window that was just advertised,
+    /// if it is further than any advertised before.
+    fn note_advertised_edge(&mut self) {
+        if let Some(last_ack) = self.remote_last_ack {
+            let edge = last_ack + ((self.remote_last_win as usize) << self.remote_win_shift);
+            match self.remote_adv_edge {
+                Some(furthest) if furthest >= edge => (),
+                _ => self.remote_adv_edge = Some(edge),
+            }
+        }
     }
 
     fn challenge_ack_reply(
@@ -1794,6 +1814,20 @@ impl<'a> Socket<'a> {
         } else {
             window_start
         };
+        // The window is never taken back: an edge that was advertised stands.
+        let window_end = match self.remote_adv_edge {
+            Some(furthest) if furthest > window_end => furthest,
+            _ => window_end,
+        };
+        // Whatever was advertised, no octet is taken that the buffer cannot hold.
+        // The window of a SYN is not scaled, and remote_last_win is shifted above
+        // all the same.
+        let buffer_end = window_start + self.rx_buffer.window();
+        let window_end = if window_end > buffer_end {
+            buffer_end
+        } else {
+            window_end
+        };
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -1960,6 +1994,14 @@ impl<'a> Socket<'a> {
             control = TcpControl::None;
         }
 
+        // If a FIN is received at the end of a segment whose payload was cut at
+        // the right edge of the window, the octets before the FIN are missing:
+        // disregard this FIN. The remote sends it again with those octets.
+        if control == TcpControl::Fin && segment_end > window_end {
+            tcp_trace!("ignoring FIN because the segment ends beyond the window");
+            control = TcpControl::None;
+        }
+
         // Validate and update the state.
         match (self.state, control) {
             // RSTs are not accepted in the LISTEN state.
@@ -2003,6 +2045,10 @@ impl<'a> Socket<'a> {
                 });
                 self.local_seq_no = Self::random_seq_no(cx);
                 self.remote_seq_no = repr.seq_number + 1;
+                // After an RST in SYN-RECEIVED, a socket goes back to LISTEN and is
+                // not reset. An edge of the earlier attempt is in another sequence
+                // space.
+                self.remote_adv_edge = None;
                 self.remote_last_seq = self.local_seq_no;
                 self.remote_has_sack = repr.sack_permitted;
                 self.remote_win_scale = repr.window_scale;
@@ -2051,6 +2097,7 @@ impl<'a> Socket<'a> {
                 }
 
                 self.remote_seq_no = repr.seq_number + 1;
+                self.remote_adv_edge = None;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
                 self.remote_has_sack = repr.sack_permitted;
@@ -2900,6 +2947,21 @@ impl<'a> Socket<'a> {
             }
         }
         self.ack_delay_timer = AckDelayTimer::Idle;
+
+        // Every segment advertises a window, a zero-window probe and a keep-alive
+        // among them, and the remote may send up to its right edge. Remember the
+        // edge if it is further than any advertised before. This is
+        // note_advertised_edge(), which cannot be called while the segment borrows
+        // the transmit buffer.
+        if repr.control != TcpControl::Syn
+            && let Some(ack) = repr.ack_number
+        {
+            let edge = ack + ((repr.window_len as usize) << self.remote_win_shift);
+            match self.remote_adv_edge {
+                Some(furthest) if furthest >= edge => (),
+                _ => self.remote_adv_edge = Some(edge),
+            }
+        }
 
         // Leave the rest of the state intact if sending a zero-window probe.
         if is_zero_window_probe {
@@ -8211,6 +8273,373 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    fn test_window_edge_does_not_move_back() {
+        let mut s = socket_established();
+        // The window field counts 8 octets, so the window that is advertised is
+        // rounded down to a multiple of 8.
+        s.remote_win_shift = 3;
+        s.remote_last_win = s.scaled_window();
+
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0x11; 8][..],
+                ..SEND_TEMPL
+            }
+        );
+        // The right edge of this window is the end of the buffer.
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 8),
+                window_len: 7,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0x22; 4][..],
+                ..SEND_TEMPL
+            }
+        );
+        // 52 octets are free and 48 are advertised: the right edge of this
+        // window is 4 octets short of the edge of the one before.
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 12),
+                window_len: 6,
+                ..RECV_TEMPL
+            }]
+        );
+        // The remote fills the earlier window, as it may, and all of it is taken.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 12,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0x33; 52][..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.rx_buffer.len(), 64);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 64),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_fin_of_segment_cut_at_window_edge_is_ignored() {
+        let mut s = socket_established();
+
+        // The segment ends 6 octets beyond the window. The octets before the FIN
+        // are not all there, so the FIN is not taken.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0x11; 70][..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.rx_buffer.len(), 64);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 64),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_window_of_keep_alive_is_honored() {
+        let mut s = socket_established();
+        s.set_keep_alive(Some(Duration::from_millis(100)));
+        // drain the forced keep-alive packet
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &[0],
+            ..RECV_TEMPL
+        }));
+
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[0x11; 32][..],
+            ..SEND_TEMPL
+        });
+        recv!(s, time 10, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 32),
+            window_len: 32,
+            ..RECV_TEMPL
+        }]);
+        // The window grows, but not by enough for a window update.
+        s.recv(|buffer| (16, buffer.len())).unwrap();
+        recv_nothing!(s, time 20);
+
+        // The keep-alive advertises the window as it is now.
+        recv!(s, time 110, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1 + 32),
+            window_len: 48,
+            payload:    &[0],
+            ..RECV_TEMPL
+        }));
+        // The remote fills that window, and all of it is taken.
+        send!(s, time 120, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 32,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[0x22; 48][..],
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.rx_buffer.len(), 64);
+    }
+
+    #[test]
+    fn test_fin_at_earlier_window_edge_with_scale() {
+        // The segment ends at the edge of the earlier window, 1 octet beyond it,
+        // and 5 octets beyond it.
+        for extra in [0usize, 1, 5] {
+            let mut s = socket_established();
+            s.remote_win_shift = 3;
+            s.remote_last_win = s.scaled_window();
+
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &[0x11; 8][..],
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 8),
+                    window_len: 7,
+                    ..RECV_TEMPL
+                }]
+            );
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + 8,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &[0x22; 4][..],
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 12),
+                    window_len: 6,
+                    ..RECV_TEMPL
+                }]
+            );
+            let data = vec![0x33u8; 52 + extra];
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: REMOTE_SEQ + 1 + 12,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &data[..],
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.rx_buffer.len(), 64);
+            if extra == 0 {
+                // All the octets before the FIN are there, and the FIN is taken.
+                assert_eq!(s.state, State::CloseWait);
+                recv!(
+                    s,
+                    [TcpRepr {
+                        seq_number: LOCAL_SEQ + 1,
+                        ack_number: Some(REMOTE_SEQ + 1 + 64 + 1),
+                        window_len: 0,
+                        ..RECV_TEMPL
+                    }]
+                );
+            } else {
+                assert_eq!(s.state, State::Established);
+                recv!(
+                    s,
+                    [TcpRepr {
+                        seq_number: LOCAL_SEQ + 1,
+                        ack_number: Some(REMOTE_SEQ + 1 + 64),
+                        window_len: 0,
+                        ..RECV_TEMPL
+                    }]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_window_of_zero_window_probe_is_honored() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+        // The remote takes it, shuts its window and sends 32 octets.
+        s.send_slice(b"ghijkl").unwrap();
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            window_len: 0,
+            payload: &[0x11; 32][..],
+            ..SEND_TEMPL
+        });
+        recv!(s, time 10, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1 + 32),
+            window_len: 32,
+            ..RECV_TEMPL
+        }]);
+        // The window grows, but not by enough for a window update.
+        s.recv(|buffer| (16, buffer.len())).unwrap();
+        recv_nothing!(s, time 20);
+
+        // The zero-window probe advertises the window as it is now.
+        let mut probe = None;
+        for millis in (30..5000).step_by(10) {
+            s.cx.set_now(Instant::from_millis(millis));
+            let _: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+                probe = Some((repr.ack_number, repr.window_len, repr.payload.len()));
+                Ok(())
+            });
+            if probe.is_some() {
+                break;
+            }
+        }
+        assert_eq!(probe, Some((Some(REMOTE_SEQ + 1 + 32), 48, 1)));
+        // The remote fills that window, and all of it is taken.
+        let _ = send(
+            &mut s,
+            Instant::from_millis(5000),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 32,
+                ack_number: Some(LOCAL_SEQ + 1 + 6),
+                window_len: 0,
+                payload: &[0x22; 48][..],
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.rx_buffer.len(), 64);
+    }
+
+    #[test]
+    fn test_listen_again_forgets_window_edge() {
+        let mut s = socket_listen();
+        let earlier = REMOTE_SEQ + 100_000;
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: earlier,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(earlier + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+        // An empty segment one octet below the window is answered with an ACK,
+        // which advertises a window.
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: earlier,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: earlier + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Listen);
+
+        // The next attempt has a lower initial sequence number. The edge of the
+        // earlier one must not stand for it.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+        // 100 octets for a buffer of 64.
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0x55; 100][..],
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.rx_buffer.len(), 64);
     }
 
     #[test]
