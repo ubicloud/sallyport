@@ -63,10 +63,11 @@ module Sallyport
         rescue Errno::ECONNRESET
           # The tunnel's thread closed its end before it had read our
           # last answer. The system reports that as a reset, once.
-          raise IOError, "the tunnel was closed"
+          ended
         end
       return nil if from == :wait_readable
-      raise IOError, "the tunnel was closed" if from.nil? || from.empty?
+
+      ended if from.nil? || from.empty?
 
       answer
       # The system gives no descriptor to a process that has its limit of
@@ -79,6 +80,14 @@ module Sallyport
 
       io.autoclose = false
       Socket.adopt(io.fileno, Addrinfo.tcp(peer[1], peer[2].to_i), @tunnel)
+    end
+
+    # The tunnel's thread has closed its end. It does that when the
+    # tunnel is closed, and otherwise only when it has failed.
+    def ended
+      raise IOError, "the tunnel was closed" if @tunnel.closed?
+
+      raise Errno::ENETDOWN, "the tunnel's thread has failed"
     end
 
     # Tells the tunnel's thread that a connection was accepted, which

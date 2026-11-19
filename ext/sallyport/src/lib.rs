@@ -239,9 +239,10 @@ pub unsafe extern "C" fn sp_listen(h: *mut c_void, port: c_int, backlog: c_int) 
 /// Asks the tunnel's thread to tell something of the tunnel, and returns
 /// a descriptor for the answer at once. The thread writes the answer on
 /// the descriptor from the next turn of its loop: a status of one byte,
-/// which is 0, and then a text. The stream then ends. A stream that ends
-/// with nothing in it is that of a thread which ended before it could
-/// answer.
+/// which is 0, the length of a text in four bytes, the most significant
+/// first, and then the text. The stream then ends. A stream that ends
+/// before that is the stream of a thread which ended before it had
+/// answered: the tunnel was closed, or the thread failed.
 ///
 /// Returns -1 and sets errno if nothing was begun, as sp_connect does.
 unsafe fn tell(h: *mut c_void, of: Of) -> c_int {

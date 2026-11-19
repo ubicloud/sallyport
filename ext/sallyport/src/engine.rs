@@ -223,7 +223,11 @@ impl Engine {
                 Cmd::Connect { fd, .. } => Stack::refuse(fd, status::NO_ROUTE),
                 Cmd::Listen { fd, port, backlog } => self.stack.listen(fd, port, backlog),
                 Cmd::Tell { fd, of } => {
-                    let text = [&[status::OK], self.tell_of(of).as_bytes()].concat();
+                    // The length goes before the text, so that a caller
+                    // can tell an answer that was cut short from a whole
+                    // one. The thread may end before it has written all.
+                    let told = self.tell_of(of);
+                    let text = [&[status::OK][..], &(told.len() as u32).to_be_bytes(), told.as_bytes()].concat();
                     self.telling.push(Telling { fd, text, sent: 0 });
                 }
             }

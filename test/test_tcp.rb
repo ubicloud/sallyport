@@ -163,9 +163,56 @@ class TestTCP < Minitest::Test
     listener = Sallyport::Listener.new(ours, 7, a)
     ours.send("\0", 0)
     theirs.close
+    a.close
     assert_raises(IOError) { listener.accept(timeout: 1) }
   ensure
     ours&.close
+  end
+
+  # A question may be on its way to the tunnel's thread when another
+  # thread closes the tunnel. Its answer is then that the tunnel was
+  # closed, and never that the thread has failed.
+  def test_a_question_that_a_close_overtakes_says_closed
+    100.times do
+      a, = pair
+      asking = Thread.new do
+        loop { a.connections }
+      rescue IOError => e
+        e
+      end
+      asking.report_on_exception = false
+      sleep 0.001
+      a.close
+      assert_instance_of IOError, asking.value
+    end
+  end
+
+  # A description that is longer than a socket pair holds is written as
+  # its caller reads it. If the tunnel closes meanwhile, the caller is
+  # told so, and is not given the part that was written.
+  def test_a_description_that_a_close_cuts_short_is_not_returned
+    whole = cut = 0
+    until whole.positive? && cut.positive?
+      a, b = pair(debug: "trace=100000")
+      client, server = connection(a, b)
+      transfer(client, server, Random.new(12).bytes(4 << 20))
+      asking = Thread.new do
+        a.dump
+      rescue IOError => e
+        e
+      end
+      asking.report_on_exception = false
+      sleep((whole + cut).odd? ? 0.0005 : 0.01)
+      a.close(linger: 0)
+      b.close(linger: 0)
+      case (answer = asking.value)
+      when IOError then cut += 1
+      else
+        assert_match(/ len \d+\n\z/, answer, "the description is whole")
+        whole += 1
+      end
+      flunk "a close never #{whole.zero? ? "left a description whole" : "cut one short"}" if whole + cut > 60
+    end
   end
 
   def test_bytes_cross_each_way

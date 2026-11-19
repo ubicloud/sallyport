@@ -363,10 +363,20 @@ module Sallyport
       # with it whatever else has arrived, and what does not read through
       # Ruby's buffer, as OpenSSL does not, would miss that.
       status = io.recv(1)
-      # The thread closes its end when the tunnel is closed. At the end of
-      # a stream recv returns nil, or "" before Ruby 3.3.
-      raise IOError, "the tunnel was closed" if status.nil? || status.empty?
+      # The thread closes its end when the tunnel is closed, and when it
+      # fails. At the end of a stream recv returns nil, or "" before Ruby
+      # 3.3.
+      ended if status.nil? || status.empty?
       raise Native::STATUS.fetch(status.ord), what unless status.ord.zero?
+    end
+
+    # The tunnel's thread ended before it had answered. It ends when the
+    # tunnel is closed, which another thread may do at any time, and
+    # otherwise only when it has failed.
+    def ended
+      raise IOError, "the tunnel was closed" if closed?
+
+      failed
     end
 
     # A tunnel's thread ends before the tunnel is closed only by a fault
@@ -377,8 +387,8 @@ module Sallyport
     end
 
     # Asks the tunnel's thread for a text, and returns it. The library
-    # gives a descriptor at once. The thread writes a status and then the
-    # text on it, and ends the stream.
+    # gives a descriptor at once. The thread writes a status, the length
+    # of the text and the text on it, and ends the stream.
     def ask(function, what)
       # The wait for the lock can be interrupted. From the call until the
       # descriptor has an owner, an exception from another thread waits.
@@ -390,10 +400,11 @@ module Sallyport
           IO.for_fd(fd)
         end
       end
-      # A thread that fails before it answers writes nothing.
+      # A thread that ends before it has answered writes nothing, or a
+      # part of its answer.
       answer = io.read
-      failed if answer.empty?
-      answer.byteslice(1..).force_encoding(Encoding::UTF_8)
+      ended unless answer.bytesize >= 5 && answer.bytesize == 5 + answer.unpack1("xN")
+      answer.byteslice(5..).force_encoding(Encoding::UTF_8)
     ensure
       io&.close
     end
