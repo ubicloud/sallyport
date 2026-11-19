@@ -150,8 +150,7 @@ the TCP inside. With `SALLYPORT_DEBUG=trace=200` in the environment, or
 `debug: "trace=200"` given to `Tunnel.new`, the tunnel keeps a line for
 each of its last 200 TCP packets, and `Tunnel#dump` returns them. It
 then also returns the account that smoltcp gives of each connection's
-socket. That account takes the tunnel's thread some 6 ms for each
-connection, in which the tunnel does nothing else.
+socket.
 
 ## Tests
 
@@ -245,7 +244,9 @@ The tests against other implementations, and the models, found the
 following. Each is something that another project may want to know of,
 and most name the test that shows it.
 
-smoltcp, at the commit that `ext/sallyport/vendor/README.md` names:
+smoltcp, at the commit that `ext/sallyport/vendor/README.md` names. The
+copy in this repository mends a fault where a deviation is named, and
+`tools/deviations show` prints the deviation:
 
 - Release 0.14.0 panics when a peer fills a receive window whose edge the
   window scale rounded back. The fix is on the main branch and in no
@@ -269,6 +270,11 @@ smoltcp, at the commit that `ext/sallyport/vendor/README.md` names:
   that was cut is taken. This library gives smoltcp a FIN in a packet of
   its own, after the data
   (`a_fin_is_not_taken_with_a_segment_that_the_window_cut`).
+- The `Debug` of a TCP socket writes every byte of its two buffers,
+  whether or not they hold anything. For two buffers of 256 KiB that is
+  1.6 MB of text, which takes 10 ms. The deviation `ring-debug` mends
+  this (`test_debug_leaves_out_the_storage`, among the tests of the
+  copy).
 - A socket's timeout counts the time since the peer's last packet,
   whether or not anything waits to be acknowledged. A connection that is
   only quiet is reset unless a keep-alive is set as well

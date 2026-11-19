@@ -494,9 +494,7 @@ impl Stack {
 
     /// Describes every connection in a line, which is what the stack
     /// knows of it. With `detail`, a second line is smoltcp's account of
-    /// the socket. That one takes milliseconds to write for each
-    /// connection, because smoltcp writes out every byte of the socket's
-    /// buffers on the way, and the thread does nothing else meanwhile.
+    /// the socket, which is a long one.
     pub fn describe(&self, text: &mut String, detail: bool) {
         for c in &self.conns {
             let (phase, pair) = match &c.phase {
@@ -520,7 +518,7 @@ impl Stack {
                 if left { ", Ruby is gone" } else { "" },
             );
             if detail {
-                let _ = writeln!(text, "  {}", Sock::detail(s));
+                let _ = writeln!(text, "  {s:?}");
             }
         }
     }
