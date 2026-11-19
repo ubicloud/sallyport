@@ -248,10 +248,8 @@ module Sallyport
     # Returns a description of the tunnel for a person to read: what it
     # has counted, a line for each peer, and a line for each connection.
     # With a trace, each connection has a second line, which is the TCP
-    # socket as smoltcp prints it. That line takes the tunnel's thread
-    # some milliseconds to write, in which the tunnel does nothing else.
-    # The description is there to show why something does not move, and
-    # its form may change.
+    # socket as smoltcp prints it. The description is there to show why
+    # something does not move, and its form may change.
     def dump
       ask(Native::DUMP, "a description of the tunnel")
     end

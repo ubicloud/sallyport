@@ -260,17 +260,6 @@ impl<'a> Sock<'a> {
         )
     }
 
-    /// Returns what smoltcp prints of a socket, and leaves out the bytes
-    /// in its buffers.
-    pub fn detail(s: &Socket) -> String {
-        let mut detail = format!("{s:?}");
-        while let Some(from) = detail.find("Owned([") {
-            let to = detail[from..].find("])").map_or(detail.len(), |to| from + to + 2);
-            detail.replace_range(from..to, "..");
-        }
-        detail
-    }
-
     // TLA-sock> \* Sock::new. The socket keeps what it holds for Ruby until Ruby is given
     // TLA-sock> \* it. smoltcp alone would clear it ten seconds after both streams have
     // TLA-sock> \* ended, and this is that fault.
