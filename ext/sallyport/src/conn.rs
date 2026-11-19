@@ -299,10 +299,11 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
                 let left = pair.hangup() != Hangup::No;
                 match shake(left, Sock::opening(s), now - since >= SYN_WAIT) {
                     Shake::Wait => return Phase::Connecting { pair, since },
-                    Shake::Done => {
-                        pair.say(status::OK);
-                        Phase::open(pair)
-                    }
+                    // Ruby reads the status, or the end of the pair if
+                    // the status could not be sent. So a connection
+                    // that Ruby cannot be told of is not kept.
+                    Shake::Done if pair.say(status::OK) => Phase::open(pair),
+                    Shake::Done => break Fate::Abort,
                     Shake::Refused => {
                         pair.say(status::REFUSED);
                         break Fate::Close;

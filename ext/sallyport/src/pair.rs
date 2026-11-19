@@ -251,9 +251,11 @@ impl Pair {
     }
 
     /// Sends the status that is the first byte of a connection that Ruby
-    /// makes.
-    pub fn say(&self, status: u8) {
-        sys::send(self.fd.as_raw_fd(), &[status]);
+    /// makes, and says whether the pair took it. A pair that has nothing
+    /// in it takes a byte, unless Ruby has shut down its reading or the
+    /// system has no memory for it.
+    pub fn say(&self, status: u8) -> bool {
+        sys::send(self.fd.as_raw_fd(), &[status]) == 1
     }
 
     // TLA-pair> \* poll reports that there is something to read when a read would not say

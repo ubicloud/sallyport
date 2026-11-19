@@ -278,12 +278,14 @@ impl Stack {
         // Ruby may have closed a listener on this port a moment ago.
         self.reap();
         let ctl = Ctl::new(ctl);
-        if self.listeners.iter().any(|l| l.port == port) {
-            return ctl.say(status::IN_USE);
+        // Ruby reads the status, or the end of the pair if the status
+        // could not be sent. So a listener that Ruby cannot be told of is
+        // not kept.
+        let free = !self.listeners.iter().any(|l| l.port == port);
+        if ctl.say(if free { status::OK } else { status::IN_USE }) && free {
+            self.listened += 1;
+            self.listeners.push(Listener { id: self.listened, port, ctl, backlog });
         }
-        ctl.say(status::OK);
-        self.listened += 1;
-        self.listeners.push(Listener { id: self.listened, port, ctl, backlog });
     }
 
     /// Stops the listening on each port whose listener Ruby has closed. A
@@ -923,6 +925,22 @@ mod tests {
         a.turn();
         assert!(is_reset(&a.transmit().unwrap()));
         assert!(a.conns.is_empty() && a.local_ports.is_empty());
+    }
+
+    #[test]
+    fn a_connection_that_ruby_cannot_be_told_of_is_not_kept() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let listener = listen(&mut b, 7, 4);
+        assert_eq!(message(&listener), Some(vec![status::OK]));
+        let client = connect(&mut a, B, 7);
+        // Ruby's end takes no more, and so not the status. It has not
+        // hung up: it may still write.
+        client.shutdown(Shutdown::Read).unwrap();
+        settle(&mut a, &mut b);
+        assert!(a.conns.is_empty(), "A has reset the connection");
+        // The reset came in place of the ACK that ends the handshake, so
+        // B has no connection to send its listener.
+        assert!(b.conns.is_empty() && message(&listener).is_none());
     }
 
     #[test]

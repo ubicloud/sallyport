@@ -63,9 +63,10 @@ impl Ctl {
         Ctl { fd, unaccepted: 0 }
     }
 
-    /// Sends the status that is the first message of a listener.
-    pub fn say(&self, status: u8) {
-        sys::send(self.fd.as_raw_fd(), &[status]);
+    /// Sends the status that is the first message of a listener, and
+    /// says whether the pair took it.
+    pub fn say(&self, status: u8) -> bool {
+        sys::send(self.fd.as_raw_fd(), &[status]) == 1
     }
 
     // TLA-ctl> \* Ctl::send, on a pair that Ruby has not closed. The pair takes a
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn the_pair_holds_the_messages_of_the_largest_backlog() {
         let (mut ours, ruby) = ctl();
-        ours.say(0);
+        assert!(ours.say(0));
         let sent: Vec<(Sent, Pair)> = (0..MAX_BACKLOG).map(|_| connection(&mut ours)).collect();
         assert!(sent.iter().all(|(sent, _)| *sent == Sent::Ok) && ours.unaccepted() == MAX_BACKLOG);
         for _ in 0..MAX_BACKLOG {

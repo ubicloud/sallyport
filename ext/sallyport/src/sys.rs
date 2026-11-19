@@ -11,13 +11,15 @@ pub const AGAIN: isize = -2;
 pub const PIPE: isize = -3;
 
 /// Maps what a system call returned to a count, AGAIN, PIPE, or -1 for
-/// any other error.
+/// any other error. A call that the system had no memory for is one to
+/// make again, as one that would have had to wait is: the system has the
+/// memory a moment later, and the descriptor is as it was.
 fn result(n: isize) -> isize {
     if n >= 0 {
         return n;
     }
     match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::EAGAIN | libc::EINTR) => AGAIN,
+        Some(libc::EAGAIN | libc::EINTR | libc::ENOBUFS | libc::ENOMEM) => AGAIN,
         Some(libc::EPIPE) => PIPE,
         _ => -1,
     }
@@ -234,6 +236,16 @@ pub fn random_fill(buf: &mut [u8]) {
 mod tests {
     use super::*;
     use std::net::{Ipv6Addr, SocketAddrV6};
+
+    #[test]
+    fn a_call_that_found_no_memory_is_one_to_make_again() {
+        let failed = |errno: libc::c_int| {
+            unsafe { *libc::__errno_location() = errno };
+            result(-1)
+        };
+        assert_eq!([libc::EAGAIN, libc::EINTR, libc::ENOBUFS, libc::ENOMEM].map(failed), [AGAIN; 4]);
+        assert_eq!([libc::EPIPE, libc::ECONNRESET, libc::EBADF].map(failed), [PIPE, -1, -1]);
+    }
 
     #[test]
     fn a_datagram_may_be_cut_up_on_its_way() {
