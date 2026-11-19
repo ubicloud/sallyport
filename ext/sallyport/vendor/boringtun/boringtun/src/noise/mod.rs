@@ -62,8 +62,9 @@ pub struct Tunn {
     handshake: handshake::Handshake,
     /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
     sessions: [Option<session::Session>; N_SESSIONS],
-    /// Index of most recently used session
-    current: usize,
+    /// Id of the session to send in. The peer has shown that it holds the keys of this
+    /// session, with a handshake response or with a data packet. None until it has.
+    current: Option<usize>,
     /// Queue to store blocked packets
     packet_queue: VecDeque<Vec<u8>>,
     /// Keeps tabs on the expiring timers
@@ -248,8 +249,7 @@ impl Tunn {
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
-        let current = self.current;
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+        if let Some(session) = self.current_session() {
             // Send the packet using an established session
             let packet = session.format_packet_data(src, dst);
             self.timer_tick(TimerName::TimeLastPacketSent);
@@ -386,18 +386,34 @@ impl Tunn {
         Ok(TunnResult::Done)
     }
 
+    /// The session that `current` names, while the ring still holds it.
+    ///
+    /// The session in the slot of `current` can be another one. A slot is taken by id
+    /// modulo N_SESSIONS, so the session of a later handshake initiation that we
+    /// answered can have replaced the current one. The peer has not shown that it holds
+    /// the keys of that session, and may never do so.
+    pub(super) fn current_session(&self) -> Option<&session::Session> {
+        let current = self.current?;
+        self.sessions[current % N_SESSIONS]
+            .as_ref()
+            .filter(|session| session.local_index() == current)
+    }
+
     /// Update the index of the currently used session, if needed
     fn set_current_session(&mut self, new_idx: usize) {
-        let cur_idx = self.current;
-        if cur_idx == new_idx {
+        if self.current == Some(new_idx) {
             // There is nothing to do, already using this session, this is the common case
             return;
         }
-        if self.sessions[cur_idx % N_SESSIONS].is_none()
-            || self.timers.session_timers[new_idx % N_SESSIONS]
-                >= self.timers.session_timers[cur_idx % N_SESSIONS]
-        {
-            self.current = new_idx;
+        let is_newer = match self.current_session() {
+            Some(current) => {
+                self.timers.session_timers[new_idx % N_SESSIONS]
+                    >= self.timers.session_timers[current.local_index() % N_SESSIONS]
+            }
+            None => true,
+        };
+        if is_newer {
+            self.current = Some(new_idx);
             tracing::debug!(message = "New session", session = new_idx);
         }
     }
@@ -541,7 +557,7 @@ impl Tunn {
     }
 
     fn estimate_loss(&self) -> f32 {
-        let session_idx = self.current;
+        let session_idx = self.current.unwrap_or_default();
 
         let mut weight = 9.0;
         let mut cur_avg = 0.0;
@@ -666,6 +682,38 @@ mod tests {
         (my_tun, their_tun)
     }
 
+    /// `initiator` begins a handshake, which `responder` answers. The response is lost,
+    /// so `responder` holds a session that `initiator` has not confirmed.
+    fn handshake_without_confirmation(initiator: &mut Tunn, responder: &mut Tunn) {
+        // A responder takes a handshake initiation only if its timestamp is later than
+        // that of the one before.
+        #[cfg(feature = "mock-instant")]
+        mock_instant::MockClock::advance(Duration::from_millis(1));
+        let mut dst = vec![0u8; 2048];
+        let init = initiator.format_handshake_initiation(&mut dst, true);
+        let init = if let TunnResult::WriteToNetwork(sent) = init {
+            sent
+        } else {
+            unreachable!();
+        };
+        create_handshake_response(responder, init);
+    }
+
+    /// Encapsulates a packet, which must result in a handshake initiation and not in a
+    /// data packet.
+    fn encapsulate_results_in_handshake(tun: &mut Tunn) {
+        let mut dst = vec![0u8; 2048];
+        let result = tun.encapsulate(&create_ipv4_udp_packet(), &mut dst);
+        assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+        let packet_data = if let TunnResult::WriteToNetwork(data) = result {
+            data
+        } else {
+            unreachable!();
+        };
+        let packet = Tunn::parse_incoming_packet(packet_data).unwrap();
+        assert!(matches!(packet, Packet::HandshakeInit(_)));
+    }
+
     fn create_ipv4_udp_packet() -> Vec<u8> {
         let header =
             etherparse::PacketBuilder::ipv4([192, 168, 1, 2], [192, 168, 1, 3], 5).udp(5678, 23);
@@ -764,6 +812,64 @@ mod tests {
 
         mock_instant::MockClock::advance(REKEY_TIMEOUT);
         update_timer_results_in_handshake(&mut my_tun)
+    }
+
+    #[test]
+    fn no_data_in_session_peer_did_not_confirm() {
+        let (mut my_tun, mut their_tun) = create_two_tuns();
+        // They answer as many handshake initiations as the ring has sessions, and we
+        // complete none of them.
+        for _ in 0..N_SESSIONS {
+            handshake_without_confirmation(&mut my_tun, &mut their_tun);
+        }
+        assert!(their_tun.time_since_last_handshake().is_none());
+        encapsulate_results_in_handshake(&mut their_tun);
+    }
+
+    #[test]
+    fn unconfirmed_session_is_not_taken_for_current_session() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let sent_packet_buf = create_ipv4_udp_packet();
+
+        // While their ring still holds the session that we confirmed, they send in it.
+        for _ in 0..N_SESSIONS - 1 {
+            handshake_without_confirmation(&mut my_tun, &mut their_tun);
+
+            let mut my_dst = [0u8; 1024];
+            let mut their_dst = [0u8; 1024];
+            let data = their_tun.encapsulate(&sent_packet_buf, &mut their_dst);
+            assert!(matches!(data, TunnResult::WriteToNetwork(_)));
+            let data = if let TunnResult::WriteToNetwork(sent) = data {
+                sent
+            } else {
+                unreachable!();
+            };
+            let data = my_tun.decapsulate(None, data, &mut my_dst);
+            assert!(matches!(data, TunnResult::WriteToTunnelV4(..)));
+        }
+
+        // One more session takes the slot of the session that we confirmed. They do not
+        // send in that one.
+        handshake_without_confirmation(&mut my_tun, &mut their_tun);
+        assert!(their_tun.time_since_last_handshake().is_none());
+        encapsulate_results_in_handshake(&mut their_tun);
+    }
+
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn time_since_last_handshake_is_of_current_session() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+
+        mock_instant::MockClock::advance(Duration::from_secs(10));
+        assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
+        // This advances time by a millisecond.
+        handshake_without_confirmation(&mut my_tun, &mut their_tun);
+
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert_eq!(
+            their_tun.time_since_last_handshake(),
+            Some(Duration::from_millis(11_001))
+        );
     }
 
     #[test]
