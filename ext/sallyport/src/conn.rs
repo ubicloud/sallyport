@@ -45,10 +45,9 @@ pub enum Phase {
     },
     Open(Open),
     /// The connection is closed to Ruby and has no pair. Its socket stays
-    /// until it has sent what it owes the peer.
-    Dead {
-        since: Duration,
-    },
+    /// until it has sent what it owes the peer, which it does in the turn
+    /// that ended the connection.
+    Dead,
 }
 
 /// What an open connection has besides its socket.
@@ -76,6 +75,7 @@ impl Phase {
 
 // TLA-conn@20> \* A pass ends in one of these ways. A connection that is closed or reset
 // TLA-conn@20> \* keeps its socket, as Phase::Dead, until the socket has sent what it owes.
+// TLA-conn@20> \* That is a reset, or the ACK of the peer's FIN.
 // TLA-conn@20> Rest(t) == [t EXCEPT !.at = "idle"]
 // TLA-conn@20> Dead(t) == [t EXCEPT !.phase = IF Fault = "remove at once" THEN "removed" ELSE "dead",
 // TLA-conn@20>                      !.old = FALSE, !.at = "idle"]
@@ -156,7 +156,7 @@ enum Fate {
 // TLA-conn@0>   p       |-> P!New,    \* the pair
 // TLA-conn@0>   k       |-> K!New,    \* the socket
 // TLA-conn@0>   phase   |-> first,    \* "connecting", "listening", "open", "dead" or "removed"
-// TLA-conn@0>   old     |-> FALSE,    \* the phase is old: an attempt as smoltcp's timeout, a dead socket as LINGER
+// TLA-conn@0>   old     |-> FALSE,    \* an attempt is as old as smoltcp's timeout
 // TLA-conn@0>   said    |-> "none",   \* what Ruby was told of the attempt: "ok", "refused" or "timedout"
 // TLA-conn@0>   listens |-> TRUE,     \* Ruby has not closed the listener
 // TLA-conn@0>   left    |-> "no",     \* Open.left is "no", "yes" or "late" (TCP_TIMEOUT ago)
@@ -204,10 +204,7 @@ enum Fate {
 // TLA-conn@10>             /\ \E k \in K!TimesOut(s.k) : s' = [s EXCEPT !.k = k, !.kick = TRUE]
 // TLA-conn@10> Forgets == /\ s.at = "idle" /\ s.phase = "open"
 // TLA-conn@10>            /\ \E k \in K!Forgets(s.k) : s' = [s EXCEPT !.k = k, !.kick = TRUE]
-// TLA-conn@10> \* smoltcp delays an ACK for less long than LINGER, so a dead socket is old
-// TLA-conn@10> \* only when it owes nothing.
-// TLA-conn@10> Ages == /\ ~s.old /\ (s.phase = "connecting" \/ (s.phase = "dead" /\ s.k.owed = "none"))
-// TLA-conn@10>         /\ s' = [s EXCEPT !.old = TRUE, !.kick = TRUE]
+// TLA-conn@10> Ages == ~s.old /\ s.phase = "connecting" /\ s' = [s EXCEPT !.old = TRUE, !.kick = TRUE]
 // TLA-conn@10> Late == /\ s.phase = "open"
 // TLA-conn@10>         /\ \/ s.left = "yes" /\ s' = [s EXCEPT !.left = "late", !.kick = TRUE]
 // TLA-conn@10>            \/ s.wait = "yes" /\ s' = [s EXCEPT !.wait = "late", !.kick = TRUE]
@@ -238,7 +235,7 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
     let fate = loop {
         phase = match phase {
             // sweep removes it.
-            Phase::Dead { .. } => return phase,
+            Phase::Dead => return phase,
             // Ruby gave up waiting, and closed its end. Or the tunnel is
             // closing, and has shut the pair down.
             Phase::Connecting { pair, .. } if pair.hangup() != Hangup::No => break Fate::Abort,
@@ -297,7 +294,7 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
     if let Fate::Abort = fate {
         Sock::abort(s);
     }
-    Phase::Dead { since: now }
+    Phase::Dead
 }
 
 // TLA-conn> \* A pass of carry is four steps, and each makes one kind of call on the
@@ -501,7 +498,7 @@ impl Phase {
     /// pair has nothing to watch.
     pub fn watch(&self, s: &Socket) -> Option<libc::pollfd> {
         let (pair, events) = match self {
-            Phase::Listening { .. } | Phase::Dead { .. } => return None,
+            Phase::Listening { .. } | Phase::Dead => return None,
             // Ruby may write before it has the status, and nothing reads
             // that yet. So poll is not asked whether there is anything to
             // read, for which it would return for ever.
@@ -527,7 +524,7 @@ impl Phase {
 // TLA-conn@90> Clock == Ages \/ Late
 // TLA-conn@90> Timers == TimesOut \/ Forgets \/ Finish
 // TLA-conn@90> Next == \/ RubyActs \/ ListenerCloses \/ PeerPacket \/ PeerSilent
-// TLA-conn@90>         \/ Orphan \/ Timers \/ Clock \/ Loop \/ Turn \/ SweepEarly
+// TLA-conn@90>         \/ Orphan \/ Timers \/ Clock \/ Loop \/ Turn
 // TLA-conn@90> \* The loop and the clock run when they can. A timer of smoltcp takes
 // TLA-conn@90> \* effect between two passes, and it does in the end, however often the
 // TLA-conn@90> \* loop turns. Ruby and the peer owe nothing: each may stop at any point

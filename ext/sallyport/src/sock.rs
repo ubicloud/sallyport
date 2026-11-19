@@ -49,8 +49,6 @@ const KEEP_ALIVE: Duration = Duration::from_secs(75);
 /// advises, and that of Linux waits 200 ms. A peer may delay an ACK for
 /// nearly as long, so a shorter wait would send again what was not lost.
 const MIN_RTO: Duration = Duration::from_millis(200);
-/// smoltcp delays an ACK for this long at the most.
-pub const ACK_DELAY: Duration = Duration::from_millis(10);
 
 // The module "sock" is this contract as the model "conn" has it. The
 // lines of the module are here and beside the calls below.
@@ -113,7 +111,8 @@ pub const ACK_DELAY: Duration = Duration::from_millis(10);
 // TLA-sock> \* when it sends those bytes again.
 // TLA-sock> TimesOut(k) == When(~(k.up = "ended" /\ ~k.down) /\ (k.gone \/ Fault = "no keep-alive"),
 // TLA-sock>                     [Cut(k) EXCEPT !.owed = "rst"])
-// TLA-sock> \* Stack::poll has smoltcp send what a socket owes.
+// TLA-sock> \* Stack::poll has smoltcp send what a socket owes. The socket delays
+// TLA-sock> \* none of it: Sock::make has it acknowledge at once.
 // TLA-sock> Sent(k) == [k EXCEPT !.owed = "none"]
 
 /// The stream to the peer, as carry sees it.
@@ -178,6 +177,13 @@ impl<'a> Sock<'a> {
         // as much as the peer's window takes, whatever the path can carry.
         s.set_congestion_control(tcp::CongestionControl::Cubic);
         s.set_min_rto(SDuration::from_millis(MIN_RTO.as_millis() as u64));
+        // The socket sends an ACK in the turn in which it comes to owe
+        // it. smoltcp would else delay the ACK for up to 10 ms, and the
+        // socket of a connection that has ended would have to stay as
+        // long, to send its last one. The loop has the sockets send once
+        // in a turn, so one ACK answers all that the turn took in
+        // (`a_connection_that_ends_sends_its_last_ack_in_the_same_turn`).
+        s.set_ack_delay(None);
         s
     }
 
@@ -289,16 +295,6 @@ impl<'a> Sock<'a> {
             tcp::State::Closed => Opening::Failed,
             _ => Opening::Done,
         }
-    }
-
-    // TLA-sock> \* Sock::silent. A socket that was reset is silent once the reset has left.
-    // TLA-sock> Silent(k) == k.cut /\ k.owed = "none"
-    /// Says whether a socket that is closed has sent all that it owed.
-    /// smoltcp forgets the peer once it has no more to send it. A socket
-    /// that waits out TIME-WAIT is never silent in this sense: the peer's
-    /// FIN may still be owed an ACK.
-    pub fn silent(s: &Socket) -> bool {
-        s.state() == tcp::State::Closed && s.remote_endpoint().is_none()
     }
 
     /// Says what poll is to be asked for a socket: whether it has room for

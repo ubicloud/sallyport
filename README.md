@@ -96,6 +96,9 @@ descriptor as well, and reads the description from it.
   64 KiB of it at the most, and the peer is held after that. If the
   socket is closed while the tunnel holds such bytes, the peer is reset.
 - It agrees to no selective acknowledgement. The last section says why.
+- It does not delay an ACK, as most TCPs do to send it with data. An ACK
+  leaves in the turn of the tunnel's thread that took the segments in,
+  and one ACK answers all that the turn took in.
 - The window that it gives a peer has no scale, so a peer sends 64 KiB
   at the most in one round trip. Where a round trip takes 100 ms, Ruby
   reads 640 KiB a second at the most. The last section says why.

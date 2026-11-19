@@ -13,7 +13,7 @@ use crate::conn::{status, step, Open, Phase};
 use crate::ctl::Ctl;
 use crate::packet::{rst, split_fin, syn, without_sack};
 use crate::pair::{Pair, PairCalls};
-use crate::sock::{Sock, Socket, ACK_DELAY};
+use crate::sock::{Sock, Socket};
 use crate::sys;
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -25,12 +25,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
-/// A closed connection's socket stays this long to acknowledge the
-/// peer's FIN. smoltcp delays an ACK by 10 ms at most.
-const LINGER: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 500 });
-/// A connection that has ended is given this long to send its last ACK
-/// when the tunnel is closing, which is twice smoltcp's longest delay.
-const LAST_ACK: Duration = Duration::from_millis(20);
 /// The stack's clock goes on by no more than this from one reading to the
 /// next. The tunnel's thread reads it several times a second, so a longer
 /// time is one in which the thread stood still.
@@ -438,7 +432,7 @@ impl Stack {
     /// Returns how many connections there are: those that the stack is
     /// making, and those that are made and have not ended.
     pub fn connections(&self) -> usize {
-        self.conns.iter().filter(|c| !matches!(c.phase, Phase::Listening { .. } | Phase::Dead { .. })).count()
+        self.conns.iter().filter(|c| !matches!(c.phase, Phase::Listening { .. } | Phase::Dead)).count()
     }
 
     /// Describes every connection, each in two lines. The first is what
@@ -450,7 +444,7 @@ impl Stack {
                 Phase::Connecting { pair, .. } => ("connecting", Some(pair)),
                 Phase::Listening { .. } => ("listening", None),
                 Phase::Open(open) => ("open", Some(&open.pair)),
-                Phase::Dead { .. } => ("dead", None),
+                Phase::Dead => ("dead", None),
             };
             let (tail, left) = match &c.phase {
                 Phase::Open(open) => (open.tail.len(), open.left.is_some()),
@@ -470,20 +464,16 @@ impl Stack {
         }
     }
 
-    // TLA-conn> \* Every turn of the loop has each socket send what it owes. smoltcp may
-    // TLA-conn> \* delay an ACK past the turn.
+    // TLA-conn> \* Every turn of the loop has each socket send what it owes.
     // TLA-conn> Dispatch == s.phase # "removed" /\ s.k.owed # "none" /\ s' = [s EXCEPT !.k = K!Sent(@)]
-    /// Has every socket send what it has to send.
-    pub fn poll(&mut self) {
+    /// Has every socket send what it has to send. Returns whether every
+    /// socket has sent all of it.
+    pub fn poll(&mut self) -> bool {
         let now = self.now();
         // smoltcp's poll sends until no socket has more to send. A socket
         // whose timer did not move would keep it there for ever, so the
         // rounds are counted. What is left goes at the next turn.
-        for _ in 0..EGRESS_ROUNDS {
-            if self.iface.poll_egress(now, &mut self.link, &mut self.sockets) == PollResult::None {
-                break;
-            }
-        }
+        (0..EGRESS_ROUNDS).any(|_| self.iface.poll_egress(now, &mut self.link, &mut self.sockets) == PollResult::None)
     }
 
     // TLA-conn@70> \* The thread may turn the loop at any time, as it does for the tick and
@@ -507,8 +497,11 @@ impl Stack {
         self.now();
         self.ingress();
         self.pump();
-        self.poll();
-        self.sweep();
+        // A dead connection's socket goes when it has sent what it owed,
+        // and a socket delays nothing that it owes.
+        if self.poll() {
+            self.sweep();
+        }
     }
 
     // TLA-conn> \* The tunnel is closing. orphan shuts down each pair both ways, and
@@ -534,28 +527,23 @@ impl Stack {
         }
     }
 
-    /// Says whether every connection has ended, and has had the time to
-    /// send its last ACK.
+    /// Says whether every connection has ended, and its socket has sent
+    /// what it owed.
     pub fn finished(&self) -> bool {
-        self.conns.iter().all(|c| matches!(c.phase, Phase::Dead { since } if self.clock - since >= LAST_ACK))
+        self.conns.is_empty()
     }
 
     // TLA-conn> \* The linger is over. abort resets a connection that has not ended. The
-    // TLA-conn> \* poll that follows sends what every socket owes, an ACK that was delayed
-    // TLA-conn> \* among it, and the thread ends.
+    // TLA-conn> \* poll that follows sends what every socket owes, and the thread ends.
     // TLA-conn> Finish == /\ s.at = "idle" /\ s.closing /\ s.phase # "removed"
     // TLA-conn>           /\ LET k == IF s.phase = "dead" THEN s.k ELSE K!Abort(s.k)
     // TLA-conn>              IN s' = [s EXCEPT !.phase = "removed", !.k = K!Sent(k)]
     /// Resets every connection that has not ended. The resets leave at
     /// the next poll.
     pub fn abort(&mut self) {
-        for c in self.conns.iter().filter(|c| !matches!(c.phase, Phase::Dead { .. })) {
+        for c in self.conns.iter().filter(|c| !matches!(c.phase, Phase::Dead)) {
             Sock::abort(self.sockets.get_mut::<Socket>(c.handle));
         }
-        // A socket that has just taken the peer's FIN may still delay its
-        // ACK, and the next poll is the last. So the stack's clock is put
-        // on by the delay, and the ACK leaves with the resets.
-        self.clock += ACK_DELAY;
     }
 
     /// Returns how long the stack can wait before its next timer.
@@ -576,7 +564,7 @@ impl Stack {
             let s = self.sockets.get_mut::<Socket>(c.handle);
             // The step takes the phase, and gives back the phase to go on
             // in.
-            let phase = std::mem::replace(&mut c.phase, Phase::Dead { since: self.clock });
+            let phase = std::mem::replace(&mut c.phase, Phase::Dead);
             // A connection that a peer made goes to Ruby on the pair of
             // its listener, unless Ruby has closed that listener.
             let ctl = match phase {
@@ -589,25 +577,15 @@ impl Stack {
         }
     }
 
-    // TLA-conn> \* sweep removes a dead connection when its socket was reset and has sent
-    // TLA-conn> \* the reset, or when the peer's FIN has had long enough to be
-    // TLA-conn> \* acknowledged.
-    // TLA-conn> Sweep == /\ s.phase = "dead" /\ (K!Silent(s.k) \/ (s.old /\ s.k.owed = "none"))
-    // TLA-conn>          /\ s' = [s EXCEPT !.phase = "removed"]
-    // TLA-conn> \* smoltcp also forgets a socket whose FIN the peer acknowledged last, and
-    // TLA-conn> \* sweep may find that one silent sooner.
-    // TLA-conn> SweepEarly == /\ s.phase = "dead" /\ ~s.k.cut /\ s.k.owed = "none"
-    // TLA-conn>               /\ s' = [s EXCEPT !.phase = "removed"]
-    /// Removes each dead connection whose socket has sent what it owed.
-    /// The sockets have just sent, so one that was reset in this turn goes
-    /// in this turn.
+    // TLA-conn> \* sweep removes a dead connection when its socket has sent what it owed.
+    // TLA-conn> Sweep == s.phase = "dead" /\ s.k.owed = "none" /\ s' = [s EXCEPT !.phase = "removed"]
+    /// Removes each dead connection. The sockets have just sent all that
+    /// they had to send, so the socket of a connection that ended in this
+    /// turn goes in this turn.
     fn sweep(&mut self) {
-        let (sockets, ports, now) = (&mut self.sockets, &mut self.local_ports, self.clock);
+        let (sockets, ports) = (&mut self.sockets, &mut self.local_ports);
         self.conns.retain(|c| {
-            let Phase::Dead { since } = c.phase else { return true };
-            // A socket in TIME-WAIT may still owe the peer's FIN an ACK,
-            // which smoltcp may delay.
-            if !Sock::silent(sockets.get::<Socket>(c.handle)) && now - since < LINGER {
+            if !matches!(c.phase, Phase::Dead) {
                 return true;
             }
             sockets.remove(c.handle);
@@ -765,14 +743,12 @@ mod tests {
         }
     }
 
-    /// Carries packets between two stacks until neither has more to do,
-    /// and then for as long as smoltcp may delay an ACK.
+    /// Carries packets between two stacks until neither has more to do.
     fn settle(a: &mut Stack, b: &mut Stack) {
-        let mut quiet = 0;
-        while quiet < 2 {
-            let mut moved = false;
+        loop {
             a.turn();
             b.turn();
+            let mut moved = false;
             while let Some(packet) = a.transmit() {
                 b.receive(packet);
                 moved = true;
@@ -781,11 +757,8 @@ mod tests {
                 a.receive(packet);
                 moved = true;
             }
-            if moved {
-                quiet = 0;
-            } else {
-                quiet += 1;
-                std::thread::sleep(Duration::from_millis(12));
+            if !moved {
+                break;
             }
         }
     }
@@ -854,6 +827,7 @@ mod tests {
         assert_eq!(s.congestion_control(), tcp::CongestionControl::Cubic);
         assert!(!s.nagle_enabled());
         assert_eq!(s.min_rto(), SDuration::from_millis(200));
+        assert_eq!(s.ack_delay(), None);
     }
 
     #[test]
@@ -952,8 +926,6 @@ mod tests {
         settle(&mut a, &mut b);
         assert_eq!(read(&mut ruby), (vec![], true));
         drop(ruby);
-        settle(&mut a, &mut b);
-        std::thread::sleep(LINGER);
         settle(&mut a, &mut b);
         assert!(a.conns.is_empty() && b.conns.is_empty());
     }
@@ -1057,9 +1029,7 @@ mod tests {
         server.shutdown(Shutdown::Write).unwrap();
         settle(&mut a, &mut b);
         assert_eq!(read(&mut client), (vec![], true));
-        // The socket that owes the last ACK stays a while, and then goes.
-        std::thread::sleep(LINGER);
-        settle(&mut a, &mut b);
+        // The socket that owed the last ACK has sent it, and is gone.
         assert!(a.conns.is_empty() && b.conns.is_empty());
     }
 
@@ -1383,8 +1353,6 @@ mod tests {
         // B has acknowledged the FIN, and has yet to end its stream.
         assert!(a.conns.len() == 1 && b.conns.len() == 1);
         drop(server);
-        settle(&mut a, &mut b);
-        std::thread::sleep(LINGER);
         settle(&mut a, &mut b);
         assert!(a.conns.is_empty() && b.conns.is_empty());
     }
@@ -1777,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_that_is_closing_sends_an_ack_that_it_delayed() {
+    fn a_connection_that_ends_sends_its_last_ack_in_the_same_turn() {
         let (mut a, mut b) = (stack(A), stack(B));
         let (mut client, mut server) = connected(&mut a, &mut b);
         client.shutdown(Shutdown::Write).unwrap();
@@ -1794,17 +1762,10 @@ mod tests {
         put_fin(&mut last);
         a.receive(last);
         a.turn();
-        assert!(matches!(a.conns[0].phase, Phase::Dead { .. }) && a.transmit().is_none(), "the ACK is delayed");
-        assert!(!a.finished(), "the dead connection has the time for its last ACK");
-        assert_eq!(read(&mut client), (b"bye".to_vec(), true));
-        // The tunnel closes with no linger, as Engine::finish has it.
-        a.orphan();
-        a.abort();
-        a.poll();
         let ack = a.transmit().expect("the ACK of the peer's FIN");
-        assert!(!is_reset(&ack));
-        age(&mut a, LAST_ACK);
-        assert!(a.finished());
+        assert!(!is_reset(&ack) && a.transmit().is_none());
+        assert!(a.finished(), "and the connection's socket is gone");
+        assert_eq!(read(&mut client), (b"bye".to_vec(), true));
     }
 
     #[test]
