@@ -38,13 +38,27 @@ fn net(text: &str) -> Result<Net, String> {
         Some((addr, len)) => (addr, Some(len)),
         None => (text, None),
     };
-    let addr: IpAddr = addr.trim().parse().map_err(|_| format!("bad address {text:?}"))?;
+    let addr: IpAddr = addr.trim().parse().map_err(|_| "a bad address".to_string())?;
     let max = if addr.is_ipv4() { 32 } else { 128 };
     let len = match len {
         Some(len) => len.trim().parse::<u8>().ok().filter(|len| *len <= max),
         None => Some(max),
     };
-    Ok((addr, len.ok_or_else(|| format!("bad prefix length in {text:?}"))?))
+    Ok((addr, len.ok_or("a bad prefix length")?))
+}
+
+/// Returns a name as a fault may show it. A fault shows nothing else of
+/// the text: a configuration holds keys, and what a fault says is logged.
+/// A line that is not as it should be can have a key where a name or a
+/// number is looked for. A name of at most 24 letters is no key, which
+/// has 43 characters or more.
+fn word(text: &str) -> String {
+    let inner = text.strip_prefix('[').and_then(|text| text.strip_suffix(']')).unwrap_or(text);
+    if !inner.is_empty() && inner.len() <= 24 && inner.bytes().all(|b| b.is_ascii_alphabetic()) {
+        format!(" {text}")
+    } else {
+        String::new()
+    }
 }
 
 /// Says whether the network holds the address.
@@ -78,14 +92,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
                         PeerCfg { public: [0; 32], psk: None, endpoint: None, allowed: Vec::new(), keepalive: None };
                     peers.push((None, peer));
                 }
-                _ => return Err(at(format!("unknown section {line}"))),
+                _ => return Err(at(format!("unknown section{}", word(line)))),
             }
             continue;
         }
         let (name, value) = line.split_once('=').ok_or_else(|| at("expected KEY = VALUE".into()))?;
         let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
-        let number = |v: &str| v.parse::<u16>().map_err(|_| at(format!("bad number {v:?}")));
-        let list = |v: &str| v.split(',').map(net).collect::<Result<Vec<Net>, String>>().map_err(at);
+        let of = |fault: String| at(format!("{name} has {fault}"));
+        let number = |v: &str| v.parse::<u16>().map_err(|_| of("a bad number".into()));
+        let list = |v: &str| v.split(',').map(net).collect::<Result<Vec<Net>, String>>().map_err(of);
         match (section.as_str(), name.as_str(), peers.last_mut()) {
             ("[interface]", "privatekey", _) => private = Some(keys::decode(value).map_err(at)?),
             ("[interface]", "address", _) => {
@@ -114,9 +129,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ("[peer]", "endpoint", Some((_, peer))) => {
                 // A host name is resolved here, once.
                 let found = value.to_socket_addrs().ok().and_then(|mut addrs| addrs.next());
-                peer.endpoint = Some(found.ok_or_else(|| at(format!("cannot resolve endpoint {value:?}")))?);
+                peer.endpoint = Some(found.ok_or_else(|| of("an address that does not resolve".into()))?);
             }
-            _ => return Err(at(format!("unknown key {name}"))),
+            _ => return Err(at(format!("unknown key{}", word(&name)))),
         }
     }
     if addrs.is_empty() || addrs.len() > MAX_ADDRS {
@@ -201,9 +216,9 @@ mod tests {
             (interface("Address = 10.9.0.1\nColour = red"), "line 4: unknown key colour"),
             (interface("Address = 10.9.0.1\n[Pier]"), "line 4: unknown section [Pier]"),
             (interface("Address = 10.9.0.1\nListenPort"), "line 4: expected KEY = VALUE"),
-            (interface("Address = 10.9.0.1\nListenPort = 70000"), "line 4: bad number \"70000\""),
-            (interface("Address = 10.9.0.300"), "line 3: bad address \"10.9.0.300\""),
-            (interface("Address = 10.9.0.1/33"), "line 3: bad prefix length in \"10.9.0.1/33\""),
+            (interface("Address = 10.9.0.1\nListenPort = 70000"), "line 4: listenport has a bad number"),
+            (interface("Address = 10.9.0.300"), "line 3: address has a bad address"),
+            (interface("Address = 10.9.0.1/33"), "line 3: address has a bad prefix length"),
             (interface("Address = 224.0.0.1"), "line 3: a tunnel cannot have the address 224.0.0.1"),
             (interface("Address = 10.9.0.1, ff02::1"), "line 3: a tunnel cannot have the address ff02::1"),
             (interface("Address = 255.255.255.255"), "line 3: a tunnel cannot have the address 255.255.255.255"),
@@ -212,9 +227,32 @@ mod tests {
             ("[Interface]\nPrivateKey = short".to_string(), "line 2: a key must be 32 bytes in base64"),
             (
                 interface("Address = 10.9.0.1\n[Peer]\nEndpoint = nowhere"),
-                "line 5: cannot resolve endpoint \"nowhere\"",
+                "line 5: endpoint has an address that does not resolve",
             ),
             ("Address = 10.9.0.1".to_string(), "line 1: unknown key address"),
+        ];
+        for (text, fault) in cases {
+            assert_eq!(parse(&text).unwrap_err(), fault);
+        }
+    }
+
+    #[test]
+    fn a_fault_shows_no_text_that_may_be_a_key() {
+        // Each of these has a key where the parser looks for something
+        // else: the separator is left out, the line breaks are lost, or a
+        // key is the value of another setting.
+        let cases = [
+            (format!("[Interface]\nPrivateKey {KEY}\nAddress = 10.9.0.1"), "line 2: unknown key"),
+            (format!("[Interface]\\nPrivateKey = {KEY}\\nAddress = 10.9.0.1"), "line 1: unknown section"),
+            (format!("[Interface] PrivateKey = {KEY}"), "line 1: unknown section"),
+            (interface(&format!("Address = 10.9.0.1\\nPrivateKey = {KEY}")), "line 3: address has a bad address"),
+            (interface(&format!("Address = 10.9.0.1/{KEY}")), "line 3: address has a bad prefix length"),
+            (interface(&format!("Address = 10.9.0.1\nListenPort = {KEY}")), "line 4: listenport has a bad number"),
+            (
+                interface(&format!("Address = 10.9.0.1\n[Peer]\nEndpoint = {KEY}")),
+                "line 5: endpoint has an address that does not resolve",
+            ),
+            (interface(&format!("Address = 10.9.0.1\n{KEY}")), "line 4: unknown key"),
         ];
         for (text, fault) in cases {
             assert_eq!(parse(&text).unwrap_err(), fault);
