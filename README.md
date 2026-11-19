@@ -82,7 +82,12 @@ thread's answer from it.
 - An exception from another thread, as `Thread#kill` and `Timeout` raise
   one, cannot leave a tunnel or a descriptor without an owner. Ruby does
   not hold back the exception of a signal in the same way, so Ctrl-C can,
-  at the moment that a tunnel is made or closed or a connection is begun.
+  at the moment that a tunnel is made or closed, or a connection is begun
+  or accepted.
+- `Tunnel#close` waits for its linger, and nothing ends that wait
+  sooner. An exception from another thread waits with it. So does a
+  signal, if the main thread is the one that closes. Every other call on
+  the tunnel waits for the close as well.
 - `connect` takes an IP address, because a tunnel has no resolver. The
   host name of a peer's endpoint is resolved once, when the tunnel starts.
 - A `Sallyport::Socket` is a `UNIXSocket`. Its `remote_address` is the
@@ -111,6 +116,17 @@ thread's answer from it.
   at the most in one round trip. Where a round trip takes 100 ms, Ruby
   reads 640 KiB a second at the most. The last section says why.
 - A listener's backlog is 128 connections at most.
+- A tunnel answers a peer from the address that the system chooses for
+  the way back. On a machine with several addresses, that may not be the
+  address that the peer wrote to, and a NAT or a firewall on the peer's
+  side may then drop the answer. The kernel's WireGuard answers from the
+  address that it was written to.
+- A connection has 320 KiB of buffers from its first packet on, and
+  keeps them until it has ended. A socket that Ruby has closed can take
+  a while to end: up to 60 seconds if the peer does not end its stream,
+  and up to 300 if the peer is gone. The tunnel's thread holds a
+  descriptor for it as long. If the process cannot have the memory for
+  a buffer, it ends, as a Rust program does when an allocation fails.
 - It is made for tens or hundreds of connections in a tunnel, and not
   for thousands. A connection that nothing happens to costs the tunnel's
   thread no system call. But smoltcp looks at every socket for each
@@ -332,6 +348,20 @@ boringtun 0.7.1:
   so that the length of a datagram says less of what it carries. The
   tunnel pads the packet before boringtun has it
   (`a_packet_is_padded_to_sixteen_bytes_and_arrives_as_it_was`).
+- It keeps the session of each initiation that it answers in one of
+  eight places, and sends in the session that is in the place of the
+  current one, whether or not the peer has confirmed it. WireGuard sends
+  in a session only when the peer has shown that it holds the keys.
+  After eight initiations that their sender does not complete, as with a
+  preshared key that does not match, the peer reads as alive, and
+  packets for it leave in a session that it does not have. The tunnel
+  does nothing about this.
+- A session lasts 180 seconds, and boringtun begins the next one when it
+  has something to send and none to send it in. A peer that sends only
+  keepalives, every 25 seconds, is without a session for some 20 seconds
+  in every 200, and `Peer#alive?` is false then. The first packet brings
+  a handshake, which takes a few milliseconds. The kernel's WireGuard
+  begins the next session while the old one still holds.
 - It does not look at what a key exchange gives. A few public keys give
   zeros with every private key, and a session with such a peer would have
   keys that anyone can make. The tunnel refuses a configuration that has
