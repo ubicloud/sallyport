@@ -11,7 +11,7 @@
 use crate::config::Config;
 use crate::conn::{status, step, Open, Phase};
 use crate::ctl::Ctl;
-use crate::packet::{ends, rst, split_fin, syn, without_sack};
+use crate::packet::{ends, rst, syn, without_sack};
 use crate::pair::{Pair, PairCalls};
 use crate::sock::{Sock, Socket};
 use crate::sys;
@@ -247,20 +247,7 @@ impl Stack {
         if !self.sack {
             without_sack(&mut packet);
         }
-        // smoltcp takes a segment as far as the end of the window that it
-        // has on record, and it takes the FIN of a segment that it cut
-        // there. Ruby would then read the end of the stream without the
-        // bytes that were cut. A peer can have sent past that end. A
-        // keep-alive carries the window as it is then, and so does a probe
-        // of the peer's window, and smoltcp keeps no record of either. And
-        // after a SYN of its own, smoltcp has the end on record a byte
-        // short until its first ACK has left. So a FIN comes to smoltcp in
-        // a packet of its own, after its data. smoltcp passes over a FIN
-        // that follows bytes which it does not have, and the peer sends
-        // the FIN again with those bytes.
-        let fin = split_fin(&mut packet);
         self.link.rx.push_back(packet);
-        self.link.rx.extend(fin);
     }
 
     /// Returns the next IP packet that the stack wants sent.
@@ -1332,10 +1319,11 @@ mod tests {
     #[test]
     fn a_stream_that_ends_where_the_window_ends_is_read_whole() {
         // The client's socket has this much room when the server writes
-        // the last of its stream, which is two writes. A window that
-        // smoltcp scaled would be all of the room before the first write,
-        // which is a multiple of 8 bytes, and less than the room for the
-        // second, which is an odd number of bytes.
+        // the last of its stream, which is two writes. The window has a
+        // scale, and the number in a header counts 8 bytes. So the window
+        // is all of the room before the first write, which is a multiple
+        // of 8 bytes. It is less than the room for the second, which is
+        // an odd number of bytes.
         const ROOM: usize = 4096;
         const LAST: usize = 1001;
         let (mut a, mut b) = (stack(A), stack(B));
@@ -1363,9 +1351,11 @@ mod tests {
         assert_eq!(write_from(&mut server, at, end), end);
         b.turn();
         // A acknowledges the first write at once, as it is more than a
-        // segment, and the window that it tells of is all of the room.
-        // With a scaled window it would be a byte short of the second
-        // write, and smoltcp would drop the last byte of the stream.
+        // segment. The window that it tells of ends a byte short of the
+        // second write, which B has sent as far as the end that it was
+        // given before. smoltcp as its project has it drops the last byte
+        // of the stream there, and takes the FIN. The copy takes a
+        // segment as far as any end that it gave.
         a.turn();
         // The second write is all that B has left to send, and A takes the
         // whole of it.
@@ -1461,8 +1451,9 @@ mod tests {
         s.set_keep_alive(interval);
         // B answers with an ACK that has no data. Linux numbers such an
         // ACK from the last byte that it has sent, and B's ACK is given
-        // that number here. With a scaled window that byte would be past
-        // the end of A's window, and A would not count the answer.
+        // that number here. smoltcp as its project has it has dropped
+        // that byte, so the number is past the end of A's window, and A
+        // does not count the answer. The copy has taken the byte.
         let begun = a.clock;
         while a.clock - begun < Duration::from_secs(4) {
             a.turn();
