@@ -182,11 +182,14 @@ impl Peers {
                 send(b, to);
             }
         }
-        // A peer speaks only for the addresses that its AllowedIPs give it,
-        // so the source address of a packet that gets this far is one that
-        // the peer's key vouches for.
+        // A peer speaks only for the addresses that are routed to it: a
+        // packet to such an address goes to that peer and to no other. The
+        // peer's key vouches for a packet that gets this far, and the
+        // packet is taken if its source is such an address. Where the
+        // AllowedIPs of two peers overlap, neither can send as an address
+        // that the other holds more closely.
         let (packet, src) = packet?;
-        if peer.allowed.iter().any(|net| contains(net, &src)) {
+        if self.route(&src) == Some(i) {
             Some(packet)
         } else {
             self.dropped.disallowed += 1;
@@ -195,7 +198,9 @@ impl Peers {
     }
 
     /// Finds the peer whose AllowedIPs hold the address. Where several
-    /// do, the longest prefix wins, as in any routing table.
+    /// do, the longest prefix wins, as in any routing table. If two peers
+    /// have the same net, it is the later one's, as it is to the kernel's
+    /// WireGuard when it is given the two in that order.
     fn route(&self, dst: &IpAddr) -> Option<usize> {
         let nets = self.list.iter().enumerate().flat_map(|(i, p)| p.allowed.iter().map(move |net| (net, i)));
         nets.filter(|(net, _)| contains(net, dst)).max_by_key(|(net, _)| net.1).map(|(_, i)| i)
@@ -487,6 +492,54 @@ mod tests {
         // The same peer is heard when it sends from its own address.
         let mut datagrams = sent(&mut b, &ip(B, A));
         assert_eq!(settle(&mut a, &mut b, &mut datagrams, 2).0, [ip(B, A)]);
+    }
+
+    /// Builds the peers of a tunnel at 10.9.0.1 that has two peers, and
+    /// the peers of each of those two. The first peer is at port 2 and
+    /// the second at port 3.
+    fn three(first: &str, second: &str) -> (Peers, Peers, Peers) {
+        let ((ka, pa), (kb, pb), (kc, pc)) = (key(1), key(2), key(3));
+        let a = format!(
+            "[Interface]\nPrivateKey = {ka}\nAddress = {A}\n\
+             [Peer]\nPublicKey = {pb}\nAllowedIPs = {first}\n\
+             [Peer]\nPublicKey = {pc}\nAllowedIPs = {second}"
+        );
+        let other = |key: &str| {
+            let conf = format!(
+                "[Interface]\nPrivateKey = {key}\nAddress = {B}\n\
+                 [Peer]\nPublicKey = {pa}\nAllowedIPs = {A}/32\nEndpoint = 192.0.2.1:1"
+            );
+            Peers::new(&config::parse(&conf).unwrap()).unwrap()
+        };
+        (Peers::new(&config::parse(&a).unwrap()).unwrap(), other(&kb), other(&kc))
+    }
+
+    #[test]
+    fn a_peer_does_not_send_as_an_address_that_another_peer_holds_more_closely() {
+        let (mut a, mut wide, mut narrow) = three("10.9.0.0/24", "10.9.0.2/32");
+        // 10.9.0.2 is in the first peer's net, and a packet to it goes to
+        // the second peer.
+        let mut datagrams = sent(&mut wide, &ip("10.9.0.2", A));
+        assert!(settle(&mut a, &mut wide, &mut datagrams, 2).0.is_empty());
+        assert_eq!(a.dropped, Dropped { unknown: 0, refused: 0, disallowed: 1 });
+        let mut datagrams = sent(&mut wide, &ip("10.9.0.3", A));
+        assert_eq!(settle(&mut a, &mut wide, &mut datagrams, 2).0, [ip("10.9.0.3", A)]);
+        let mut datagrams = sent(&mut narrow, &ip("10.9.0.2", A));
+        assert_eq!(settle(&mut a, &mut narrow, &mut datagrams, 3).0, [ip("10.9.0.2", A)]);
+        // The second peer has that one address and no other.
+        let mut datagrams = sent(&mut narrow, &ip("10.9.0.3", A));
+        assert!(settle(&mut a, &mut narrow, &mut datagrams, 3).0.is_empty());
+        assert_eq!(a.dropped.disallowed, 2);
+    }
+
+    #[test]
+    fn a_net_that_two_peers_have_is_the_later_one_s() {
+        let (mut a, mut first, mut second) = three("10.9.0.2/32", "10.9.0.2/32");
+        let mut datagrams = sent(&mut first, &ip(B, A));
+        assert!(settle(&mut a, &mut first, &mut datagrams, 2).0.is_empty());
+        let mut datagrams = sent(&mut second, &ip(B, A));
+        assert_eq!(settle(&mut a, &mut second, &mut datagrams, 3).0, [ip(B, A)]);
+        assert_eq!(a.route(&B.parse().unwrap()), Some(1));
     }
 
     #[test]
