@@ -161,7 +161,7 @@ socket.
 | `rake vpp`, then `sudo env "PATH=$PATH" ruby -Ilib -Itest test/test_vpp.rb` | The tests against VPP, which the task fetches as packages for Ubuntu 24.04. | root, ethtool |
 | `rake tla` | TLC on the TLA+ models. The task fetches TLC. | Java |
 | `rake conform` | The code that moves the bytes of a connection, in every state that TLC reaches of the model of it. | Java, Cargo |
-| `rake vendored` | The tests that smoltcp and boringtun have of their own, on the copies in `ext/sallyport/vendor`. First `rake deviations` checks that each change of a copy is of a deviation that has a class. | Cargo, the whole history |
+| `rake vendored` | The tests that smoltcp and boringtun have of their own, on the copies in `ext/sallyport/vendor`. First `rake deviations` checks that each change of a copy is of a deviation that has a class, and that the copies are laid out as rustfmt lays them out. | Cargo, the whole history |
 
 The tests against another implementation put it in a ring. A test writes
 to a connection that it made, and reads the same bytes from a connection
