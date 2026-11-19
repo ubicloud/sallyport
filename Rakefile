@@ -36,6 +36,10 @@ task vendored: :deviations do
   rest = ["--release", "--locked", "--target-dir", "ext/sallyport/target/vendored"]
   sh "cargo", "test", "--lib", "--manifest-path", "ext/sallyport/vendor/smoltcp/Cargo.toml", *rest
   sh "cargo", "test", "-p", "boringtun", "--manifest-path", "ext/sallyport/vendor/boringtun/Cargo.toml", *rest
+  # Some tests of boringtun move a clock of their own, and are built only
+  # with this feature.
+  sh "cargo", "test", "-p", "boringtun", "--features", "mock-instant", "--manifest-path",
+     "ext/sallyport/vendor/boringtun/Cargo.toml", *rest
 end
 
 # Wireproxy is the second implementation that the tests talk to. It is a
