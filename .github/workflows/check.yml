@@ -96,11 +96,19 @@ jobs:
       - run: cargo test --release --locked --manifest-path ext/sallyport/Cargo.toml -- --ignored
   # These are the tests that smoltcp and boringtun have of their own. The
   # repository changes its copies of the two, in ext/sallyport/vendor.
+  # tools/deviations holds each change to the rules of that directory. It
+  # reads the commits, so the checkout has them all.
   vendored:
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - run: tools/deviations check
       - run: cargo test --lib --manifest-path ext/sallyport/vendor/smoltcp/Cargo.toml --release --locked --target-dir ext/sallyport/target/vendored
       - run: cargo test -p boringtun --manifest-path ext/sallyport/vendor/boringtun/Cargo.toml --release --locked --target-dir ext/sallyport/target/vendored
   lint:

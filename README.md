@@ -52,8 +52,9 @@ binds by hand with Fiddle. [boringtun](https://github.com/cloudflare/boringtun)
 is its WireGuard and [smoltcp](https://github.com/smoltcp-rs/smoltcp) is
 its TCP. The repository holds a copy of each in `ext/sallyport/vendor`,
 and the library is built with those. `ext/sallyport/vendor/README.md`
-says where each copy is from and how it has been changed. To install the
-gem is to build the library, which takes Cargo.
+says where each copy is from, and `tools/deviations` lists what has been
+changed in each, by class. To install the gem is to build the library,
+which takes Cargo.
 
 Each tunnel has a thread of its own, which never takes the GVL. The
 thread owns the UDP socket, the WireGuard sessions and the TCP stack.
@@ -164,7 +165,7 @@ connection, in which the tunnel does nothing else.
 | `rake vpp`, then `sudo env "PATH=$PATH" ruby -Ilib -Itest test/test_vpp.rb` | The tests against VPP, which the task fetches as packages for Ubuntu 24.04. | root, ethtool |
 | `rake tla` | TLC on the TLA+ models. The task fetches TLC. | Java |
 | `rake conform` | The code that moves the bytes of a connection, in every state that TLC reaches of the model of it. | Java, Cargo |
-| `rake vendored` | The tests that smoltcp and boringtun have of their own, on the copies in `ext/sallyport/vendor`. | Cargo |
+| `rake vendored` | The tests that smoltcp and boringtun have of their own, on the copies in `ext/sallyport/vendor`. First `rake deviations` checks that each change of a copy is of a deviation that has a class. | Cargo, the whole history |
 
 The tests against another implementation put it in a ring. A test writes
 to a connection that it made, and reads the same bytes from a connection

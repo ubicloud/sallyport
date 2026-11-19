@@ -17,8 +17,13 @@ task :slow do
   sh "cargo", "test", "--release", "--locked", "--manifest-path", "ext/sallyport/Cargo.toml", "--", "--ignored"
 end
 
+desc "Check that each change of a copy in vendor is of a deviation that has a class"
+task :deviations do
+  sh "tools/deviations", "check"
+end
+
 desc "Run the tests that smoltcp and boringtun have of their own, on the copies in vendor"
-task :vendored do
+task vendored: :deviations do
   # The copies are changed here, so their tests are run here. Each is
   # built with the crates that a lock file names, and outside its
   # directory.

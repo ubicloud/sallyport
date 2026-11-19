@@ -1,0 +1,336 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# ext/sallyport/vendor holds copies of other projects, and this
+# repository changes them. A change is a deviation. This tool lists the
+# deviations of each copy by class, writes them as patches for the
+# project that the copy is of, and checks the rules that let it do so.
+# The README of that directory gives the rules in full.
+#
+# A deviation has a name. A table in that README gives its class, and
+# says what it changes. A commit that changes a copy says which deviation
+# it is part of, in a trailer of its message. This is one.
+#
+#   Deviation: receive-window
+#
+# A deviation can have several commits, which all have the same trailer.
+# The lines of a TLA+ model in a copy are a class by their form, "model",
+# and need no trailer. tools/tla says what such a line is.
+#
+#   tools/deviations [list] [CLASS...]
+#       List the deviations of each copy, or those of the classes that
+#       are given.
+#   tools/deviations show [COPY/]NAME
+#       Print one deviation as one patch. The paths in it are those of
+#       the project.
+#   tools/deviations patches DIR [CLASS...]
+#       Write each deviation as a file that "git am" takes, into
+#       DIR/COPY, in the order of the classes. The lines of the models
+#       are the last file.
+#   tools/deviations check
+#       Check the rule, and print what breaks it. CI runs this.
+#
+# The tool reads the history, so it needs a clone that has all of it.
+# It writes nothing into the repository. The objects that it makes go
+# into a directory that it removes.
+
+require "fileutils"
+require "open3"
+require "tmpdir"
+
+ROOT = File.expand_path("..", __dir__)
+VENDOR = "ext/sallyport/vendor"
+README = "#{VENDOR}/README.md"
+# The classes, in the order in which their deviations are made again on
+# the tree of the project. A deviation that the project could take comes
+# before one that it would not take, and so never rests on one.
+CLASSES = %w[backport fix addition local build].freeze
+NAME = /[a-z0-9]+(?:-[a-z0-9]+)*/
+# A line of a model, as tools/tla reads one in a Rust file.
+PRAGMA = %r{\A\s*//[/!]?\s*TLA-(?<model>\w+)(?:@\d+|\.cfg(?:/[\w-]+(?:!\w+)?)?)?>}
+# These read the README of the directory: a row of the table of copies,
+# and a row of the table of deviations.
+COPY = /\A\| `(?<name>[\w-]+)` \|.*\| `(?<commit>\h{40})` \| `(?<tree>\h{40})` \|/
+ROW = /\A\| `(?<copy>[\w-]+)` \| `(?<name>#{NAME})` \| `(?<class>[a-z]+)` \| (?<what>.*\S) \|\s*\z/
+# Two commits changed a copy before there were rules. Each also changed
+# files of this library, and has no trailer. This is the deviation that
+# each is part of.
+BEFORE_THE_RULES = {
+  "bae34f6eb593fb88bebd94f34a4ae0d300a967ef" => "lock",
+  "6691402c89cfa2eb4cc3451e80a398d3ddbaa750" => "sends-now"
+}.freeze
+
+Copy = Struct.new(:name, :path, :commit, :tree, :first, :deviations, :models, :plain, :problems)
+# `before` and `after` are the trees on the two sides of a deviation
+# when the deviations are made again in the order of the classes.
+Deviation = Struct.new(:klass, :name, :what, :commits, :before, :after, :alone)
+# `from` and `to` are the copy before and after a commit, without the
+# lines of the models. `at` counts the commits of the copy.
+Commit = Struct.new(:id, :from, :to, :at)
+
+# Runs git. What it writes goes into the directory of the tool, and
+# what it reads comes from there and from the repository.
+class Git
+  def initialize(dir)
+    @dir, @indexes = dir, 0
+    objects = run("rev-parse", "--path-format=absolute", "--git-path", "objects").strip
+    @env = {"GIT_OBJECT_DIRECTORY" => File.join(dir, "objects"), "GIT_ALTERNATE_OBJECT_DIRECTORIES" => objects}
+    FileUtils.mkdir_p(@env["GIT_OBJECT_DIRECTORY"])
+  end
+
+  # Returns what git prints, or nil if git fails and `failing` allows it.
+  def run(*args, input: "", index: nil, failing: false)
+    env = (@env || {}).merge(index ? {"GIT_INDEX_FILE" => index} : {})
+    out, err, status = Open3.capture3(env, "git", "-C", ROOT, *args, stdin_data: input, binmode: true)
+    return out if status.success?
+    return nil if failing
+
+    abort "git #{args.join(" ")}: #{err}"
+  end
+
+  # Returns a new index that holds a tree.
+  def index(tree)
+    path = File.join(@dir, "index#{@indexes += 1}")
+    run("read-tree", tree, index: path)
+    path
+  end
+
+  def tree(index)
+    run("write-tree", index: index).strip
+  end
+end
+
+class Deviations
+  def initialize(git)
+    @git, @stripped = git, {}
+  end
+
+  # Reads the two tables of the README, and all that the history says of
+  # each copy.
+  def copies
+    lines = File.readlines(File.join(ROOT, README))
+    rows = lines.filter_map { |line| ROW.match(line) }
+    copies = lines.filter_map { |line| COPY.match(line) }.map do |row|
+      copy = Copy.new(row[:name], "#{VENDOR}/#{row[:name]}", row[:commit], row[:tree], nil, [], Hash.new(0), nil, [])
+      rows.select { |listed| listed[:copy] == copy.name }.each do |listed|
+        if copy.deviations.any? { |known| known.name == listed[:name] }
+          copy.problems << "the README lists #{listed[:name]} twice"
+        elsif !CLASSES.include?(listed[:class])
+          copy.problems << "the README gives #{listed[:name]} a class that there is not: #{listed[:class]}"
+        else
+          copy.deviations << Deviation.new(listed[:class], listed[:name], listed[:what], [])
+        end
+      end
+      read(copy)
+      copy
+    end
+    abort "#{README} has no table of the copies" if copies.empty?
+    (rows.map { |listed| listed[:copy] }.uniq - copies.map(&:name)).each do |name|
+      copies.first.problems << "the README lists a deviation of #{name}, which is no copy"
+    end
+    copies
+  end
+
+  # Returns the commits of a deviation as one patch that "git am" takes.
+  def patch(deviation)
+    first, *rest = deviation.commits.map { |commit| message(commit.id) }
+    who, date = @git.run("log", "-1", "--format=%an <%ae>%n%aD", deviation.commits.first.id).split("\n")
+    text = [first, *rest].join("\n\n")
+    mail(deviation.commits.first.id, who, date, "#{text}\n\nDeviation: #{deviation.name}", deviation.before, deviation.after)
+  end
+
+  # Returns the lines of the models as a patch, which goes on the copy
+  # as it is without them.
+  def models(copy)
+    who, date = @git.run("log", "-1", "--format=%an <%ae>%n%aD", "HEAD").split("\n")
+    text = "#{copy.name}: Put in the lines of the models\n\n" \
+           "These lines are comments that tools/tla of sallyport gathers. They\nchange nothing that is built."
+    mail(@git.run("rev-parse", "HEAD").strip, who, date, text, copy.plain, tree_of("HEAD", copy.path))
+  end
+
+  private
+
+  def mail(id, who, date, text, before, after)
+    subject, body = text.split("\n", 2)
+    "From #{id} Mon Sep 17 00:00:00 2001\nFrom: #{who}\nDate: #{date}\nSubject: [PATCH] #{subject}\n#{body}\n---\n" +
+      @git.run("diff-tree", "-p", "--stat", "--binary", "--full-index", before, after)
+  end
+
+  # The message of a commit, without the trailer of its deviation.
+  def message(id)
+    @git.run("log", "-1", "--format=%B", id).lines.reject { |line| line.start_with?("Deviation:") }.join.strip
+  end
+
+  def tree_of(commit, path)
+    @git.run("rev-parse", "-q", "--verify", "#{commit}:#{path}", failing: true)&.strip
+  end
+
+  # Returns a tree without the lines of the models that it holds.
+  def stripped(tree)
+    @stripped[tree] ||= begin
+      found = @git.run("grep", "-l", "-z", "-e", "TLA-", tree, "--", "*.rs", failing: true).to_s
+      plain = found.split("\0").filter_map do |path|
+        path = path.delete_prefix("#{tree}:")
+        text = @git.run("cat-file", "blob", "#{tree}:#{path}")
+        kept = text.lines.reject { |line| PRAGMA.match?(line) }.join
+        [path, @git.run("hash-object", "-w", "--stdin", input: kept).strip] unless kept == text
+      end
+      if plain.empty?
+        tree
+      else
+        index = @git.index(tree)
+        plain.each do |path, blob|
+          mode = @git.run("ls-files", "-s", "--", path, index: index).split.first
+          @git.run("update-index", "--cacheinfo", "#{mode},#{blob},#{path}", index: index)
+        end
+        @git.tree(index)
+      end
+    end
+  end
+
+  # Makes the change of a commit again in an index. Returns whether the
+  # change went in whole.
+  def apply(commit, index)
+    patch = @git.run("diff-tree", "-p", "--binary", "--full-index", commit.from, commit.to)
+    !@git.run("apply", "--cached", "--whitespace=nowarn", "-", input: patch, index: index, failing: true).nil?
+  end
+
+  def read(copy)
+    # The copy came in with the newest commit at which its tree is the
+    # tree of the project.
+    touched = @git.run("rev-list", "HEAD", "--", copy.path).split
+    copy.first = touched.find { |id| tree_of(id, copy.path) == copy.tree }
+    unless copy.first
+      shallow = @git.run("rev-parse", "--is-shallow-repository").strip == "true"
+      return copy.problems << "no commit has the tree #{copy.tree}, which the README gives" \
+                              "#{" (this clone does not have the whole history)" if shallow}"
+    end
+    copy.problems << "the tree of the project has a line that reads as one of a model" unless stripped(copy.tree) == copy.tree
+
+    @git.run("rev-list", "--reverse", "--no-merges", "#{copy.first}..HEAD", "--", copy.path).split.each_with_index do |id, at|
+      commit = Commit.new(id, stripped(tree_of("#{id}^", copy.path)), stripped(tree_of(id, copy.path)), at)
+      next if commit.from == commit.to # The commit changed lines of a model, and no more.
+
+      name = BEFORE_THE_RULES[id] || @git.run("log", "-1", "--format=%(trailers:key=Deviation,valueonly)", id).strip
+      short = "#{id[0, 7]} (#{@git.run("log", "-1", "--format=%s", id).strip})"
+      next copy.problems << "#{short} changes the copy, and names no deviation" if name.empty?
+      next copy.problems << "#{short} does not name one deviation: #{name.inspect}" unless name.match?(/\A#{NAME}\z/)
+
+      deviation = copy.deviations.find { |known| known.name == name }
+      next copy.problems << "#{short} is of #{name}, which the README does not list" unless deviation
+
+      # A commit of a deviation may change its row of the README too.
+      outside = @git.run("diff-tree", "--no-commit-id", "--name-only", "-r", id).split("\n")
+                    .reject { |path| path.start_with?("#{copy.path}/") || path == README }
+      unless outside.empty? || BEFORE_THE_RULES[id]
+        copy.problems << "#{short} is of a deviation, and also changes #{outside.first}"
+      end
+      deviation.commits << commit
+    end
+    copy.deviations.select { |deviation| deviation.commits.empty? }.each do |deviation|
+      copy.problems << "the README lists #{deviation.name}, and no commit is of it"
+    end
+    # The copy cannot be made again without a commit that broke a rule,
+    # since it is in no deviation.
+    replay(copy) if copy.problems.empty?
+    head = tree_of("HEAD", copy.path)
+    @git.run("grep", "-h", "-e", "TLA-", head, "--", "*.rs", failing: true).to_s.each_line do |line|
+      pragma = PRAGMA.match(line) and copy.models[pragma[:model]] += 1
+    end
+  end
+
+  # Makes the deviations again on the tree of the project, in the order
+  # of the classes. What comes of that must be the copy as it is, without
+  # the lines of the models.
+  def replay(copy)
+    # Within a class, the deviations are in the order of their first
+    # commits.
+    copy.deviations.sort_by! { |deviation| [CLASSES.index(deviation.klass), deviation.commits.first.at] }
+    index = @git.index(copy.tree)
+    copy.deviations.each do |deviation|
+      before = @git.tree(index)
+      unless deviation.commits.all? { |commit| apply(commit, index) }
+        return copy.problems << "#{deviation.name} cannot be made again on the deviations that come before it"
+      end
+      deviation.before, deviation.after = before, @git.tree(index)
+      alone = @git.index(copy.tree)
+      deviation.alone = deviation.commits.all? { |commit| apply(commit, alone) }
+    end
+    copy.plain = stripped(tree_of("HEAD", copy.path))
+    return if @git.tree(index) == copy.plain
+
+    copy.problems << "the deviations in the order of their classes do not make the copy as it is"
+  end
+end
+
+def numbers(git, before, after)
+  rows = git.run("diff-tree", "--numstat", "-r", before, after).lines.map { |line| line.chomp.split("\t", 3) }
+  [rows.sum { |row| row[0].to_i }, rows.sum { |row| row[1].to_i }, rows.map { |row| row[2] }]
+end
+
+def list(git, copies, classes)
+  copies.each do |copy|
+    first = copy.first ? git.run("log", "-1", "--format=%h", copy.first).strip : "no commit"
+    puts "#{copy.name}, which the project has at #{copy.commit[0, 12]}, and which came in with #{first}"
+    copy.deviations.each do |deviation|
+      next unless classes.empty? || classes.include?(deviation.klass)
+
+      puts format("  %-9s %s", deviation.klass, deviation.name)
+      puts "            #{deviation.what}"
+      next unless deviation.after # It was not made again, and the tool says why at the end.
+
+      added, removed, paths = numbers(git, deviation.before, deviation.after)
+      commits = deviation.commits.size
+      puts "            +#{added} -#{removed} in #{commits} commit#{"s" unless commits == 1}: #{paths.join(" ")}"
+      puts "            rests on another deviation" unless deviation.alone
+    end
+    next unless classes.empty? || classes.include?("model")
+
+    copy.models.sort.each do |model, lines|
+      puts format("  %-9s %s\n            %d line%s", "model", model, lines, lines == 1 ? "" : "s")
+    end
+    puts "  no deviation" if copy.deviations.empty? && copy.models.empty?
+  end
+end
+
+def patches(tool, copies, dir, classes)
+  copies.each do |copy|
+    FileUtils.mkdir_p(File.join(dir, copy.name))
+    files = copy.deviations.select { |deviation| classes.empty? || classes.include?(deviation.klass) }
+                .map { |deviation| ["#{deviation.klass}-#{deviation.name}", tool.patch(deviation)] }
+    files << ["model", tool.models(copy)] if !copy.models.empty? && (classes.empty? || classes.include?("model"))
+    files.each_with_index do |(name, text), at|
+      File.binwrite(File.join(dir, copy.name, format("%04d-%s.patch", at + 1, name)), text)
+    end
+    puts "#{File.join(dir, copy.name)}: #{files.size} file#{"s" unless files.size == 1}"
+  end
+end
+
+command, *rest = ARGV
+command, rest = "list", ARGV if command.nil? || (CLASSES + ["model"]).include?(command)
+abort File.read(__FILE__)[/^# ext.*?(?=^\nrequire)/m].gsub(/^# ?/, "") unless %w[list show patches check].include?(command)
+
+Dir.mktmpdir("deviations") do |dir|
+  git = Git.new(dir)
+  tool = Deviations.new(git)
+  copies = tool.copies
+  problems = copies.flat_map { |copy| copy.problems.map { |problem| "#{copy.name}: #{problem}" } }
+  case command
+  when "list"
+    list(git, copies, rest)
+  when "show"
+    abort problems.join("\n") unless problems.empty?
+    name = rest.fetch(0) { abort "tools/deviations show [COPY/]NAME" }
+    found = copies.flat_map do |copy|
+      copy.deviations.select { |deviation| [deviation.name, "#{copy.name}/#{deviation.name}"].include?(name) }
+          .map { |deviation| tool.patch(deviation) }
+    end
+    abort "#{found.size} deviations have the name #{name}" unless found.size == 1
+    print found.first
+  when "patches"
+    abort problems.join("\n") unless problems.empty?
+    patches(tool, copies, rest.fetch(0) { abort "tools/deviations patches DIR [CLASS...]" }, rest.drop(1))
+  end
+  warn problems.join("\n") unless problems.empty?
+  exit 1 unless problems.empty?
+end
