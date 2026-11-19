@@ -74,10 +74,17 @@ impl Phase {
     }
 }
 
-/// A step decides one of these for its connection.
-pub enum Fate {
-    /// The connection goes on, in this phase.
-    Keep(Phase),
+// TLA-conn@20> \* A pass ends in one of these ways. A connection that is closed or reset
+// TLA-conn@20> \* keeps its socket, as Phase::Dead, until the socket has sent what it owes.
+// TLA-conn@20> Rest(t) == [t EXCEPT !.at = "idle"]
+// TLA-conn@20> Dead(t) == [t EXCEPT !.phase = IF Fault = "remove at once" THEN "removed" ELSE "dead",
+// TLA-conn@20>                      !.old = FALSE, !.at = "idle"]
+// TLA-conn@20> Close(t) == Dead(t)
+// TLA-conn@20> Abort(t) == Dead([t EXCEPT !.k = K!Abort(@)])
+/// A pass over a connection ends in one of these ways.
+enum Fate {
+    /// The connection goes on.
+    Rest,
     /// Close our end of the pair. The TCP connection has ended by itself.
     Close,
     /// Close our end of the pair, and reset the TCP connection.
@@ -205,13 +212,6 @@ pub enum Fate {
 // TLA-conn@10>         /\ \/ s.left = "yes" /\ s' = [s EXCEPT !.left = "late", !.kick = TRUE]
 // TLA-conn@10>            \/ s.wait = "yes" /\ s' = [s EXCEPT !.wait = "late", !.kick = TRUE]
 
-// TLA-conn@20> \* A pass ends in one of these ways. A connection that is closed or reset
-// TLA-conn@20> \* keeps its socket, as Phase::Dead, until the socket has sent what it owes.
-// TLA-conn@20> Rest(t) == [t EXCEPT !.at = "idle"]
-// TLA-conn@20> Dead(t) == [t EXCEPT !.phase = IF Fault = "remove at once" THEN "removed" ELSE "dead",
-// TLA-conn@20>                      !.old = FALSE, !.at = "idle"]
-// TLA-conn@20> Close(t) == Dead(t)
-// TLA-conn@20> Abort(t) == Dead([t EXCEPT !.k = K!Abort(@)])
 // TLA-conn> \* step, for a connection that is not open yet. Ruby is told of a
 // TLA-conn> \* connection once, when its handshake is over: with the status of one
 // TLA-conn> \* that it makes, or with the descriptor of one that it accepts. The
@@ -231,28 +231,28 @@ pub enum Fate {
 // TLA-conn>          ELSE IF K!Opening(t.k) = "failed" /\ Fault # "keeps a failure" THEN Close(t)
 // TLA-conn>          ELSE Rest(t)
 /// Moves one connection as far as it will go, through each phase that it
-/// can leave now, and says what becomes of it. `ctl` is the pair of the
-/// listener that a connection in Phase::Listening waits for, and there is
-/// none if Ruby has closed that listener.
-pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Duration, closing: bool) -> Fate {
-    loop {
+/// can leave now, and returns the phase that it is then in. `ctl` is the
+/// pair of the listener that a connection in Phase::Listening waits for,
+/// and there is none if Ruby has closed that listener.
+pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Duration, closing: bool) -> Phase {
+    let fate = loop {
         phase = match phase {
             // sweep removes it.
-            Phase::Dead { .. } => return Fate::Keep(phase),
+            Phase::Dead { .. } => return phase,
             // Ruby gave up waiting, and closed its end. Or the tunnel is
             // closing, and has shut the pair down.
-            Phase::Connecting { pair, .. } if pair.hangup() != Hangup::No => return Fate::Abort,
+            Phase::Connecting { pair, .. } if pair.hangup() != Hangup::No => break Fate::Abort,
             Phase::Connecting { pair, since } => match Sock::opening(s) {
                 // The peer answers a SYN with a bare SYN if it was
                 // connecting to us at the same moment, and the handshake
                 // is not over.
-                Opening::Pending => return Fate::Keep(Phase::Connecting { pair, since }),
+                Opening::Pending => return Phase::Connecting { pair, since },
                 Opening::Failed => {
                     // smoltcp does not say whether a reset or its timeout
                     // closed the socket, so the time taken has to.
                     let late = now - since + Duration::from_secs(1) >= TCP_TIMEOUT;
                     pair.say(if late { status::TIMED_OUT } else { status::REFUSED });
-                    return Fate::Close;
+                    break Fate::Close;
                 }
                 Opening::Done => {
                     pair.say(status::OK);
@@ -261,37 +261,55 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
             },
             Phase::Listening { .. } => {
                 // Ruby closed the listener.
-                let Some(ctl) = ctl.as_deref_mut() else { return Fate::Abort };
+                let Some(ctl) = ctl.as_deref_mut() else { break Fate::Abort };
                 match Sock::opening(s) {
-                    Opening::Pending => return Fate::Keep(phase),
+                    Opening::Pending => return phase,
                     // The peer left the handshake unfinished, or it
                     // finished the handshake and reset the connection at
                     // once.
-                    Opening::Failed => return Fate::Close,
+                    Opening::Failed => break Fate::Close,
                     Opening::Done => {
                         // The system may have no descriptors to spare.
-                        let Ok((ours, theirs)) = sys::socketpair(libc::SOCK_STREAM) else { return Fate::Abort };
-                        let Some(from) = Sock::peer(s) else { return Fate::Abort };
+                        let Ok((ours, theirs)) = sys::socketpair(libc::SOCK_STREAM) else { break Fate::Abort };
+                        let Some(from) = Sock::peer(s) else { break Fate::Abort };
                         // Ruby may have closed the listener a moment ago.
                         if !ctl.send(&format!("{} {}", from.addr, from.port), &theirs) {
-                            return Fate::Abort;
+                            break Fate::Abort;
                         }
                         Phase::open(Pair::new(ours))
                     }
                 }
             }
-            Phase::Open(open) => return carry(open, s, now, closing),
+            Phase::Open(mut open) => {
+                let Open { pair, left, wait, tail } = &mut open;
+                // The socket's contract has the tail, and carry has the
+                // rest.
+                match carry(pair, &mut Sock::new(s, tail), left, wait, now, closing) {
+                    Fate::Rest => return Phase::Open(open),
+                    over => break over,
+                }
+            }
         };
+    };
+    // The connection is over for Ruby, and our end of the pair is closed
+    // with the phase that held it. The socket has a reset or a last ACK
+    // to send, and stays until it has sent it.
+    if let Fate::Abort = fate {
+        Sock::abort(s);
     }
+    Phase::Dead { since: now }
 }
 
 /// Moves bytes each way for an open connection, and passes on the end of
-/// each direction.
-fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
-    let Open { pair, left, wait, tail } = &mut open;
-    // The socket's contract has the tail, and carry has the rest.
-    let s = &mut Sock::new(s, tail);
-
+/// each direction. `left` and `wait` are those of Open.
+fn carry(
+    pair: &mut Pair,
+    s: &mut Sock,
+    left: &mut Option<Duration>,
+    wait: &mut Option<Duration>,
+    now: Duration,
+    closing: bool,
+) -> Fate {
     // TLA-conn> \* A pass of carry is four steps, and each makes one kind of call on the
     // TLA-conn> \* pair. Ruby may act between two calls.
     // TLA-conn> \*
@@ -404,7 +422,7 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
         // its window shut for ever, or take a byte at a time. An orphan is
         // not kept that long: it has as long as a silent peer is given.
         _ if orphaned.is_some_and(|age| age >= TCP_TIMEOUT) => Fate::Abort,
-        _ => Fate::Keep(Phase::Open(open)),
+        _ => Fate::Rest,
     }
 }
 

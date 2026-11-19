@@ -9,7 +9,7 @@
 //! turns each connection. conn.rs has what one connection does in a turn.
 
 use crate::config::Config;
-use crate::conn::{status, step, Fate, Open, Phase};
+use crate::conn::{status, step, Open, Phase};
 use crate::ctl::Ctl;
 use crate::packet::{rst, split_fin, syn, without_sack};
 use crate::pair::Pair;
@@ -574,10 +574,8 @@ impl Stack {
         self.reap();
         for c in &mut self.conns {
             let s = self.sockets.get_mut::<Socket>(c.handle);
-            // The step takes the phase and gives back the phase to go on
-            // in. If it gives none back, the connection is over for Ruby,
-            // and our end of the pair is closed. The socket has a reset
-            // or a last ACK to send, and must stay until it has sent it.
+            // The step takes the phase, and gives back the phase to go on
+            // in.
             let phase = std::mem::replace(&mut c.phase, Phase::Dead { since: self.clock });
             // A connection that a peer made goes to Ruby on the pair of
             // its listener, unless Ruby has closed that listener.
@@ -587,11 +585,7 @@ impl Stack {
                 }
                 _ => None,
             };
-            match step(phase, s, ctl, self.clock, self.closing) {
-                Fate::Keep(phase) => c.phase = phase,
-                Fate::Close => {}
-                Fate::Abort => Sock::abort(s),
-            }
+            c.phase = step(phase, s, ctl, self.clock, self.closing);
         }
     }
 
