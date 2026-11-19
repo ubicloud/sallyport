@@ -99,7 +99,14 @@ thread's answer from it.
 - It agrees to no selective acknowledgement. The last section says why.
 - It does not delay an ACK, as most TCPs do to send it with data. An ACK
   leaves in the turn of the tunnel's thread that took the segments in,
-  and one ACK answers all that the turn took in.
+  and one ACK answers all that the turn took in. So a segment that
+  arrives alone has an ACK to itself, where most TCPs send one ACK for
+  two segments. Segments that arrive faster than the thread turns share
+  an ACK.
+- A connection that has ended leaves no socket to wait in TIME-WAIT. Its
+  last ACK has left by the end of the turn that ends it. If that ACK is
+  lost, the peer sends its FIN again, and is answered with a reset where
+  a kernel sends the ACK again. Neither side has lost a byte by then.
 - The window that it gives a peer has no scale, so a peer sends 64 KiB
   at the most in one round trip. Where a round trip takes 100 ms, Ruby
   reads 640 KiB a second at the most. The last section says why.

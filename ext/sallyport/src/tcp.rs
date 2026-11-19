@@ -1854,6 +1854,32 @@ mod tests {
     }
 
     #[test]
+    fn a_fin_that_comes_again_finds_no_socket_and_is_reset() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (mut client, mut server) = connected(&mut a, &mut b);
+        client.shutdown(Shutdown::Write).unwrap();
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut server), (vec![], true));
+        drop(server);
+        b.turn();
+        let fin = b.transmit().expect("B's FIN");
+        a.receive(fin.clone());
+        a.turn();
+        // A's socket has sent its last ACK and is gone. The ACK is lost,
+        // and B sends its FIN again.
+        assert!(a.transmit().is_some_and(|ack| !is_reset(&ack)) && a.finished());
+        a.receive(fin);
+        a.turn();
+        let answer = a.transmit().expect("an answer to the FIN");
+        assert!(is_reset(&answer));
+        // To B the reset ends the connection, as the ACK would have.
+        b.receive(answer);
+        b.turn();
+        assert!(b.conns.is_empty());
+        assert_eq!(read(&mut client), (vec![], true));
+    }
+
+    #[test]
     fn a_connection_that_ends_goes_though_another_has_more_to_send() {
         // B's link takes packets of 88 bytes, which is less than the
         // parser allows. So B asks for segments of 48 bytes, the smallest
