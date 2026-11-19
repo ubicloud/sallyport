@@ -7,6 +7,7 @@
 //! where it waits for everything else and can be interrupted.
 
 mod config;
+mod conn;
 mod ctl;
 mod engine;
 mod keys;

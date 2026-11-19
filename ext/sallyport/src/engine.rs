@@ -2,10 +2,11 @@
 //! TCP stack, and serves them from one loop that never takes Ruby's GVL.
 
 use crate::config::Config;
+use crate::conn::status;
 use crate::packet::describe;
 use crate::peers::{Dropped, Peers};
 use crate::sys;
-use crate::tcp::{status, Stack};
+use crate::tcp::Stack;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
