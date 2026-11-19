@@ -76,6 +76,19 @@ class TestTunnel < Minitest::Test
     eventually { t.listen(7) }.close
   end
 
+  # The system gives a signal of the process to a thread that has not
+  # blocked it. The tunnel's thread has blocked every signal that can be
+  # blocked, so no handler of the program runs on it.
+  def test_the_thread_of_a_tunnel_takes_no_signal
+    key, = keypair
+    tunnel(private_key: key, addresses: ["10.9.0.1"])
+    status = Dir["/proc/self/task/*/status"].map { |path| File.read(path) }.find { |text| text.start_with?("Name:\tsallyport\n") }
+    blocked = status[/^SigBlk:\t(\h+)$/, 1].to_i(16)
+    %w[INT TERM HUP USR1 USR2 CHLD ALRM VTALRM PROF PIPE].each do |name|
+      assert_equal 1, blocked[Signal.list.fetch(name) - 1], "SIG#{name}"
+    end
+  end
+
   def test_a_tunnel_tells_its_port
     key, = keypair
     port = free_udp_port

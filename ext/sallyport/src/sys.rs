@@ -71,6 +71,20 @@ pub fn poll(fds: &mut [libc::pollfd], wait: Duration) {
     unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
 }
 
+/// Runs `f` with every signal blocked, and returns what it gives. A
+/// thread that is made meanwhile has every signal blocked for its life,
+/// so the system delivers a signal of the process to another thread.
+pub fn with_signals_blocked<T>(f: impl FnOnce() -> T) -> T {
+    unsafe {
+        let (mut all, mut before): (libc::sigset_t, libc::sigset_t) = (std::mem::zeroed(), std::mem::zeroed());
+        libc::sigfillset(&raw mut all);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const all, &raw mut before);
+        let given = f();
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut());
+        given
+    }
+}
+
 /// Makes an eventfd that does not block. It is a count that poll can
 /// wait on: poll reports it as readable while the count is not 0. It is
 /// one descriptor, so it has no end that a writer can find closed.

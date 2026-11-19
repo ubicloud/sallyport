@@ -98,7 +98,11 @@ fn open(conf: &str, debug: &str) -> Result<Handle, (c_int, String)> {
     let port = udp.0.local_addr().map_err(|e| refused(&what, e))?.port();
     let wake = sys::eventfd().map_err(|e| refused("an eventfd", e))?;
     let (engine, shared) = Engine::new(&cfg, knobs, udp, wake).map_err(fault)?;
-    let thread = std::thread::Builder::new().name("sallyport".into()).spawn(move || engine.run());
+    // The thread takes no signal. A handler that the program has set is
+    // written for the program's threads, and the handlers of Ruby are
+    // for threads that Ruby made.
+    let thread =
+        sys::with_signals_blocked(|| std::thread::Builder::new().name("sallyport".into()).spawn(move || engine.run()));
     Ok(Handle { shared, thread: Some(thread.map_err(|e| refused("a thread", e))?), port })
 }
 
