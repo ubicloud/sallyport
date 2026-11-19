@@ -56,8 +56,12 @@ class TestTunnel < Minitest::Test
   # b's keepalive has it shake hands with a at once. a was not told where
   # b is, and learns it from the handshake.
   def test_two_tunnels_shake_hands
-    a, b = pair(persistent_keepalive: 25)
+    (a_key, a_public), (b_key, b_public) = keypair, keypair
+    a = tunnel(private_key: a_key, addresses: ["10.9.0.1"], peers: [{public_key: b_public, allowed_ips: ["10.9.0.2/32"]}])
+    # b is not there yet, so its handshake cannot have come.
     assert_nil a.peers.first.endpoint
+    a_is = {public_key: a_public, allowed_ips: ["10.9.0.1/32"], endpoint: "127.0.0.1:#{a.listen_port}"}
+    b = tunnel(private_key: b_key, addresses: ["10.9.0.2"], peers: [a_is.merge(persistent_keepalive: 25)])
     eventually { a.peers.first.alive? && b.peers.first.alive? }
     assert_equal "127.0.0.1:#{b.listen_port}", a.peers.first.endpoint
     assert_operator b.peers.first.handshake_age, :<, 10
