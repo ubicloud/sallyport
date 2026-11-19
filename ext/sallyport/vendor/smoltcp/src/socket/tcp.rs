@@ -3013,9 +3013,6 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    // sallyport added sends_now, and the line of its model "sock" that goes
-    // with it. tools/tla of sallyport gathers the lines that begin so.
-    //
     // TLA-sock> \* Socket::sends_now, of a socket whose two streams have ended. Such a
     // TLA-sock> \* socket has no data to send, and no FIN.
     // TLA-sock> Owes(k) == k.owed # "none"
@@ -5870,12 +5867,15 @@ mod test {
         assert!(!s.socket.sends_now(&mut s.cx));
         s.abort();
         assert!(s.socket.sends_now(&mut s.cx));
-        recv!(s, [TcpRepr {
-            control: TcpControl::Rst,
-            seq_number: LOCAL_SEQ + 1,
-            ack_number: Some(REMOTE_SEQ + 1),
-            ..RECV_TEMPL
-        }]);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
         assert!(!s.socket.sends_now(&mut s.cx));
     }
 
