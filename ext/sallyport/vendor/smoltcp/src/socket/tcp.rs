@@ -2951,6 +2951,22 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
+    // sallyport added sends_now, and the line of its model "sock" that goes
+    // with it. tools/tla of sallyport gathers the lines that begin so.
+    //
+    // TLA-sock> \* Socket::sends_now, of a socket whose two streams have ended. Such a
+    // TLA-sock> \* socket has no data to send, and no FIN.
+    // TLA-sock> Owes(k) == k.owed # "none"
+    /// Return whether the socket has a packet to send now: `dispatch` would
+    /// emit one without a wait for a timer or for the remote endpoint.
+    ///
+    /// A caller that is done with a socket can so tell when the socket is done
+    /// with the remote endpoint, for example when a reset or the last
+    /// acknowledgement has left, and remove it then.
+    pub fn sends_now(&self, cx: &mut Context) -> bool {
+        self.poll_at(cx) == PollAt::Now
+    }
+
     #[allow(clippy::if_same_then_else)]
     pub(crate) fn poll_at(&self, cx: &mut Context) -> PollAt {
         // The logic here mirrors the beginning of dispatch() closely.
@@ -5760,6 +5776,45 @@ mod test {
         });
         assert_eq!(s.state, State::TimeWait);
         sanity!(s, socket_time_wait(false));
+    }
+
+    #[test]
+    fn test_sends_now_until_the_ack_of_a_fin_has_left() {
+        let mut s = socket_fin_wait_2();
+        // A socket that has yet to be dispatched wants that, to take the time.
+        assert!(s.socket.sends_now(&mut s.cx));
+        recv_nothing!(s);
+        assert!(!s.socket.sends_now(&mut s.cx));
+        send!(s, time 1_000, TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::TimeWait);
+        assert!(s.socket.sends_now(&mut s.cx));
+        recv!(s, time 1_000, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 1),
+            ..RECV_TEMPL
+        }]);
+        assert!(!s.socket.sends_now(&mut s.cx));
+    }
+
+    #[test]
+    fn test_sends_now_until_a_reset_has_left() {
+        let mut s = socket_established();
+        recv_nothing!(s);
+        assert!(!s.socket.sends_now(&mut s.cx));
+        s.abort();
+        assert!(s.socket.sends_now(&mut s.cx));
+        recv!(s, [TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }]);
+        assert!(!s.socket.sends_now(&mut s.cx));
     }
 
     #[test]

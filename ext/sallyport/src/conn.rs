@@ -597,7 +597,7 @@ impl Phase {
 // TLA-conn@90> Spec == Init /\ [][Next]_s /\ WF_s(Loop) /\ WF_s(Clock) /\ SF_s(Timers)
 // TLA-conn@90>
 // TLA-conn@90> \* A socket is not removed while it owes the peer a reset or an ACK.
-// TLA-conn@90> RemovedClean == s.phase = "removed" => s.k.owed = "none"
+// TLA-conn@90> RemovedClean == s.phase = "removed" => ~K!Owes(s.k)
 // TLA-conn@90> \* Both streams of a dead connection's socket have ended.
 // TLA-conn@90> DeadEnds == s.phase = "dead" => s.k.up = "ended" /\ ~s.k.down
 // TLA-conn@90> \* carry passes on the end of the peer's stream only when Ruby has been

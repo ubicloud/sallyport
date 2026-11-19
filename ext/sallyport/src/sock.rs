@@ -237,6 +237,14 @@ impl<'a> Sock<'a> {
         s.abort();
     }
 
+    /// Says whether a socket has a packet to send now. Of a socket whose
+    /// connection has ended, that is the reset or the last ACK that it
+    /// owes the peer. The copy of smoltcp in vendor has sends_now for
+    /// this, and the line of the model that goes with it.
+    pub fn owes(s: &Socket, cx: &mut Context) -> bool {
+        s.sends_now(cx)
+    }
+
     /// Describes a socket in a few words, for a person: its two ends, its
     /// state as smoltcp names it, and how many bytes it holds each way.
     /// `tail` is how many bytes for Ruby were taken out of it.

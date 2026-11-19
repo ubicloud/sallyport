@@ -526,7 +526,7 @@ impl Stack {
     }
 
     // TLA-conn> \* Every turn of the loop has each socket send what it owes.
-    // TLA-conn> Dispatch == s.phase # "removed" /\ s.k.owed # "none" /\ s' = [s EXCEPT !.k = K!Sent(@)]
+    // TLA-conn> Dispatch == s.phase # "removed" /\ K!Owes(s.k) /\ s' = [s EXCEPT !.k = K!Sent(@)]
     /// Has every socket send what it has to send.
     pub fn poll(&mut self) {
         let now = self.now();
@@ -697,15 +697,16 @@ impl Stack {
 
     // TLA-conn> \* sweep removes a dead connection when its socket has sent what it owed.
     // TLA-conn> \* It does not wait for what the other sockets have to send.
-    // TLA-conn> Sweep == /\ s.phase = "dead" /\ s.k.owed = "none" /\ Fault # "waits for the others"
+    // TLA-conn> Sweep == /\ s.phase = "dead" /\ ~K!Owes(s.k) /\ Fault # "waits for the others"
     // TLA-conn>          /\ s' = [s EXCEPT !.phase = "removed"]
-    /// Removes each dead connection. Its socket has just sent the packet
-    /// that it owed, if it owed one, so the socket of a connection that
-    /// ended in this turn goes in this turn.
+    /// Removes each dead connection whose socket owes the peer nothing.
+    /// The socket has just sent the packet that it owed, if it owed one,
+    /// so the socket of a connection that ended in this turn goes in this
+    /// turn (`a_dead_connection_stays_until_its_socket_owes_nothing`).
     fn sweep(&mut self) {
-        let (sockets, ports) = (&mut self.sockets, &mut self.local_ports);
+        let (sockets, ports, cx) = (&mut self.sockets, &mut self.local_ports, self.iface.context());
         self.conns.retain(|c| {
-            if !matches!(c.phase, Phase::Dead) {
+            if !matches!(c.phase, Phase::Dead) || Sock::owes(sockets.get::<Socket>(c.handle), cx) {
                 return true;
             }
             sockets.remove(c.handle);
@@ -2028,6 +2029,24 @@ mod tests {
         age(&mut a, CHECK);
         a.stir();
         assert_eq!(cause(&a), [true, true]);
+    }
+
+    #[test]
+    fn a_dead_connection_stays_until_its_socket_owes_nothing() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let (client, mut server) = connected(&mut a, &mut b);
+        server.write_all(b"unread").unwrap();
+        settle(&mut a, &mut b);
+        // The client leaves bytes unread, and the pass resets the peer
+        // for them. Until the sockets have sent, the socket owes the
+        // reset.
+        drop(client);
+        a.pump();
+        a.sweep();
+        assert!(matches!(a.conns[..], [Conn { phase: Phase::Dead, .. }]) && a.transmit().is_none());
+        a.poll();
+        a.sweep();
+        assert!(a.conns.is_empty() && is_reset(&a.transmit().unwrap()));
     }
 
     #[test]
