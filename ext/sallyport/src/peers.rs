@@ -594,6 +594,33 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_that_completes_no_handshake_has_no_session() {
+        // B has another preshared key than A has for it. So B can make
+        // nothing of what A answers, and begins again.
+        let (mut a, _) = pair_with(&format!("PresharedKey = {}\n", key(7).0));
+        let theirs = PublicKey::from(keys::public(&[1; 32]));
+        let mut b = Tunn::new(StaticSecret::from([2; 32]), theirs, Some([8; 32]), None, 0, None);
+        let mut buf = [0; 256];
+        // boringtun keeps the sessions of the last eight handshakes, and
+        // the ninth takes the place of the first.
+        for _ in 0..8 {
+            let TunnResult::WriteToNetwork(initiation) = b.format_handshake_initiation(&mut buf, true) else {
+                panic!("no initiation");
+            };
+            let mut answers = Vec::new();
+            a.receive(initiation, at(2), &mut |d, _| answers.push(d[0]));
+            assert_eq!(answers, [2], "A answers the initiation");
+        }
+        let mut text = String::new();
+        a.stats(&mut text);
+        assert_eq!(text.split(' ').nth(2), Some("-1"), "A has had no handshake with B");
+        // A packet for B waits for a session, and A begins a handshake for
+        // it. It does not leave in a session that B does not have.
+        let types: Vec<u8> = sent(&mut a, &ip(A, B)).iter().map(|d| d[0]).collect();
+        assert_eq!(types, [1]);
+    }
+
+    #[test]
     fn a_source_is_held_to_a_rate() {
         let mut sources = Sources::default();
         let (start, one, other) = (Instant::now(), "192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
