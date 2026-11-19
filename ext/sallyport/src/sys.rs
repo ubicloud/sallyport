@@ -71,26 +71,24 @@ pub fn poll(fds: &mut [libc::pollfd], wait: Duration) {
     unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
 }
 
-/// Makes a pipe whose ends do not block, and returns its read end and its
-/// write end.
-pub fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut ends = [0 as RawFd; 2];
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(std::io::Error::last_os_error());
+/// Makes an eventfd that does not block. It is a count that poll can
+/// wait on: poll reports it as readable while the count is not 0. It is
+/// one descriptor, so it has no end that a writer can find closed.
+pub fn eventfd() -> std::io::Result<OwnedFd> {
+    match unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) } {
+        fd if fd >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        _ => Err(std::io::Error::last_os_error()),
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) })
 }
 
-/// Writes a byte to a pipe. A full pipe takes no more, which is as good:
-/// its reader has a byte to wake for.
-pub fn write_byte(fd: RawFd) {
-    unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
+/// Adds one to the count of an eventfd, which does not wait.
+pub fn signal(fd: RawFd) {
+    unsafe { libc::write(fd, 1u64.to_ne_bytes().as_ptr().cast(), 8) };
 }
 
-/// Empties a pipe.
+/// Sets the count of an eventfd to 0.
 pub fn drain(fd: RawFd) {
-    let mut buf = [0u8; 64];
-    while read(fd, &mut buf) > 0 {}
+    read(fd, &mut [0; 8]);
 }
 
 /// Makes a Unix socket pair of a kind: SOCK_STREAM for a connection, or

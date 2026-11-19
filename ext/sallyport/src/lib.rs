@@ -96,7 +96,7 @@ fn open(conf: &str, debug: &str) -> Result<Handle, (c_int, String)> {
     };
     let udp = sys::udp_socket(cfg.listen_port).map_err(|e| refused(&what, e))?;
     let port = udp.0.local_addr().map_err(|e| refused(&what, e))?.port();
-    let wake = sys::pipe().map_err(|e| refused("a pipe", e))?;
+    let wake = sys::eventfd().map_err(|e| refused("an eventfd", e))?;
     let (engine, shared) = Engine::new(&cfg, knobs, udp, wake).map_err(fault)?;
     let thread = std::thread::Builder::new().name("sallyport".into()).spawn(move || engine.run());
     Ok(Handle { shared, thread: Some(thread.map_err(|e| refused("a thread", e))?), port })
@@ -144,10 +144,10 @@ pub unsafe extern "C" fn sp_open(
 // TLA-wake> KStop == /\ s.kpc = "stop" /\ s' = [s EXCEPT !.stop = TRUE, !.kpc = "wake"]
 // TLA-wake> KWake == /\ s.kpc = "wake" /\ s' = Woke([s EXCEPT !.kpc = "join"])
 // TLA-wake> KJoin == /\ s.kpc = "join" /\ s.epc = "done" /\ s' = [s EXCEPT !.kpc = "free"]
-// TLA-wake> \* The handle is then dropped, and both ends of the pipe are closed with
-// TLA-wake> \* it. Only this thread knows that nothing is left to use either end.
+// TLA-wake> \* The handle is then dropped, and the eventfd is closed with it. Only
+// TLA-wake> \* this thread knows that nothing is left to use the eventfd.
 // TLA-wake> KFree == /\ s.kpc = "free"
-// TLA-wake>          /\ s' = [s EXCEPT !.rOpen = FALSE, !.wOpen = FALSE, !.freed = TRUE, !.kpc = "return"]
+// TLA-wake>          /\ s' = [s EXCEPT !.open = FALSE, !.freed = TRUE, !.kpc = "return"]
 /// Stops a tunnel. Its listeners stop at once. Each connection is ended
 /// as if its descriptor had been closed: what was written to it is sent,
 /// and then the end of the stream, and a write to it fails from then on.
@@ -169,8 +169,8 @@ pub unsafe extern "C" fn sp_close(h: *mut c_void, linger_ms: c_int) {
     if let Some(thread) = h.thread.take() {
         let _ = thread.join();
     }
-    // The pipe is closed here, as the handle is dropped. The thread has
-    // ended, and nothing else can write to the pipe or wait on it.
+    // The eventfd is closed here, as the handle is dropped. The thread
+    // has ended, and nothing else can write to the eventfd or wait on it.
 }
 
 /// Begins a TCP connection through the tunnel, and returns a descriptor

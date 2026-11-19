@@ -48,7 +48,6 @@ struct Telling {
 //
 // TLA-wake@0> EXTENDS Naturals
 // TLA-wake@0> CONSTANTS Callers,   \* the Ruby threads that each make one call
-// TLA-wake@0>           PipeCap,   \* how many bytes the pipe holds
 // TLA-wake@0>           MayPanic,  \* the tunnel's thread may panic at any point
 // TLA-wake@0>           Ticks,     \* poll also returns for a timer
 // TLA-wake@0>           Fault      \* the fault that a variant puts in, or "none"
@@ -57,9 +56,8 @@ struct Telling {
 // TLA-wake@0> Init == s = [cmds  |-> {},      \* Shared.cmds: the callers whose command is queued
 // TLA-wake@0>              dead  |-> FALSE,   \* Shared.dead
 // TLA-wake@0>              stop  |-> FALSE,   \* Shared.stop
-// TLA-wake@0>              pipe  |-> 0,       \* how many bytes are in the pipe
-// TLA-wake@0>              rOpen |-> TRUE,    \* the read end of the pipe is open
-// TLA-wake@0>              wOpen |-> TRUE,    \* the write end of the pipe is open
+// TLA-wake@0>              woken |-> FALSE,   \* the count of the eventfd is not 0
+// TLA-wake@0>              open  |-> TRUE,    \* the eventfd is open
 // TLA-wake@0>              epc   |-> "top",   \* where the tunnel's thread is
 // TLA-wake@0>              fd    |-> [c \in Callers |-> "none"],  \* who has the descriptor that each caller made
 // TLA-wake@0>              cpc   |-> [c \in Callers |-> "idle"],  \* where each caller is
@@ -72,10 +70,9 @@ pub struct Shared {
     pub cmds: Mutex<Vec<Cmd>>,
     /// The thread has ended, and takes no more commands.
     pub dead: AtomicBool,
-    /// The pipe that wakes the loop. It is closed with the handle, which
-    /// is the last to hold it, once the thread has ended.
-    pub wake_r: OwnedFd,
-    pub wake_w: OwnedFd,
+    /// The eventfd that wakes the loop. It is closed with the handle,
+    /// which is the last to hold it, once the thread has ended.
+    pub eventfd: OwnedFd,
     pub stop: AtomicBool,
     /// How many milliseconds the thread may take to end its connections
     /// in order, once it is told to stop.
@@ -87,12 +84,11 @@ pub struct Shared {
     pub connections: AtomicUsize,
 }
 
-// TLA-wake@0> \* Shared::wake writes a byte into the pipe and does not wait. A pipe
-// TLA-wake@0> \* that is full takes no more, and has no need to.
-// TLA-wake@0> Woke(t) == [t EXCEPT !.pipe = IF @ < PipeCap THEN @ + 1 ELSE @]
+// TLA-wake@0> \* Shared::wake adds to the count of the eventfd, and does not wait.
+// TLA-wake@0> Woke(t) == [t EXCEPT !.woken = TRUE]
 impl Shared {
     pub fn wake(&self) {
-        sys::write_byte(self.wake_w.as_raw_fd());
+        sys::signal(self.eventfd.as_raw_fd());
     }
 }
 
@@ -163,20 +159,19 @@ pub struct Engine {
 
 impl Engine {
     /// Makes the engine of a tunnel around its UDP socket, as
-    /// sys::udp_socket returns it, and the two ends of the pipe that wakes
-    /// it. An error is a fault in the configuration.
+    /// sys::udp_socket returns it, and the eventfd that wakes it. An error
+    /// is a fault in the configuration.
     pub fn new(
         cfg: &Config,
         knobs: Knobs,
         (udp, udp_v6): (UdpSocket, bool),
-        (wake_r, wake_w): (OwnedFd, OwnedFd),
+        eventfd: OwnedFd,
     ) -> Result<(Engine, Arc<Shared>), String> {
         let peers = Peers::new(cfg)?;
         let shared = Arc::new(Shared {
             cmds: Mutex::default(),
             dead: AtomicBool::new(false),
-            wake_r,
-            wake_w,
+            eventfd,
             stop: AtomicBool::new(false),
             linger: AtomicU32::new(0),
             stats: Mutex::default(),
@@ -307,13 +302,14 @@ impl Engine {
     // TLA-wake> \* A turn does the thread's work, which the model leaves out, and then
     // TLA-wake> \* waits in poll.
     // TLA-wake> ETurn == s.epc = "turn" /\ s' = [s EXCEPT !.epc = IF Fault = "late drain" THEN "drain" ELSE "poll"]
-    // TLA-wake> \* poll returns when the pipe holds a byte, and the pipe is drained only
-    // TLA-wake> \* then. The drain comes before the commands are next taken. So a byte
-    // TLA-wake> \* that it takes never stood for a command that is still to be seen.
-    // TLA-wake> EPoll == /\ s.epc = "poll" /\ (s.pipe > 0 \/ Ticks)
-    // TLA-wake>          /\ s' = [s EXCEPT !.epc = IF s.pipe > 0 /\ Fault # "late drain" THEN "drain" ELSE "top"]
+    // TLA-wake> \* poll returns when the count of the eventfd is not 0, and the count is
+    // TLA-wake> \* set to 0 only then. That comes before the commands are next taken. So
+    // TLA-wake> \* a wake that it clears never stood for a command that is still to be
+    // TLA-wake> \* seen.
+    // TLA-wake> EPoll == /\ s.epc = "poll" /\ (s.woken \/ Ticks)
+    // TLA-wake>          /\ s' = [s EXCEPT !.epc = IF s.woken /\ Fault # "late drain" THEN "drain" ELSE "top"]
     // TLA-wake> EDrain == /\ s.epc = "drain"
-    // TLA-wake>           /\ s' = [s EXCEPT !.pipe = 0, !.epc = IF Fault = "late drain" THEN "poll" ELSE "top"]
+    // TLA-wake>           /\ s' = [s EXCEPT !.woken = FALSE, !.epc = IF Fault = "late drain" THEN "poll" ELSE "top"]
     /// Makes one turn of the loop. It takes what has arrived, moves the
     /// connections, sends what they have to send, and then waits until
     /// there is more to do, or for `most` at the longest.
@@ -339,7 +335,7 @@ impl Engine {
             wait = Duration::ZERO;
         }
         fds.clear();
-        fds.extend([self.shared.wake_r.as_raw_fd(), self.udp.as_raw_fd()].map(|fd| libc::pollfd {
+        fds.extend([self.shared.eventfd.as_raw_fd(), self.udp.as_raw_fd()].map(|fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
@@ -354,7 +350,7 @@ impl Engine {
         }));
         sys::poll(fds, wait);
         if fds[0].revents != 0 {
-            sys::drain(self.shared.wake_r.as_raw_fd());
+            sys::drain(self.shared.eventfd.as_raw_fd());
         }
     }
 
@@ -454,13 +450,14 @@ impl Engine {
 // TLA-wake> \* Drop for Engine refuses commands, whatever ended the thread.
 // TLA-wake> EDrop == /\ s.epc = "drop" /\ s' = [Refused(s) EXCEPT !.epc = "fields"]
 // TLA-wake> \* The engine's fields are dropped last, and the descriptors that the
-// TLA-wake> \* thread keeps with them. The pipe is not among them: the handle is the last to hold
-// TLA-wake> \* it. Suppose that the thread closed its end of the pipe here. A caller
-// TLA-wake> \* may have queued a command and not yet written its byte. It would then
-// TLA-wake> \* write to a pipe that nothing reads, which is SIGPIPE.
+// TLA-wake> \* thread keeps with them. The eventfd is not among them: the handle is
+// TLA-wake> \* the last to hold it. Suppose that the thread closed the eventfd here. A
+// TLA-wake> \* caller may have queued a command and not yet woken the thread. It
+// TLA-wake> \* would then write to a descriptor that is closed, or that is another's
+// TLA-wake> \* by then.
 // TLA-wake> EFields == /\ s.epc = "fields"
 // TLA-wake>            /\ s' = [s EXCEPT !.fd = [c \in Callers |-> IF s.fd[c] = "engine" THEN "closed" ELSE s.fd[c]],
-// TLA-wake>                              !.rOpen = @ /\ Fault # "engine's pipe", !.epc = "done"]
+// TLA-wake>                              !.open = @ /\ Fault # "thread closes", !.epc = "done"]
 /// The thread ends when run returns, or with a panic. Either way the
 /// engine is dropped, and every descriptor that the thread holds is
 /// closed with it. Ruby's ends then reach end of file, so a tunnel that
@@ -483,9 +480,9 @@ impl Drop for Engine {
 // TLA-wake@90>
 // TLA-wake@90> \* No thread is in a call on a handle that has been freed.
 // TLA-wake@90> NoUseAfterFree == s.freed => \A c \in Callers : s.cpc[c] \notin {"push", "wake"}
-// TLA-wake@90> \* Both ends of the pipe are open when a thread is about to write to it.
+// TLA-wake@90> \* The eventfd is open when a thread is about to write to it.
 // TLA-wake@90> Waking == {s.cpc[c] : c \in Callers} \cup {s.kpc}
-// TLA-wake@90> PipeIsThere == "wake" \in Waking => s.rOpen /\ s.wOpen
+// TLA-wake@90> WakeIsOpen == "wake" \in Waking => s.open
 // TLA-wake@90> \* Once the thread has ended, it holds no descriptor and none waits for it.
 // TLA-wake@90> NoLeak == s.epc = "done" => \A c \in Callers : s.fd[c] \in {"none", "closed"}
 // TLA-wake@90> \* The handle is freed only when the thread has ended.
@@ -499,20 +496,19 @@ impl Drop for Engine {
 // TLA-wake@90> Stops == s.stop ~> s.kpc = "done"
 // TLA-wake@90> \* A handle that is taken out of its holder is freed.
 // TLA-wake@90> Released == ~s.held ~> s.freed
-// TLA-wake@90> \* A byte in the pipe is drained unless the thread is ending. So the
-// TLA-wake@90> \* thread does not turn for ever for one byte.
-// TLA-wake@90> Drained == s.pipe > 0 ~> s.pipe = 0 \/ s.epc \notin {"top", "take", "handle", "turn", "poll", "drain"}
+// TLA-wake@90> \* The count of the eventfd is set to 0 unless the thread is ending. So
+// TLA-wake@90> \* the thread does not turn for ever for one wake.
+// TLA-wake@90> Drained == s.woken ~> ~s.woken \/ s.epc \notin {"top", "take", "handle", "turn", "poll", "drain"}
 //
 // The model is checked without the timer, to show that no wake depends on
 // it, and with a panic possible at any point.
 //
 // TLA-wake.cfg> SPECIFICATION Spec
 // TLA-wake.cfg> CONSTANTS Callers = {c1, c2}
-// TLA-wake.cfg>   PipeCap = 1
 // TLA-wake.cfg>   MayPanic = TRUE
 // TLA-wake.cfg>   Ticks = FALSE
 // TLA-wake.cfg>   Fault = "none"
-// TLA-wake.cfg> INVARIANTS NoUseAfterFree PipeIsThere NoLeak FreedLast TakenOnce
+// TLA-wake.cfg> INVARIANTS NoUseAfterFree WakeIsOpen NoLeak FreedLast TakenOnce
 // TLA-wake.cfg> PROPERTIES Taken Stops Released Drained
 // TLA-wake.cfg> CHECK_DEADLOCK FALSE
 //
@@ -522,16 +518,16 @@ impl Drop for Engine {
 // TLA-wake.cfg/three> Callers = {c1, c2, c3}
 //
 // Each of these variants has a fault that the code avoids, and the model
-// finds each. The thread closes its end of the pipe as it ends:
+// finds each. The thread closes the eventfd as it ends:
 //
-// TLA-wake.cfg/engines-pipe!PipeIsThere> Fault = "engine's pipe"
+// TLA-wake.cfg/thread-closes!WakeIsOpen> Fault = "thread closes"
 //
 // A command holds a bare descriptor, which the code closes where it
 // remembers to, and unwinding closes nothing:
 //
 // TLA-wake.cfg/closed-by-hand!NoLeak> Fault = "closed by hand"
 //
-// The pipe is drained after the commands are taken:
+// The count of the eventfd is set to 0 after the commands are taken:
 //
 // TLA-wake.cfg/late-drain!Taken> Fault = "late drain"
 //
@@ -547,6 +543,19 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model "wake" takes this much of an eventfd.
+    #[test]
+    fn an_eventfd_wakes_poll_from_the_first_wake_until_it_is_drained() {
+        let eventfd = sys::eventfd().unwrap();
+        let woken = || sys::revents(eventfd.as_raw_fd(), libc::POLLIN) & libc::POLLIN != 0;
+        assert!(!woken());
+        sys::signal(eventfd.as_raw_fd());
+        sys::signal(eventfd.as_raw_fd());
+        assert!(woken());
+        sys::drain(eventfd.as_raw_fd());
+        assert!(!woken());
+    }
 
     #[test]
     fn knobs_are_read_from_text() {
