@@ -98,7 +98,7 @@ module Sallyport
     # These are the lines of the model "wake" for Ruby's part. See
     # ext/sallyport/src/engine.rs for the model.
     #
-    # TLA-wake> \* Tunnel#connect, Tunnel#listen and Tunnel#dump call the library
+    # TLA-wake> \* Each call that asks something of the tunnel's thread is made
     # TLA-wake> \* under the tunnel's lock, and only while the tunnel has its handle.
     # TLA-wake> CEnter(c) == /\ s.cpc[c] = "idle" /\ s.mon = "none" /\ s.held
     # TLA-wake>              /\ s' = [s EXCEPT !.mon = c, !.cpc[c] = "push"]
@@ -213,8 +213,7 @@ module Sallyport
     # was written to it and has ended its own stream too, or until it is
     # reset.
     def connections
-      count = synchronize { Native::CONNECTIONS.call(handle) }
-      count.negative? ? failed : count
+      ask(Native::CONNECTIONS, "the tunnel's connections").to_i
     end
 
     # Returns a description of the tunnel for a person to read: what it
@@ -222,29 +221,12 @@ module Sallyport
     # of which the second is the TCP socket as smoltcp prints it. It is
     # there to show why something does not move, and its form may change.
     def dump
-      # The wait for the lock can be interrupted. From the call until the
-      # descriptor has an owner, an exception from another thread waits.
-      io = synchronize do
-        Thread.handle_interrupt(Object => :never) do
-          fd, code = Native::DUMP.call(handle), Fiddle.last_error
-          raise SystemCallError.new("a description of the tunnel", code) if fd.negative?
-
-          IO.for_fd(fd)
-        end
-      end
-      # The tunnel's thread writes the description and ends the stream. A
-      # thread that fails first writes nothing.
-      text = io.read
-      failed if text.empty?
-      text.force_encoding(Encoding::UTF_8)
-    ensure
-      io&.close
+      ask(Native::DUMP, "a description of the tunnel")
     end
 
     # Returns a Peer for each peer, in the order of the configuration.
-    # What it says is a quarter of a second old at most.
     def peers
-      stats.lines.map do |line|
+      ask(Native::STATS, "the tunnel's peers").lines.map do |line|
         key, endpoint, age, tx, rx = line.split
         Peer.new(key, (endpoint unless endpoint == "-"), (age.to_i / 1000.0 unless age == "-1"), tx.to_i, rx.to_i)
       end
@@ -362,16 +344,26 @@ module Sallyport
       raise Errno::ENETDOWN, "the tunnel's thread has failed"
     end
 
-    def stats
-      size = 4096
-      loop do
-        text = Fiddle::Pointer.malloc(size, Fiddle::RUBY_FREE)
-        need = synchronize { Native::STATS.call(handle, text, size) }
-        failed if need.zero?
-        return text.to_s.force_encoding(Encoding::UTF_8) if need <= size
+    # Asks the tunnel's thread for a text, and returns it. The library
+    # gives a descriptor at once. The thread writes a status and then the
+    # text on it, and ends the stream.
+    def ask(function, what)
+      # The wait for the lock can be interrupted. From the call until the
+      # descriptor has an owner, an exception from another thread waits.
+      io = synchronize do
+        Thread.handle_interrupt(Object => :never) do
+          fd, code = function.call(handle), Fiddle.last_error
+          raise SystemCallError.new(what, code) if fd.negative?
 
-        size = need * 2
+          IO.for_fd(fd)
+        end
       end
+      # A thread that fails before it answers writes nothing.
+      answer = io.read
+      failed if answer.empty?
+      answer.byteslice(1..).force_encoding(Encoding::UTF_8)
+    ensure
+      io&.close
     end
   end
 end

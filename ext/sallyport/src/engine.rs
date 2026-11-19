@@ -10,7 +10,7 @@ use crate::tcp::Stack;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,11 +28,24 @@ const UDP_BATCH: usize = 1024;
 pub enum Cmd {
     Connect { fd: OwnedFd, addr: IpAddr, port: u16 },
     Listen { fd: OwnedFd, port: u16, backlog: usize },
-    Describe { fd: OwnedFd },
+    Tell { fd: OwnedFd, of: Of },
 }
 
-/// A description of the tunnel that a caller asked for, and how much of
-/// it the caller's pair has taken.
+/// What a caller may ask the thread to tell of the tunnel.
+#[derive(Clone, Copy)]
+pub enum Of {
+    /// A description of the whole tunnel, for a person to read.
+    Tunnel,
+    /// The state of each peer, as Peers::stats writes it.
+    Peers,
+    /// How many connections the tunnel has.
+    Connections,
+}
+
+/// What the thread tells a caller that asked, and how much of it the
+/// caller's pair has taken. It is a status of one byte, which is 0, and
+/// then the text. So a caller can tell a text with nothing in it from
+/// the silence of a thread that ended first.
 struct Telling {
     fd: OwnedFd,
     text: Vec<u8>,
@@ -77,11 +90,6 @@ pub struct Shared {
     /// How many milliseconds the thread may take to end its connections
     /// in order, once it is told to stop.
     pub linger: AtomicU32,
-    /// The state of the peers as Peers::stats writes it, and as it was
-    /// when the timers last ran.
-    pub stats: Mutex<String>,
-    /// How many connections the stack had when the loop last turned.
-    pub connections: AtomicUsize,
 }
 
 // TLA-wake@0> \* Shared::wake adds to the count of the eventfd, and does not wait.
@@ -140,7 +148,7 @@ pub struct Engine {
     udp_v6: bool,
     peers: Peers,
     stack: Stack,
-    /// The descriptions that are not yet written whole.
+    /// The answers that are not yet written whole.
     telling: Vec<Telling>,
     next_tick: Instant,
     buf: Vec<u8>,
@@ -174,8 +182,6 @@ impl Engine {
             eventfd,
             stop: AtomicBool::new(false),
             linger: AtomicU32::new(0),
-            stats: Mutex::default(),
-            connections: AtomicUsize::new(0),
         });
         let engine = Engine {
             shared: shared.clone(),
@@ -193,15 +199,7 @@ impl Engine {
             epoch: Instant::now(),
             drop_until: None,
         };
-        engine.publish();
         Ok((engine, shared))
-    }
-
-    /// Writes the state of the peers where sp_stats reads it.
-    fn publish(&self) {
-        let mut text = String::new();
-        self.peers.stats(&mut text);
-        *self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = text;
     }
 
     // TLA-wake> \* The thread takes every queued command at once, under the lock.
@@ -223,18 +221,17 @@ impl Engine {
                 Cmd::Connect { fd, addr, port } if self.peers.reaches(&addr) => self.stack.connect(fd, addr, port),
                 Cmd::Connect { fd, .. } => Stack::refuse(fd, status::NO_ROUTE),
                 Cmd::Listen { fd, port, backlog } => self.stack.listen(fd, port, backlog),
-                Cmd::Describe { fd } => {
-                    let text = self.describe().into_bytes();
+                Cmd::Tell { fd, of } => {
+                    let text = [&[status::OK], self.tell_of(of).as_bytes()].concat();
                     self.telling.push(Telling { fd, text, sent: 0 });
                 }
             }
         }
     }
 
-    /// Writes as much of each description as its pair takes now. A
-    /// description that is written whole is dropped, which ends the
-    /// stream that the caller reads. So is one whose caller has closed
-    /// its end.
+    /// Writes as much of each answer as its pair takes now. An answer
+    /// that is written whole is dropped, which ends the stream that the
+    /// caller reads. So is one whose caller has closed its end.
     fn tell(&mut self) {
         self.telling.retain_mut(|telling| {
             while telling.sent < telling.text.len() {
@@ -282,7 +279,6 @@ impl Engine {
     fn tick(&mut self) {
         let (udp, v6) = (&self.udp, self.udp_v6);
         self.peers.tick(&mut |d, to| sys::udp_send(udp, v6, d, to));
-        self.publish();
     }
 
     // TLA-wake> \* The loop turns until the thread is told to stop.
@@ -321,7 +317,6 @@ impl Engine {
         }
         self.stack.turn();
         self.flush();
-        self.shared.connections.store(self.stack.connections(), Ordering::Relaxed);
         self.tell();
 
         let mut wait = self.next_tick.saturating_duration_since(Instant::now()).min(most);
@@ -341,7 +336,7 @@ impl Engine {
             revents: 0,
         }));
         self.stack.poll_fds(fds);
-        // A description waits for room in its pair, or for its caller to
+        // An answer waits for room in its pair, or for its caller to
         // close the other end.
         fds.extend(self.telling.iter().map(|telling| libc::pollfd {
             fd: telling.fd.as_raw_fd(),
@@ -376,6 +371,19 @@ impl Engine {
                 self.trace.pop_front();
             }
             self.trace.push_back(format!("{:10.4} {way} {line}", self.epoch.elapsed().as_secs_f64()));
+        }
+    }
+
+    /// Returns what a caller asked the thread to tell.
+    fn tell_of(&self, of: Of) -> String {
+        match of {
+            Of::Tunnel => self.describe(),
+            Of::Peers => {
+                let mut text = String::new();
+                self.peers.stats(&mut text);
+                text
+            }
+            Of::Connections => format!("{}\n", self.stack.connections()),
         }
     }
 

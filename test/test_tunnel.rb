@@ -44,6 +44,15 @@ class TestTunnel < Minitest::Test
     assert_raises(IOError) { t.peers }
   end
 
+  # The tunnel's thread answers with nothing for a tunnel that has no
+  # peer, and that is not the silence of a thread that has failed.
+  def test_a_tunnel_with_no_peer
+    key, = keypair
+    t = tunnel(private_key: key, addresses: ["10.9.0.1"])
+    assert_empty t.peers
+    assert_equal 0, t.connections
+  end
+
   # b's keepalive has it shake hands with a at once. a was not told where
   # b is, and learns it from the handshake.
   def test_two_tunnels_shake_hands

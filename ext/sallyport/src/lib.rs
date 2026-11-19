@@ -18,7 +18,7 @@ mod sock;
 mod sys;
 mod tcp;
 
-use engine::{Cmd, Engine, Knobs, Shared};
+use engine::{Cmd, Engine, Knobs, Of, Shared};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::IpAddr;
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
@@ -232,40 +232,52 @@ pub unsafe extern "C" fn sp_listen(h: *mut c_void, port: c_int, backlog: c_int) 
     })
 }
 
-/// Returns how many connections the tunnel has: those that it is making,
-/// and those that are made and have not ended. Returns -1 if the tunnel's
-/// thread has ended.
-///
-/// # Safety
-/// `h` came from sp_open.
-#[no_mangle]
-pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> isize {
-    let h = &*h.cast::<Handle>();
-    if h.shared.dead.load(Ordering::Acquire) {
-        return -1;
-    }
-    h.shared.connections.load(Ordering::Relaxed) as isize
-}
-
-/// Asks the tunnel's thread for a description of the tunnel, for a
-/// person to read, and returns a descriptor for it at once. The thread
-/// writes the description on the descriptor from the next turn of its
-/// loop: what the tunnel has counted, then a line for each peer as
-/// sp_stats gives it, then two lines for each connection. The stream then
-/// ends. A stream that ends with nothing in it is that of a thread which
-/// ended before it could answer.
+/// Asks the tunnel's thread to tell something of the tunnel, and returns
+/// a descriptor for the answer at once. The thread writes the answer on
+/// the descriptor from the next turn of its loop: a status of one byte,
+/// which is 0, and then a text. The stream then ends. A stream that ends
+/// with nothing in it is that of a thread which ended before it could
+/// answer.
 ///
 /// Returns -1 and sets errno if nothing was begun, as sp_connect does.
+unsafe fn tell(h: *mut c_void, of: Of) -> c_int {
+    let h = &*h.cast::<Handle>();
+    h.pair(libc::SOCK_STREAM, |fd| Cmd::Tell { fd, of }).unwrap_or_else(|errno| {
+        *libc::__errno_location() = errno;
+        -1
+    })
+}
+
+/// Asks for a description of the tunnel, for a person to read: what the
+/// tunnel has counted, then a line for each peer as sp_stats gives it,
+/// then two lines for each connection. The answer comes as `tell` says.
 ///
 /// # Safety
 /// `h` came from sp_open.
 #[no_mangle]
 pub unsafe extern "C" fn sp_dump(h: *mut c_void) -> c_int {
-    let h = &*h.cast::<Handle>();
-    h.pair(libc::SOCK_STREAM, |fd| Cmd::Describe { fd }).unwrap_or_else(|errno| {
-        *libc::__errno_location() = errno;
-        -1
-    })
+    tell(h, Of::Tunnel)
+}
+
+/// Asks for the state of the peers, as Peers::stats gives it. The answer
+/// comes as `tell` says.
+///
+/// # Safety
+/// `h` came from sp_open.
+#[no_mangle]
+pub unsafe extern "C" fn sp_stats(h: *mut c_void) -> c_int {
+    tell(h, Of::Peers)
+}
+
+/// Asks how many connections the tunnel has: those that it is making,
+/// and those that are made and have not ended. The answer comes as `tell`
+/// says, and its text is the number in decimal.
+///
+/// # Safety
+/// `h` came from sp_open.
+#[no_mangle]
+pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> c_int {
+    tell(h, Of::Connections)
 }
 
 /// Returns the tunnel's UDP port.
@@ -276,25 +288,6 @@ pub unsafe extern "C" fn sp_dump(h: *mut c_void) -> c_int {
 pub unsafe extern "C" fn sp_port(h: *mut c_void) -> c_int {
     let h = &*h.cast::<Handle>();
     h.port.into()
-}
-
-/// Writes the state of the peers, as Peers::stats gives it and as it was
-/// at most a quarter of a second ago, into `buf`. Returns how many bytes
-/// the whole of it needs. If that is more than `len`, what was written
-/// is cut short. Returns 0 if the tunnel's thread has ended, and with it
-/// the sessions that the state was of.
-///
-/// # Safety
-/// `h` came from sp_open, and `buf` has room for `len` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn sp_stats(h: *mut c_void, buf: *mut c_char, len: usize) -> usize {
-    let h = &*h.cast::<Handle>();
-    if h.shared.dead.load(Ordering::Acquire) {
-        return 0;
-    }
-    let stats = h.shared.stats.lock().unwrap_or_else(|e| e.into_inner());
-    put(buf, len, &stats);
-    stats.len() + 1
 }
 
 /// Writes a new private key, in base64, into 45 bytes. Returns 0, or -1
