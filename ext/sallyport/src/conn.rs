@@ -300,10 +300,14 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
     Phase::Dead { since: now }
 }
 
-/// Moves bytes each way for an open connection, and passes on the end of
-/// each direction. `left` and `wait` are those of Open. It asks nothing of
-/// the pair and of the socket but through their calls, so a test can give
-/// it the pair and the socket of the model.
+// TLA-conn> \* A pass of carry is four steps, and each makes one kind of call on the
+// TLA-conn> \* pair. Ruby may act between two calls.
+/// Moves bytes each way for an open connection, passes on the end of
+/// each direction, and says how the pass ends. `left` and `wait` are
+/// those of Open. A pass is four steps, which the model has by the same
+/// names. Neither carry nor a step asks anything of the pair and of the
+/// socket but through their calls, so a test can give them the pair and
+/// the socket of the model.
 fn carry(
     pair: &mut impl PairCalls,
     s: &mut impl SockCalls,
@@ -312,26 +316,35 @@ fn carry(
     now: Duration,
     closing: bool,
 ) -> Fate {
-    // TLA-conn> \* A pass of carry is four steps, and each makes one kind of call on the
-    // TLA-conn> \* pair. Ruby may act between two calls.
-    // TLA-conn> \*
-    // TLA-conn> \* The first step takes what Ruby wrote. One read moves as many bytes as
-    // TLA-conn> \* the socket has room for, and the step comes again until a read moves
-    // TLA-conn> \* none. If the stream to the peer has ended and Ruby has not ended its
-    // TLA-conn> \* own, the peer cut the connection, and the step stops what Ruby writes.
-    // TLA-conn> \* Our FIN follows what Ruby wrote, and it waits until the peer has
-    // TLA-conn> \* acknowledged all of that.
-    // TLA-conn> Fin(t) == IF t.k.up = "open" /\ t.p.done /\ (K!AllAcked(t.k) \/ Fault = "early fin")
-    // TLA-conn>           THEN [t EXCEPT !.k = K!End(@)] ELSE t
-    // TLA-conn> Onward(t) == [Fin(t) EXCEPT !.at = "give"]
-    // TLA-conn> Take(t) ==
-    // TLA-conn>   IF ~t.p.done /\ t.k.up # "open" /\ Fault # "writes on" THEN Onward([t EXCEPT !.p = P!Stop(@)])
-    // TLA-conn>   ELSE IF t.p.done \/ ~K!HasRoom(t.k) THEN Onward(t)
-    // TLA-conn>   ELSE LET n == Min(t.p.fromRuby, K!Room(t.k))
-    // TLA-conn>            u == [t EXCEPT !.p = P!Took(@, n), !.k = K!Filled(@, n)]
-    // TLA-conn>        IN CASE P!Read(t.p) = "bytes" -> u
-    // TLA-conn>             [] P!Read(t.p) = "reset" -> Abort(u)
-    // TLA-conn>             [] OTHER -> Onward(u)
+    if let Some(over) = take(pair, s) {
+        return over;
+    }
+    give(pair, s);
+    end(pair, s);
+    judge(pair, s, left, wait, now, closing)
+}
+
+// TLA-conn> \* The first step takes what Ruby wrote. One read moves as many bytes as
+// TLA-conn> \* the socket has room for, and the step comes again until a read moves
+// TLA-conn> \* none. If the stream to the peer has ended and Ruby has not ended its
+// TLA-conn> \* own, the peer cut the connection, and the step stops what Ruby writes.
+// TLA-conn> \* Our FIN follows what Ruby wrote, and it waits until the peer has
+// TLA-conn> \* acknowledged all of that.
+// TLA-conn> Fin(t) == IF t.k.up = "open" /\ t.p.done /\ (K!AllAcked(t.k) \/ Fault = "early fin")
+// TLA-conn>           THEN [t EXCEPT !.k = K!End(@)] ELSE t
+// TLA-conn> Onward(t) == [Fin(t) EXCEPT !.at = "give"]
+// TLA-conn> Take(t) ==
+// TLA-conn>   IF ~t.p.done /\ t.k.up # "open" /\ Fault # "writes on" THEN Onward([t EXCEPT !.p = P!Stop(@)])
+// TLA-conn>   ELSE IF t.p.done \/ ~K!HasRoom(t.k) THEN Onward(t)
+// TLA-conn>   ELSE LET n == Min(t.p.fromRuby, K!Room(t.k))
+// TLA-conn>            u == [t EXCEPT !.p = P!Took(@, n), !.k = K!Filled(@, n)]
+// TLA-conn>        IN CASE P!Read(t.p) = "bytes" -> u
+// TLA-conn>             [] P!Read(t.p) = "reset" -> Abort(u)
+// TLA-conn>             [] OTHER -> Onward(u)
+/// Takes what Ruby wrote, for as much as the socket has room, and ends
+/// the stream to the peer when Ruby has ended its own. It says how the
+/// pass ends if the pass ends here.
+fn take(pair: &mut impl PairCalls, s: &mut impl SockCalls) -> Option<Fate> {
     if !pair.done() && s.up() != Up::Open {
         // Nothing that Ruby writes from now on can be sent. A write by
         // Ruby then fails, as a write to a TCP socket does once it is
@@ -344,54 +357,74 @@ fn carry(
             // The peer sent the bytes that Ruby left unread, and it is
             // reset, as a TCP socket of the kernel resets it when it is
             // closed with bytes unread.
-            Some(Took::Reset) => return Fate::Abort,
+            Some(Took::Reset) => return Some(Fate::Abort),
             Some(Took::End | Took::Nothing) | None => break,
         }
     }
     if s.up() == Up::Open && pair.done() && s.all_acknowledged() {
         s.end();
     }
+    None
+}
 
-    // TLA-conn> \* The second step gives Ruby what the socket holds, for as much as the
-    // TLA-conn> \* pair has room. When the pair refuses a write, the socket keeps what it
-    // TLA-conn> \* holds, and carry writes no more.
-    // TLA-conn> Give(t) ==
-    // TLA-conn>   IF t.p.deaf \/ ~K!Holds(t.k) THEN [t EXCEPT !.at = "end"]
-    // TLA-conn>   ELSE LET n == Min(t.k.rx, P!Room(t.p))
-    // TLA-conn>            lost == IF Fault = "drops" /\ P!Write(t.p) = "refused" THEN t.k.rx ELSE 0
-    // TLA-conn>            u == [t EXCEPT !.p = P!Gave(@, n), !.k = K!Drained(@, n + lost)]
-    // TLA-conn>        IN IF P!Write(t.p) = "bytes" THEN u ELSE [u EXCEPT !.at = "end"]
-    // A TCP socket of the kernel keeps such bytes too, and the peer is
-    // held once the socket is full. Nothing is dropped while the
-    // connection lasts.
+// TLA-conn> \* The second step gives Ruby what the socket holds, for as much as the
+// TLA-conn> \* pair has room. When the pair refuses a write, the socket keeps what it
+// TLA-conn> \* holds, and carry writes no more.
+// TLA-conn> Give(t) ==
+// TLA-conn>   IF t.p.deaf \/ ~K!Holds(t.k) THEN [t EXCEPT !.at = "end"]
+// TLA-conn>   ELSE LET n == Min(t.k.rx, P!Room(t.p))
+// TLA-conn>            lost == IF Fault = "drops" /\ P!Write(t.p) = "refused" THEN t.k.rx ELSE 0
+// TLA-conn>            u == [t EXCEPT !.p = P!Gave(@, n), !.k = K!Drained(@, n + lost)]
+// TLA-conn>        IN IF P!Write(t.p) = "bytes" THEN u ELSE [u EXCEPT !.at = "end"]
+/// Gives Ruby what the socket holds, for as much as the pair has room.
+/// The socket keeps what the pair refuses. A TCP socket of the kernel
+/// keeps such bytes too, and the peer is held once the socket is full.
+/// Nothing is dropped while the connection lasts.
+fn give(pair: &mut impl PairCalls, s: &mut impl SockCalls) {
     while !pair.deaf() && s.holds() {
         if !matches!(s.drain(|buf| pair.write(buf)), Some(Gave::Bytes(_))) {
             break;
         }
     }
+}
 
-    // TLA-conn> \* The third step ends what Ruby reads, when the peer has ended its
-    // TLA-conn> \* stream and Ruby has been given all of it.
-    // TLA-conn> End(t) == IF ~t.p.told /\ ~t.k.down /\ ~K!Holds(t.k)
-    // TLA-conn>           THEN [t EXCEPT !.p = P!End(@), !.at = "judge"]
-    // TLA-conn>           ELSE [t EXCEPT !.at = "judge"]
+// TLA-conn> \* The third step ends what Ruby reads, when the peer has ended its
+// TLA-conn> \* stream and Ruby has been given all of it.
+// TLA-conn> End(t) == IF ~t.p.told /\ ~t.k.down /\ ~K!Holds(t.k)
+// TLA-conn>           THEN [t EXCEPT !.p = P!End(@), !.at = "judge"]
+// TLA-conn>           ELSE [t EXCEPT !.at = "judge"]
+/// Ends what Ruby reads, when the peer has ended its stream and Ruby has
+/// been given all of it.
+fn end(pair: &mut impl PairCalls, s: &impl SockCalls) {
     if !pair.told() && !s.down_open() && !s.holds() {
         pair.end();
     }
+}
 
-    // TLA-conn> \* The last step asks poll whether Ruby has left, and decides what becomes
-    // TLA-conn> \* of the connection. The two times of a connection that Ruby has left
-    // TLA-conn> \* begin here.
-    // TLA-conn> Judge(t) ==
-    // TLA-conn>   LET u == [t EXCEPT !.left = IF @ = "no" /\ P!HungUp(t.p) THEN "yes" ELSE @]
-    // TLA-conn>       acked == u.left # "no" /\ u.k.up = "ended" /\ u.k.down
-    // TLA-conn>       v == [u EXCEPT !.wait = IF @ = "no" /\ acked THEN "yes" ELSE @]
-    // TLA-conn>   IN  IF t.left = "no" /\ P!HungUp(t.p) /\ P!Unread(t.p) THEN Abort(t)
-    // TLA-conn>       ELSE IF v.k.up = "ended" /\ ~v.k.down /\ (v.p.told \/ Fault = "early close") THEN Close(v)
-    // TLA-conn>       ELSE IF v.left # "no" /\ K!Holds(v.k) /\ Fault # "keeps unread" THEN Abort(v)
-    // TLA-conn>       ELSE IF v.k.up = "ended" /\ v.k.down /\ (v.closing \/ v.wait = "late") THEN Abort(v)
-    // TLA-conn>       ELSE IF v.left = "late" /\ Fault # "no deadline" THEN Abort(v)
-    // TLA-conn>       ELSE Rest(v)
+// TLA-conn> \* The last step asks poll whether Ruby has left, and decides what becomes
+// TLA-conn> \* of the connection. The two times of a connection that Ruby has left
+// TLA-conn> \* begin here.
+// TLA-conn> Judge(t) ==
+// TLA-conn>   LET u == [t EXCEPT !.left = IF @ = "no" /\ P!HungUp(t.p) THEN "yes" ELSE @]
+// TLA-conn>       acked == u.left # "no" /\ u.k.up = "ended" /\ u.k.down
+// TLA-conn>       v == [u EXCEPT !.wait = IF @ = "no" /\ acked THEN "yes" ELSE @]
+// TLA-conn>   IN  IF t.left = "no" /\ P!HungUp(t.p) /\ P!Unread(t.p) THEN Abort(t)
+// TLA-conn>       ELSE IF v.k.up = "ended" /\ ~v.k.down /\ (v.p.told \/ Fault = "early close") THEN Close(v)
+// TLA-conn>       ELSE IF v.left # "no" /\ K!Holds(v.k) /\ Fault # "keeps unread" THEN Abort(v)
+// TLA-conn>       ELSE IF v.k.up = "ended" /\ v.k.down /\ (v.closing \/ v.wait = "late") THEN Abort(v)
+// TLA-conn>       ELSE IF v.left = "late" /\ Fault # "no deadline" THEN Abort(v)
+// TLA-conn>       ELSE Rest(v)
+/// Asks poll whether Ruby has left, and decides what becomes of the
+/// connection. The two times of a connection that Ruby has left begin
+/// here.
+fn judge(
+    pair: &impl PairCalls,
+    s: &impl SockCalls,
+    left: &mut Option<Duration>,
+    wait: &mut Option<Duration>,
+    now: Duration,
+    closing: bool,
+) -> Fate {
     if left.is_none() {
         match pair.hangup() {
             Hangup::No => {}
