@@ -11,7 +11,7 @@
 use crate::config::Config;
 use crate::conn::{status, step, Open, Phase};
 use crate::ctl::Ctl;
-use crate::packet::{rst, split_fin, syn, without_sack};
+use crate::packet::{ends, rst, split_fin, syn, without_sack};
 use crate::pair::{Pair, PairCalls};
 use crate::sock::{Sock, Socket};
 use crate::sys;
@@ -22,13 +22,20 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 /// The stack's clock goes on by no more than this from one reading to the
 /// next. The tunnel's thread reads it several times a second, so a longer
 /// time is one in which the thread stood still.
 const STEP: Duration = Duration::from_secs(1);
+/// The loop passes over every connection this often, whatever has
+/// happened to it. That is when the times of a connection are looked
+/// at, and when the loop finds what a timer of smoltcp did to a socket.
+const CHECK: Duration = Duration::from_millis(250);
+/// The epoll set names a pair by the number of its listener with this
+/// bit, or by the number of its connection.
+const LISTENER: u64 = 1 << 63;
 /// One turn of the loop has the sockets send this many rounds of packets
 /// at the most, with a packet from each socket in a round.
 const EGRESS_ROUNDS: usize = 1024;
@@ -86,10 +93,19 @@ impl Device for Link {
 /// A connection has a socket of smoltcp, and is in a phase as conn.rs
 /// has it.
 struct Conn {
+    /// `id` is a number that no other connection of the stack has had.
+    /// The connections are kept in the order of their numbers.
+    id: u64,
     handle: SocketHandle,
     /// The local port that an outbound connection took.
     local_port: Option<u16>,
     phase: Phase,
+    /// Something has happened to the connection since its last pass, so
+    /// that a pass may find something to do.
+    cause: bool,
+    /// The descriptor of the connection's pair that the epoll set
+    /// holds, with the events that it watches for.
+    watched: Option<(RawFd, libc::c_short)>,
 }
 
 // The model "conn" is in conn.rs. Some of its lines are in this file,
@@ -141,6 +157,9 @@ struct Listener {
     /// Our end of the pair on which Ruby is sent each connection.
     ctl: Ctl,
     backlog: usize,
+    /// Ruby has answered on the pair or closed it, or it is time to
+    /// look.
+    cause: bool,
 }
 
 pub struct Stack {
@@ -149,8 +168,15 @@ pub struct Stack {
     link: Link,
     conns: Vec<Conn>,
     listeners: Vec<Listener>,
-    /// How many listeners there have been.
+    /// How many listeners there have been, and how many connections.
     listened: u64,
+    made: u64,
+    /// The epoll set that holds the pairs of the connections and of the
+    /// listeners, and room for the names that it reports.
+    set: OwnedFd,
+    names: Vec<u64>,
+    /// When the loop last passed over every connection.
+    checked: Duration,
     local_ports: HashSet<u16>,
     addrs: Vec<IpAddr>,
     /// The stack's time, and when it was last read.
@@ -163,7 +189,9 @@ pub struct Stack {
 }
 
 impl Stack {
-    pub fn new(cfg: &Config, sack: bool) -> Stack {
+    /// Makes a stack that keeps its descriptors in `set`, which is an
+    /// epoll set that sys::epoll made.
+    pub fn new(cfg: &Config, sack: bool, set: OwnedFd) -> Stack {
         let mut link = Link { rx: VecDeque::new(), tx: VecDeque::new(), mtu: cfg.mtu };
         let mut ic = IfaceConfig::new(HardwareAddress::Ip);
         ic.random_seed = u64::from_ne_bytes(sys::random());
@@ -186,6 +214,10 @@ impl Stack {
             conns: Vec::new(),
             listeners: Vec::new(),
             listened: 0,
+            made: 0,
+            set,
+            names: Vec::new(),
+            checked: Duration::ZERO,
             local_ports: HashSet::new(),
             addrs: cfg.addrs.clone(),
             clock: Duration::ZERO,
@@ -268,7 +300,13 @@ impl Stack {
         };
         let handle = self.sockets.add(s);
         let phase = Phase::Connecting { pair: Pair::new(fd), since: self.clock };
-        self.conns.push(Conn { handle, local_port: Some(local), phase });
+        self.add(handle, Some(local), phase);
+    }
+
+    /// Adds a connection, which has cause for its first pass.
+    fn add(&mut self, handle: SocketHandle, local_port: Option<u16>, phase: Phase) {
+        self.made += 1;
+        self.conns.push(Conn { id: self.made, handle, local_port, phase, cause: true, watched: None });
     }
 
     /// Listens on a TCP port. `ctl` is our end of the pair on which Ruby
@@ -284,7 +322,10 @@ impl Stack {
         let free = !self.listeners.iter().any(|l| l.port == port);
         if ctl.say(if free { status::OK } else { status::IN_USE }) && free {
             self.listened += 1;
-            self.listeners.push(Listener { id: self.listened, port, ctl, backlog });
+            // The pair is watched for Ruby accepting a connection and for
+            // Ruby closing the listener.
+            sys::watch(self.set.as_raw_fd(), ctl.raw(), libc::POLLIN, LISTENER | self.listened, false);
+            self.listeners.push(Listener { id: self.listened, port, ctl, backlog, cause: false });
         }
     }
 
@@ -324,7 +365,7 @@ impl Stack {
         let Some(s) = Sock::listening(port) else { return Welcome::Full };
         let handle = self.sockets.add(s);
         let phase = Phase::Listening { listener: l.id, since: self.clock };
-        self.conns.push(Conn { handle, local_port: None, phase });
+        self.add(handle, None, phase);
         Welcome::Socket
     }
 
@@ -374,6 +415,17 @@ impl Stack {
             // socket, and is left to the one that the first copy got.
             let fresh = syn(packet).filter(|(from, to)| !self.has(*from, *to));
             let reset = rst(packet);
+            // The connection that the packet is for has cause for a
+            // pass. It is found before smoltcp has the packet: a socket
+            // that is reset has its ends no more. A packet that this
+            // file cannot read is one that smoltcp gives to no socket.
+            if let Some((from, to)) = ends(packet) {
+                let sockets = &self.sockets;
+                let theirs = |c: &&mut Conn| Sock::has(sockets.get::<Socket>(c.handle), from, to);
+                if let Some(c) = self.conns.iter_mut().find(theirs) {
+                    c.cause = true;
+                }
+            }
             let made = match fresh.map(|(_, to)| self.welcome(to.port())) {
                 // smoltcp would reset a SYN that finds no socket, and its
                 // sender would take that to mean that nothing listens. A
@@ -488,17 +540,24 @@ impl Stack {
         }
     }
 
-    // TLA-conn@70> \* The thread may turn the loop at any time, as it does for the tick and
-    // TLA-conn@70> \* for another connection, and a turn makes a pass over this connection.
-    // TLA-conn@70> \* It does turn when poll has a cause to return.
+    // TLA-conn@70> \* A turn makes a pass over this connection when something has happened
+    // TLA-conn@70> \* to it: a packet, a time of its own, or what poll would report of its
+    // TLA-conn@70> \* pair. That is Wake. The loop also passes over every connection four
+    // TLA-conn@70> \* times a second, whatever has happened, and Turn is that pass.
     // TLA-conn@70> Turn == s.at = "idle" /\ s.phase \in Live /\ s' = [s EXCEPT !.at = First(s), !.kick = FALSE]
     // TLA-conn@70> Wake == (s.kick \/ FdReady(s)) /\ Turn
     // TLA-conn@70> Step == s.at # "idle" /\ s' = StepAt(s)
-    /// Takes in the packets that arrived, moves each connection on, has
-    /// every socket send what it has to send, and removes the connections
-    /// that owe the peer nothing more. So an ACK tells the peer of the
-    /// room that there is once Ruby has been given its bytes, and what
-    /// Ruby wrote leaves in the turn that took it.
+    /// Takes in the packets that arrived, moves on each connection that
+    /// has cause, has every socket send what it has to send, and removes
+    /// the connections that owe the peer nothing more. So an ACK tells
+    /// the peer of the room that there is once Ruby has been given its
+    /// bytes, and what Ruby wrote leaves in the turn that took it.
+    ///
+    /// A connection has cause for a pass when a packet arrived for it,
+    /// when the epoll set reports its pair or the pair of the listener
+    /// that it waits for, and four times a second. A pass over any other
+    /// connection would change nothing, as NoMissedWake says in the
+    /// model, and it would cost a read and a poll.
     ///
     /// A turn leaves each connection at rest. Nothing more happens to one
     /// until a packet arrives for it, Ruby does what poll reports of its
@@ -532,7 +591,8 @@ impl Stack {
         // reset at its next step.
         self.listeners.clear();
         self.closing = true;
-        for c in &self.conns {
+        for c in &mut self.conns {
+            c.cause = true;
             // To our end, the pair is then what a pair is whose other
             // end Ruby has closed.
             if let Phase::Connecting { pair, .. } | Phase::Open(Open { pair, .. }) = &c.phase {
@@ -566,15 +626,49 @@ impl Stack {
         self.iface.poll_delay(now, &self.sockets).map(|d| Duration::from_micros(d.total_micros()))
     }
 
-    /// Moves every connection as far as it will go.
-    fn pump(&mut self) {
-        // Ruby may have accepted connections, or closed a listener. A
-        // connection that waits for its listener is stepped after that.
-        for l in &mut self.listeners {
-            l.ctl.credit();
+    /// Marks what has cause for a pass, beyond what the packets gave.
+    /// That is each pair that the epoll set reports, and everything when
+    /// it is time to look at everything.
+    fn stir(&mut self) {
+        sys::ready(self.set.as_raw_fd(), &mut self.names, self.conns.len() + self.listeners.len());
+        for name in &self.names {
+            if name & LISTENER != 0 {
+                if let Some(l) = self.listeners.iter_mut().find(|l| l.id == name & !LISTENER) {
+                    l.cause = true;
+                }
+            } else if let Ok(at) = self.conns.binary_search_by_key(name, |c| c.id) {
+                self.conns[at].cause = true;
+            }
         }
-        self.reap();
-        for c in &mut self.conns {
+        if self.clock.saturating_sub(self.checked) >= CHECK {
+            self.checked = self.clock;
+            self.listeners.iter_mut().for_each(|l| l.cause = true);
+            self.conns.iter_mut().for_each(|c| c.cause = true);
+        }
+    }
+
+    /// Moves each connection that has cause as far as it will go.
+    fn pump(&mut self) {
+        self.stir();
+        // Ruby may have accepted connections, or closed a listener. A
+        // connection that waits for that listener is stepped after it,
+        // and has cause: there may be room for it now, or nobody to take
+        // it.
+        let mut stirred = Vec::new();
+        for l in self.listeners.iter_mut().filter(|l| l.cause) {
+            l.cause = false;
+            l.ctl.credit();
+            stirred.push(l.id);
+        }
+        if !stirred.is_empty() {
+            self.listeners.retain(|l| !(stirred.contains(&l.id) && l.ctl.ended()));
+            for c in &mut self.conns {
+                c.cause |= matches!(c.phase, Phase::Listening { listener, .. } if stirred.contains(&listener));
+            }
+        }
+        let set = self.set.as_raw_fd();
+        for c in self.conns.iter_mut().filter(|c| c.cause) {
+            c.cause = false;
             let s = self.sockets.get_mut::<Socket>(c.handle);
             // The step takes the phase, and gives back the phase to go on
             // in.
@@ -588,6 +682,16 @@ impl Stack {
                 _ => None,
             };
             c.phase = step(phase, s, ctl, self.clock, self.closing);
+            // The set is told what to watch the pair for from now on. A
+            // pair that is closed has left the set by itself.
+            let watch = c.phase.watch(s).map(|p| (p.fd, p.events));
+            match (c.watched, watch) {
+                (was, now) if was == now => {}
+                (was, Some((fd, events))) => sys::watch(set, fd, events, c.id, was.is_some_and(|(old, _)| old == fd)),
+                (Some((fd, _)), None) if !matches!(c.phase, Phase::Dead) => sys::unwatch(set, fd),
+                _ => {}
+            }
+            c.watched = watch;
         }
     }
 
@@ -612,17 +716,11 @@ impl Stack {
         });
     }
 
-    /// Adds to `fds` each descriptor that poll should watch for the
-    /// connections and the listeners.
-    pub fn poll_fds(&self, fds: &mut Vec<libc::pollfd>) {
-        // A listener is watched for Ruby accepting a connection and for
-        // Ruby closing it.
-        for l in &self.listeners {
-            fds.push(libc::pollfd { fd: l.ctl.raw(), events: libc::POLLIN, revents: 0 });
-        }
-        for c in &self.conns {
-            fds.extend(c.phase.watch(self.sockets.get::<Socket>(c.handle)));
-        }
+    /// Returns the descriptor that poll should watch for the
+    /// connections and the listeners. It is the epoll set, which poll
+    /// reports as readable while a pair in it has an event.
+    pub fn poll_fd(&self) -> RawFd {
+        self.set.as_raw_fd()
     }
 }
 
@@ -731,7 +829,7 @@ mod tests {
     }
 
     fn stack(addr: &str) -> Stack {
-        Stack::new(&cfg(addr), false)
+        Stack::new(&cfg(addr), false, sys::epoll().unwrap())
     }
 
     /// Begins a connection, and returns Ruby's end of its pair.
@@ -866,7 +964,7 @@ mod tests {
         let key = crate::keys::encode(&[1; 32]);
         let cfg = config::parse(&format!("[Interface]\nPrivateKey = {key}\nAddress = {A}")).unwrap();
         for sack in [false, true] {
-            let mut a = Stack::new(&cfg, sack);
+            let mut a = Stack::new(&cfg, sack, sys::epoll().unwrap());
             let _ruby = connect(&mut a, B, 7);
             a.turn();
             let syn = a.transmit().unwrap();
@@ -1902,13 +2000,44 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_has_cause_for_a_pass_when_something_happens_to_it() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let listener = listen(&mut b, 7, 4);
+        assert_eq!(message(&listener), Some(vec![status::OK]));
+        let mut clients = [connect(&mut a, B, 7), connect(&mut a, B, 7)];
+        settle(&mut a, &mut b);
+        let mut servers = [accept(&listener), accept(&listener)];
+        settle(&mut a, &mut b);
+        let cause = |stack: &Stack| stack.conns.iter().map(|c| c.cause).collect::<Vec<_>>();
+        assert_eq!(cause(&a), [false, false], "a turn leaves every connection at rest");
+        // Ruby writes to the second connection, and the epoll set reports
+        // that pair.
+        clients[1].write_all(b"from Ruby").unwrap();
+        a.stir();
+        assert_eq!(cause(&a), [false, true]);
+        settle(&mut a, &mut b);
+        // A packet arrives for the first.
+        servers[0].write_all(b"from the peer").unwrap();
+        b.turn();
+        a.receive(b.transmit().unwrap());
+        a.ingress();
+        assert_eq!(cause(&a), [true, false]);
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut clients[0]).0.len(), 1 + b"from the peer".len());
+        // Four times a second the loop looks at every connection.
+        age(&mut a, CHECK);
+        a.stir();
+        assert_eq!(cause(&a), [true, true]);
+    }
+
+    #[test]
     fn a_connection_that_ends_goes_though_another_has_more_to_send() {
         // B's link takes packets of 88 bytes, which is less than the
         // parser allows. So B asks for segments of 48 bytes, the smallest
         // that smoltcp agrees to. A turn has a socket send EGRESS_ROUNDS
         // packets at the most, and B's window takes more segments than
         // that.
-        let (mut a, mut b) = (stack(A), Stack::new(&Config { mtu: 88, ..cfg(B) }, false));
+        let (mut a, mut b) = (stack(A), Stack::new(&Config { mtu: 88, ..cfg(B) }, false, sys::epoll().unwrap()));
         let (mut bulk, mut sink) = connected(&mut a, &mut b);
         // A's congestion window grows by a segment for each ACK, and B
         // acknowledges once in a turn. So B takes each segment in a turn

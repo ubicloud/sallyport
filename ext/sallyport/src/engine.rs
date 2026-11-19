@@ -175,6 +175,7 @@ impl Engine {
         knobs: Knobs,
         (udp, udp_v6): (UdpSocket, bool),
         eventfd: OwnedFd,
+        set: OwnedFd,
     ) -> Result<(Engine, Arc<Shared>), String> {
         let peers = Peers::new(cfg)?;
         let shared = Arc::new(Shared {
@@ -189,7 +190,7 @@ impl Engine {
             udp,
             udp_v6,
             peers,
-            stack: Stack::new(cfg, knobs.sack),
+            stack: Stack::new(cfg, knobs.sack, set),
             telling: Vec::new(),
             next_tick: Instant::now(),
             buf: vec![0; 65536],
@@ -335,12 +336,13 @@ impl Engine {
             wait = Duration::ZERO;
         }
         fds.clear();
-        fds.extend([self.shared.eventfd.as_raw_fd(), self.udp.as_raw_fd()].map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }));
-        self.stack.poll_fds(fds);
+        fds.extend(
+            [self.shared.eventfd.as_raw_fd(), self.udp.as_raw_fd(), self.stack.poll_fd()].map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }),
+        );
         // An answer waits for room in its pair, or for its caller to
         // close the other end.
         fds.extend(self.telling.iter().map(|telling| libc::pollfd {

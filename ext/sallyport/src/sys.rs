@@ -87,6 +87,42 @@ pub fn with_signals_blocked<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Makes an epoll set. It holds descriptors, each with the events of
+/// poll(2) to watch for and a number that names it. The set is a
+/// descriptor too, and poll reports it as readable while a descriptor in
+/// it has an event. So a thread can wait on many descriptors at the cost
+/// of the few that have something.
+pub fn epoll() -> std::io::Result<OwnedFd> {
+    match unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) } {
+        fd if fd >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Puts a descriptor into an epoll set, or changes what is watched for
+/// on one that is in the set. The set reports a hangup and an error
+/// whatever it is asked, as poll does. A descriptor leaves the set when
+/// it is closed.
+pub fn watch(set: RawFd, fd: RawFd, events: libc::c_short, name: u64, change: bool) {
+    let mut event = libc::epoll_event { events: events as u32, u64: name };
+    let how = if change { libc::EPOLL_CTL_MOD } else { libc::EPOLL_CTL_ADD };
+    unsafe { libc::epoll_ctl(set, how, fd, &raw mut event) };
+}
+
+/// Takes a descriptor out of an epoll set.
+pub fn unwatch(set: RawFd, fd: RawFd) {
+    unsafe { libc::epoll_ctl(set, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+}
+
+/// Returns the names of the descriptors in an epoll set that have an
+/// event now, in `names`, which has room for as many as the set holds.
+pub fn ready(set: RawFd, names: &mut Vec<u64>, holds: usize) {
+    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; holds.max(1)];
+    let n = unsafe { libc::epoll_wait(set, events.as_mut_ptr(), events.len() as libc::c_int, 0) };
+    names.clear();
+    names.extend(events[..n.max(0) as usize].iter().map(|event| event.u64));
+}
+
 /// Makes an eventfd that does not block. It is a count that poll can
 /// wait on: poll reports it as readable while the count is not 0. It is
 /// one descriptor, so it has no end that a writer can find closed.

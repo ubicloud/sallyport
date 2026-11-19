@@ -46,13 +46,17 @@ fn addrs(p: &[u8]) -> Option<(IpAddr, IpAddr)> {
     }
 }
 
-/// Returns where a packet that opens a connection comes from, and where
-/// it goes.
-pub fn syn(p: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+/// Returns where a TCP packet comes from, and where it goes.
+pub fn ends(p: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
     let t = tcp(p)?;
     let (from, to) = addrs(p)?;
     let port = |at: usize| u16::from_be_bytes([t[at], t[at + 1]]);
-    (t[13] & (SYN | ACK) == SYN).then(|| (SocketAddr::new(from, port(0)), SocketAddr::new(to, port(2))))
+    Some((SocketAddr::new(from, port(0)), SocketAddr::new(to, port(2))))
+}
+
+/// Returns the ends of a packet that opens a connection.
+pub fn syn(p: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+    ends(p).filter(|_| tcp(p).is_some_and(|t| t[13] & (SYN | ACK) == SYN))
 }
 
 /// Says whether a packet resets a TCP connection.

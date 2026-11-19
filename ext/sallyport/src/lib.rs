@@ -97,7 +97,8 @@ fn open(conf: &str, debug: &str) -> Result<Handle, (c_int, String)> {
     let udp = sys::udp_socket(cfg.listen_port).map_err(|e| refused(&what, e))?;
     let port = udp.0.local_addr().map_err(|e| refused(&what, e))?.port();
     let wake = sys::eventfd().map_err(|e| refused("an eventfd", e))?;
-    let (engine, shared) = Engine::new(&cfg, knobs, udp, wake).map_err(fault)?;
+    let set = sys::epoll().map_err(|e| refused("an epoll set", e))?;
+    let (engine, shared) = Engine::new(&cfg, knobs, udp, wake, set).map_err(fault)?;
     // The thread takes no signal. A handler that the program has set is
     // written for the program's threads, and the handlers of Ruby are
     // for threads that Ruby made.

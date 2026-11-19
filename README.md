@@ -111,6 +111,12 @@ thread's answer from it.
   at the most in one round trip. Where a round trip takes 100 ms, Ruby
   reads 640 KiB a second at the most. The last section says why.
 - A listener's backlog is 128 connections at most.
+- It is made for tens or hundreds of connections in a tunnel, and not
+  for thousands. A connection that nothing happens to costs the tunnel's
+  thread no system call. But smoltcp looks at every socket for each
+  packet that arrives, and for each round of packets that leave. Beside
+  1,000 idle connections, a busy one carries a sixth of what it carries
+  alone, and a byte takes six times as long to go and to come back.
 
 ## Looking inside
 
