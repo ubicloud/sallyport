@@ -40,6 +40,9 @@ const SOURCE_BURST: u32 = 5;
 /// until another has been forgotten.
 const SOURCES: usize = 4096;
 
+/// A packet is padded to a multiple of this many bytes.
+const PADDING: usize = 16;
+
 /// The kinds of message that WireGuard has.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -119,7 +122,10 @@ pub struct Peers {
     taken: u64,
     since: Instant,
     sources: Sources,
+    mtu: usize,
     buf: Vec<u8>,
+    /// A packet that is sent with padding is made here.
+    padded: Vec<u8>,
     pub dropped: Dropped,
 }
 
@@ -160,7 +166,9 @@ impl Peers {
             taken: 0,
             since: Instant::now(),
             sources: Sources::default(),
+            mtu: cfg.mtu,
             buf: vec![0; 65536],
+            padded: Vec::new(),
             dropped: Dropped::default(),
         })
     }
@@ -322,7 +330,16 @@ impl Peers {
         let Some(i) = Tunn::dst_address(packet).and_then(|dst| self.route(&dst)) else { return };
         let peer = &mut self.list[i];
         let Some(to) = peer.endpoint else { return };
-        if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(packet, &mut self.buf) {
+        // WireGuard pads a packet with zeros to a multiple of 16 bytes,
+        // though to no more than the MTU, so that the length of a
+        // datagram says less of the length of the packet. boringtun
+        // leaves that to its caller. The receiver cuts the packet at the
+        // length that its IP header gives.
+        let length = packet.len().next_multiple_of(PADDING).min(self.mtu.max(packet.len()));
+        self.padded.clear();
+        self.padded.extend_from_slice(packet);
+        self.padded.resize(length, 0);
+        if let TunnResult::WriteToNetwork(b) = peer.tunn.encapsulate(&self.padded, &mut self.buf) {
             send(b, to);
         }
     }
@@ -458,6 +475,23 @@ mod tests {
         let mut datagrams = sent(&mut a, &back);
         assert_eq!(datagrams.len(), 1);
         assert_eq!(b.receive(&datagrams.pop_front().unwrap(), at(1), &mut |_, _| ()), Some(back));
+    }
+
+    #[test]
+    fn a_packet_is_padded_to_sixteen_bytes_and_arrives_as_it_was() {
+        let (mut a, mut b) = pair();
+        b.mtu = 1380;
+        let mut datagrams = sent(&mut b, &ip(B, A));
+        settle(&mut a, &mut b, &mut datagrams, 2);
+        // A data message is 32 bytes longer than what it carries.
+        let mut packet = ip(B, A);
+        for (length, carried) in [(24, 32), (32, 32), (33, 48), (1376, 1376), (1377, 1380), (1380, 1380)] {
+            packet.resize(length, 7);
+            packet[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+            let mut datagrams = sent(&mut b, &packet);
+            assert_eq!(datagrams[0].len(), carried + 32, "a packet of {length} bytes");
+            assert_eq!(a.receive(&datagrams.pop_front().unwrap(), at(2), &mut |_, _| ()), Some(packet.clone()));
+        }
     }
 
     #[test]

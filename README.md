@@ -318,6 +318,11 @@ boringtun 0.7.1:
   and each message costs a key exchange. The tunnel holds each source
   address to a rate while it is under load, as the kernel's WireGuard
   does (`a_source_with_a_cookie_is_held_to_a_rate_under_load`).
+- It does not pad a packet, and its source says that this is still to
+  do. WireGuard pads each packet with zeros to a multiple of 16 bytes,
+  so that the length of a datagram says less of what it carries. The
+  tunnel pads the packet before boringtun has it
+  (`a_packet_is_padded_to_sixteen_bytes_and_arrives_as_it_was`).
 - It does not look at what a key exchange gives. A few public keys give
   zeros with every private key, and a session with such a peer would have
   keys that anyone can make. The tunnel refuses a configuration that has
