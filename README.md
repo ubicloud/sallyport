@@ -313,6 +313,11 @@ boringtun 0.7.1:
   no key exchange on a message that fails them. boringtun then checks them
   again, because its function for a message that is already checked is
   not public.
+- Its limiter asks for a cookie when handshake messages come fast, and
+  bounds nothing more. A sender that has a cookie is taken at any rate,
+  and each message costs a key exchange. The tunnel holds each source
+  address to a rate while it is under load, as the kernel's WireGuard
+  does (`a_source_with_a_cookie_is_held_to_a_rate_under_load`).
 - It does not look at what a key exchange gives. A few public keys give
   zeros with every private key, and a session with such a peer would have
   keys that anyone can make. The tunnel refuses a configuration that has

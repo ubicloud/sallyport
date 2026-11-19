@@ -9,9 +9,11 @@ use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use std::collections::HashMap;
 use std::fmt::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A Sender is how a datagram leaves. A tunnel gives one that writes to its
 /// UDP socket, and a test gives one that keeps the datagram.
@@ -26,6 +28,17 @@ const COOKIE_REPLY_LEN: usize = 64;
 /// second before it asks each sender for a cookie. The device that
 /// boringtun has takes as many.
 const HANDSHAKES_PER_SECOND: u64 = 100;
+/// Once a tunnel has taken that many in a second, it takes from one
+/// source address this many more in a second, and this many at once. The
+/// kernel's WireGuard has the same two numbers. A cookie shows only that
+/// its sender is at the address that it gives, and each handshake message
+/// costs the thread a key exchange. A peer sends one in two minutes, and
+/// one in five seconds while it has no answer.
+const SOURCE_PER_SECOND: u32 = 20;
+const SOURCE_BURST: u32 = 5;
+/// No more sources than this are counted at a time. One more is not heard
+/// until another has been forgotten.
+const SOURCES: usize = 4096;
 
 /// The kinds of message that WireGuard has.
 #[derive(Clone, Copy, PartialEq)]
@@ -44,8 +57,46 @@ struct Peer {
     keepalive: bool,
 }
 
+/// What each source may still send while the tunnel is under load. The
+/// count is of time. A message costs the time in which a source earns
+/// one, and a source saves up no more than a burst costs.
+#[derive(Default)]
+struct Sources(HashMap<IpAddr, (Instant, Duration)>);
+
+impl Sources {
+    const COST: Duration = Duration::from_millis(1000 / SOURCE_PER_SECOND as u64);
+    const MOST: Duration = Duration::from_millis(1000 / SOURCE_PER_SECOND as u64 * SOURCE_BURST as u64);
+
+    /// Says whether a source may send a handshake message now, and
+    /// counts the message if it may.
+    fn allows(&mut self, source: IpAddr, now: Instant) -> bool {
+        // A host has a whole /64 of IPv6 addresses to send from.
+        let source = match source {
+            IpAddr::V6(addr) => IpAddr::V6(Ipv6Addr::from(u128::from(addr) & !u128::from(u64::MAX))),
+            v4 => v4,
+        };
+        if self.0.len() >= SOURCES && !self.0.contains_key(&source) {
+            return false;
+        }
+        let (last, saved) = self.0.entry(source).or_insert((now, Self::MOST));
+        *saved = (*saved + now.saturating_duration_since(*last)).min(Self::MOST);
+        *last = now;
+        let allowed = *saved >= Self::COST;
+        if allowed {
+            *saved -= Self::COST;
+        }
+        allowed
+    }
+
+    /// Forgets each source that has saved up all that it may.
+    fn forget(&mut self, now: Instant) {
+        self.0.retain(|_, (last, saved)| *saved + now.saturating_duration_since(*last) < Self::MOST);
+    }
+}
+
 /// Dropped counts the datagrams that named no peer, those that boringtun
-/// refused, and the packets from a source that their peer may not use.
+/// refused or that one source sent too fast, and the packets from a
+/// source that their peer may not use.
 #[derive(Debug, Default, PartialEq)]
 pub struct Dropped {
     pub unknown: u64,
@@ -63,6 +114,11 @@ pub struct Peers {
     /// messages. Every session has it too, so that all of them check a
     /// cookie against the one secret.
     limiter: Arc<RateLimiter>,
+    /// `taken` counts the handshake messages that were taken since
+    /// `since`, which is a second ago at the most.
+    taken: u64,
+    since: Instant,
+    sources: Sources,
     buf: Vec<u8>,
     pub dropped: Dropped,
 }
@@ -95,8 +151,18 @@ impl Peers {
             let (allowed, keepalive) = (p.allowed.clone(), p.keepalive.is_some());
             list.push(Peer { tunn, public: p.public, allowed, endpoint: p.endpoint, keepalive });
         }
-        let own = cfg.addrs.clone();
-        Ok(Peers { secret, public, own, list, limiter, buf: vec![0; 65536], dropped: Dropped::default() })
+        Ok(Peers {
+            secret,
+            public,
+            own: cfg.addrs.clone(),
+            list,
+            limiter,
+            taken: 0,
+            since: Instant::now(),
+            sources: Sources::default(),
+            buf: vec![0; 65536],
+            dropped: Dropped::default(),
+        })
     }
 
     /// Begins a handshake with each peer that has a keepalive and a known
@@ -146,6 +212,16 @@ impl Peers {
             }
             Err(_) => None,
         };
+        // A sender that has a cookie can still send without end, and each
+        // message that gets this far costs a key exchange. So a tunnel
+        // that is under load holds each source to a rate as well.
+        if let Some(Packet::HandshakeInit(_) | Packet::HandshakeResponse(_)) = message {
+            self.taken += 1;
+            if self.taken > HANDSHAKES_PER_SECOND && !self.sources.allows(from.ip(), Instant::now()) {
+                self.dropped.refused += 1;
+                return None;
+            }
+        }
         let Some((i, kind)) = message.and_then(|message| self.peer_of(&message)) else {
             self.dropped.unknown += 1;
             return None;
@@ -254,8 +330,14 @@ impl Peers {
     /// Runs boringtun's timers, which rekey, keep alive and retry
     /// handshakes.
     pub fn tick(&mut self, send: Sender) {
-        // The limiter begins a new count once a second has passed.
+        // The limiter begins a new count once a second has passed, and so
+        // does the count of what was taken.
         self.limiter.reset_count();
+        let now = Instant::now();
+        if now.saturating_duration_since(self.since) >= Duration::from_secs(1) {
+            (self.taken, self.since) = (0, now);
+        }
+        self.sources.forget(now);
         for peer in &mut self.list {
             let mut due = peer.tunn.update_timers(&mut self.buf);
             // boringtun gives a handshake up when it has had no answer for
@@ -475,6 +557,70 @@ mod tests {
         a.tick(&mut |_, _| ());
         let mut fresh = Tunn::new(StaticSecret::from([2; 32]), theirs, None, None, 0, None);
         assert_eq!(answer(&mut a, &mut fresh)[0], 2);
+    }
+
+    #[test]
+    fn a_source_is_held_to_a_rate() {
+        let mut sources = Sources::default();
+        let (start, one, other) = (Instant::now(), "192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+        let burst = (0..10).filter(|_| sources.allows(one, start)).count();
+        assert_eq!(burst, SOURCE_BURST as usize);
+        assert!(sources.allows(other, start), "each source has a count of its own");
+        // A source earns a message in the twentieth part of a second.
+        let later = start + Sources::COST;
+        assert!(sources.allows(one, later) && !sources.allows(one, later));
+        // The other source has saved up all that it may by now, and is
+        // forgotten. The first is forgotten when it has.
+        let rested = later + Duration::from_secs(60);
+        sources.forget(later);
+        assert_eq!(sources.0.keys().collect::<Vec<_>>(), [&one]);
+        sources.forget(rested);
+        assert!(sources.0.is_empty());
+        assert_eq!((0..10).filter(|_| sources.allows(one, rested)).count(), SOURCE_BURST as usize);
+        // The addresses of one /64 are one source.
+        let mut sources = Sources::default();
+        let hosts = (0..10).map(|n| format!("2001:db8::{n}").parse().unwrap());
+        assert_eq!(hosts.filter(|host| sources.allows(*host, start)).count(), SOURCE_BURST as usize);
+        assert!(sources.allows("2001:db8:0:1::1".parse().unwrap(), start));
+        // When as many sources are counted as may be, another is not heard.
+        let mut sources = Sources::default();
+        for n in 0..SOURCES as u32 {
+            assert!(sources.allows(IpAddr::V4(n.into()), start));
+        }
+        assert!(!sources.allows(one, start) && sources.allows(IpAddr::V4(7.into()), start));
+    }
+
+    #[test]
+    fn a_source_with_a_cookie_is_held_to_a_rate_under_load() {
+        let (mut a, _) = pair();
+        let theirs = PublicKey::from(keys::public(&[1; 32]));
+        let mut b = Tunn::new(StaticSecret::from([2; 32]), theirs, None, None, 0, None);
+        let mut buf = [0; 256];
+        let mut answer = |a: &mut Peers, b: &mut Tunn| {
+            let TunnResult::WriteToNetwork(initiation) = b.format_handshake_initiation(&mut buf, true) else {
+                panic!("no initiation");
+            };
+            let mut answer = Vec::new();
+            a.receive(initiation, at(2), &mut |d, _| answer = d.to_vec());
+            answer
+        };
+        // Until the tunnel is under load, a source is not counted.
+        for _ in 0..HANDSHAKES_PER_SECOND {
+            assert_eq!(answer(&mut a, &mut b)[0], 2, "a response");
+        }
+        let reply = answer(&mut a, &mut b);
+        assert_eq!(reply[0], COOKIE_REPLY);
+        assert!(matches!(b.decapsulate(None, &reply, &mut [0; 256]), TunnResult::Done));
+        // With its cookie, the source is answered a burst, and then as
+        // often as it earns a message. The 50 take a moment to make.
+        let began = Instant::now();
+        let answered = (0..50).filter(|_| answer(&mut a, &mut b).first() == Some(&2)).count();
+        let earned = (began.elapsed().as_millis() / Sources::COST.as_millis()) as usize + 1;
+        assert!((SOURCE_BURST as usize..=SOURCE_BURST as usize + earned).contains(&answered), "{answered} answered");
+        assert!(answered < 50);
+        // The tunnel counts the message that it answered with a cookie
+        // as one from no peer.
+        assert_eq!(a.dropped, Dropped { unknown: 1, refused: 50 - answered as u64, disallowed: 0 });
     }
 
     #[test]
