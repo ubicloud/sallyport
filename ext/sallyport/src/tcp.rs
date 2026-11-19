@@ -300,13 +300,12 @@ enum Welcome {
 // TLA-listen@0> CONSTANTS Peers,    \* each peer sends SYNs to the port from one address and port
 // TLA-listen@0>           Backlog,  \* how many connections the listener lets wait
 // TLA-listen@0>           Fault     \* the fault that a variant puts in, or "none"
+// TLA-listen@0> \* The listener's pair is the one that ctl.rs describes.
+// TLA-listen@0> C == INSTANCE ctl
 // TLA-listen@0> \* The state is one record, so that a step says what it changes and no more.
 // TLA-listen@0> VARIABLE s
 // TLA-listen@0> Init == s = [
-// TLA-listen@0>   open       |-> TRUE,   \* Ruby has not closed the listener
-// TLA-listen@0>   unaccepted |-> 0,      \* Listener.unaccepted
-// TLA-listen@0>   queued     |-> 0,      \* the connections that Ruby was sent and has yet to take
-// TLA-listen@0>   answers    |-> 0,      \* the answers of Ruby that credit has yet to read
+// TLA-listen@0>   c          |-> C!New,  \* Listener.ctl
 // TLA-listen@0>   listening  |-> 0,      \* the sockets that listen, and have no connection yet
 // TLA-listen@0>   shaking    |-> [p \in Peers |-> 0],      \* the sockets that have answered a SYN of the peer
 // TLA-listen@0>   made       |-> [p \in Peers |-> 0],      \* its connections that Ruby has yet to be sent
@@ -326,19 +325,6 @@ struct Listener {
     /// Our end of the pair on which Ruby is sent each connection.
     ctl: Ctl,
     backlog: usize,
-    /// How many connections Ruby has been sent and has not yet accepted.
-    unaccepted: usize,
-}
-
-impl Listener {
-    // TLA-listen> \* Listener::credit counts the answers that Ruby has sent.
-    // TLA-listen> Credit(t) == IF Fault = "uncounted" THEN t
-    // TLA-listen>              ELSE [t EXCEPT !.unaccepted = @ - t.answers, !.answers = 0]
-    /// Counts the connections that Ruby has accepted since the last call.
-    /// Ruby answers each with a message.
-    fn credit(&mut self) {
-        self.unaccepted = self.unaccepted.saturating_sub(self.ctl.answers());
-    }
 }
 
 pub struct Stack {
@@ -481,7 +467,7 @@ impl Stack {
         }
         ctl.say(status::OK);
         self.listened += 1;
-        self.listeners.push(Listener { id: self.listened, port, ctl, backlog, unaccepted: 0 });
+        self.listeners.push(Listener { id: self.listened, port, ctl, backlog });
     }
 
     /// Stops the listening on each port whose listener Ruby has closed. A
@@ -491,12 +477,14 @@ impl Stack {
         self.listeners.retain(|l| !l.ctl.ended());
     }
 
+    // TLA-listen> \* welcome and pump have the pair count the answers that Ruby has sent.
+    // TLA-listen> Credit(t) == IF Fault = "uncounted" THEN t ELSE [t EXCEPT !.c = C!Credited(@)]
     // TLA-listen> \* welcome says one of these for a SYN whose connection no socket has. A
     // TLA-listen> \* listener has room until the connections that Ruby has not accepted, and
     // TLA-listen> \* those that wait for the listener, are as many as its backlog.
     // TLA-listen> Welcome(t) == LET waiting == IF Fault = "counts no handshakes" THEN 0 ELSE Waiting(t)
-    // TLA-listen>               IN IF ~t.open THEN "nobody"
-    // TLA-listen>                  ELSE IF Credit(t).unaccepted + waiting >= Backlog THEN "full"
+    // TLA-listen>               IN IF C!Ended(t.c) THEN "nobody"
+    // TLA-listen>                  ELSE IF Credit(t).c.unaccepted + waiting >= Backlog THEN "full"
     // TLA-listen>                  ELSE "socket"
     /// Makes a socket for a SYN to a port, if the port is listened on and
     /// its listener has room. A listener has room until the connections
@@ -509,9 +497,9 @@ impl Stack {
         if l.ctl.ended() {
             return Welcome::Nobody;
         }
-        l.credit();
+        l.ctl.credit();
         let waits = |c: &&Conn| matches!(c.phase, Phase::Listening { listener } if listener == l.id);
-        let pending = l.unaccepted + self.conns.iter().filter(waits).count();
+        let pending = l.ctl.unaccepted() + self.conns.iter().filter(waits).count();
         if pending >= l.backlog {
             return Welcome::Full;
         }
@@ -543,7 +531,7 @@ impl Stack {
     // TLA-listen> Syn(p, good) ==
     // TLA-listen>   LET fresh == ~Has(s, p) \/ Fault = "takes twice"
     // TLA-listen>       w == IF fresh THEN Welcome(s) ELSE "none"
-    // TLA-listen>       t == IF fresh /\ s.open THEN Credit(s) ELSE s
+    // TLA-listen>       t == IF fresh /\ s.c.open THEN Credit(s) ELSE s
     // TLA-listen>       u == IF w = "socket" THEN [t EXCEPT !.listening = @ + 1] ELSE t
     // TLA-listen>   IN IF w = "full" /\ Fault # "resets when full" THEN s' = t
     // TLA-listen>      ELSE \E v \in (IF good THEN Smoltcp(u, p) ELSE {u}) :
@@ -613,17 +601,18 @@ impl Stack {
     // TLA-listen@60> GivesUp(p) == s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
     // TLA-listen@60> \* step sends Ruby a connection that is established, and counts it. It
     // TLA-listen@60> \* resets what waits for a listener that Ruby has closed.
-    // TLA-listen@60> Hand(p) == \/ /\ s.open /\ s.made[p] > 0
-    // TLA-listen@60>               /\ s' = [s EXCEPT !.made[p] = @ - 1, !.given[p] = @ + 1,
-    // TLA-listen@60>                                 !.unaccepted = @ + 1, !.queued = @ + 1]
-    // TLA-listen@60>            \/ ~s.open /\ s.made[p] > 0 /\ s' = [s EXCEPT !.made[p] = @ - 1]
-    // TLA-listen@60>            \/ ~s.open /\ s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
+    // TLA-listen@60> Hand(p) == \/ /\ s.c.open /\ s.made[p] > 0
+    // TLA-listen@60>               /\ s' = [s EXCEPT !.made[p] = @ - 1, !.given[p] = @ + 1, !.c = C!Sent(@)]
+    // TLA-listen@60>            \/ ~s.c.open /\ s.made[p] > 0 /\ s' = [s EXCEPT !.made[p] = @ - 1]
+    // TLA-listen@60>            \/ ~s.c.open /\ s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
     // TLA-listen@60> \* A connection that Ruby was sent ends, and its socket goes.
     // TLA-listen@60> Ends(p) == s.given[p] > 0 /\ s' = [s EXCEPT !.given[p] = @ - 1]
-    // TLA-listen@60> \* pump counts Ruby's answers at each turn. Ruby may close the listener
-    // TLA-listen@60> \* at any time.
-    // TLA-listen@60> Counts == s.open /\ s.answers > 0 /\ Credit(s) # s /\ s' = Credit(s)
-    // TLA-listen@60> Close == s.open /\ s' = [s EXCEPT !.open = FALSE]
+    // TLA-listen@60> \* pump counts Ruby's answers at each turn.
+    // TLA-listen@60> Counts == s.c.open /\ s.c.answers > 0 /\ Credit(s) # s /\ s' = Credit(s)
+    // TLA-listen@60> \* Ruby accepts a connection when it likes, and may close the listener at
+    // TLA-listen@60> \* any time.
+    // TLA-listen@60> Accept == \E c \in C!Accepts(s.c) : s' = [s EXCEPT !.c = c]
+    // TLA-listen@60> Close == \E c \in C!Closes(s.c) : s' = [s EXCEPT !.c = c]
 
     /// Returns how many connections there are: those that the stack is
     /// making, and those that are made and have not ended.
@@ -759,7 +748,7 @@ impl Stack {
         // Ruby may have accepted connections, or closed a listener. A
         // connection that waits for its listener is stepped after that.
         for l in &mut self.listeners {
-            l.credit();
+            l.ctl.credit();
         }
         self.reap();
         for c in &mut self.conns {
@@ -931,7 +920,6 @@ fn step(mut phase: Phase, s: &mut Socket, listeners: &mut [Listener], now: Durat
                         if !l.ctl.send(&format!("{} {}", from.addr, from.port), &theirs) {
                             return Fate::Abort;
                         }
-                        l.unaccepted += 1;
                         Phase::open(Pair::new(ours))
                     }
                 }
@@ -1281,13 +1269,13 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 // TLA-listen@90>
 // TLA-listen@90> \* No more than the backlog are pending: the connections that Ruby has not
 // TLA-listen@90> \* accepted, and those that wait for the listener.
-// TLA-listen@90> Bounded == s.unaccepted + Waiting(s) <= Backlog
+// TLA-listen@90> Bounded == s.c.unaccepted + Waiting(s) <= Backlog
 // TLA-listen@90> \* The listener's count is of the connections that Ruby has yet to take,
 // TLA-listen@90> \* and of those that it has taken and credit has yet to count.
-// TLA-listen@90> Exact == s.unaccepted = s.queued + s.answers
+// TLA-listen@90> Exact == s.c.unaccepted = s.c.queued + s.c.answers
 // TLA-listen@90> \* Neither side waits to send a message on the listener's pair, which
 // TLA-listen@90> \* holds as many each way as the largest backlog, as ctl.rs shows.
-// TLA-listen@90> Fits == s.queued <= Backlog /\ s.answers <= Backlog
+// TLA-listen@90> Fits == s.c.queued <= Backlog /\ s.c.answers <= Backlog
 // TLA-listen@90> \* No socket listens between two packets. One that did would take the
 // TLA-listen@90> \* next SYN to the port, whatever connection that SYN belonged to.
 // TLA-listen@90> NoStray == s.listening = 0
@@ -1295,13 +1283,13 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 // TLA-listen@90> OnePerPeer == \A p \in Peers : s.shaking[p] + s.made[p] + s.given[p] <= 1
 // TLA-listen@90> \* A SYN is reset only when nothing listens. One that the backlog has no
 // TLA-listen@90> \* room for gets no answer, and its sender tries again.
-// TLA-listen@90> FullIsSilent == [][\A p \in Peers : s'.refused[p] /\ ~s.refused[p] => ~s.open]_s
+// TLA-listen@90> FullIsSilent == [][\A p \in Peers : s'.refused[p] /\ ~s.refused[p] => ~s.c.open]_s
 // TLA-listen@90> \* No place in the backlog is held for ever. A handshake ends, a
 // TLA-listen@90> \* connection that is established is sent to Ruby, and Ruby's answers are
 // TLA-listen@90> \* counted.
 // TLA-listen@90> Shaken == \A p \in Peers : s.shaking[p] > 0 ~> s.shaking[p] = 0
 // TLA-listen@90> Handed == \A p \in Peers : s.made[p] > 0 ~> s.made[p] = 0
-// TLA-listen@90> Counted == s.answers > 0 ~> s.answers = 0 \/ ~s.open
+// TLA-listen@90> Counted == s.c.answers > 0 ~> s.c.answers = 0 \/ ~s.c.open
 //
 // TLA-listen.cfg> SPECIFICATION Spec
 // TLA-listen.cfg> CONSTANTS Peers = {p1, p2}
@@ -1579,7 +1567,9 @@ mod tests {
         let mut ruby = connect(&mut a, B, 7);
         settle(&mut a, &mut b);
         assert_eq!(read(&mut ruby), (vec![status::OK], false));
-        assert!(b.conns.len() == 1 && matches!(b.conns[0].phase, Phase::Open(_)) && b.listeners[0].unaccepted == 1);
+        assert!(
+            b.conns.len() == 1 && matches!(b.conns[0].phase, Phase::Open(_)) && b.listeners[0].ctl.unaccepted() == 1
+        );
         let from = format!("{A} {}", a.conns[0].local_port.unwrap());
         assert_eq!(message(&listener), Some(from.into_bytes()));
         // The message was read here without its descriptor. So the pair's
@@ -1632,7 +1622,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1100));
         settle(&mut a, &mut b);
         assert_eq!(read(&mut rubies[2]), (vec![status::OK], false));
-        assert_eq!(b.listeners[0].unaccepted, 2);
+        assert_eq!(b.listeners[0].ctl.unaccepted(), 2);
     }
 
     #[test]

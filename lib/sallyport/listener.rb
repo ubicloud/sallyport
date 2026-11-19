@@ -50,8 +50,8 @@ module Sallyport
 
     private
 
-    # TLA-listen@60> \* Listener#take: Ruby takes a connection, and answers.
-    # TLA-listen@60> Accept == s.open /\ s.queued > 0 /\ s' = [s EXCEPT !.queued = @ - 1, !.answers = @ + 1]
+    # TLA-ctl> \* Listener#take: Ruby takes a connection, and answers.
+    # TLA-ctl> Accepts(c) == When(c.open /\ c.queued > 0, [c EXCEPT !.queued = @ - 1, !.answers = @ + 1])
 
     # Takes a connection that has arrived, and returns its Socket, or nil
     # if none has. The tunnel's thread sends each as a message that names

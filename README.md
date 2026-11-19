@@ -159,6 +159,8 @@ pair, and `sock` is what it takes for granted of smoltcp's socket. Tests
 hold the kernel and smoltcp to those two. TLC checks that `conn` then
 keeps the promise, whatever Ruby and the peer do, and with Ruby free to
 act between any two system calls that the library makes on the pair.
+`listen` stands in the same way on `ctl`, which is what the library takes
+for granted of a listener's socket pair.
 
 A model is written in the source, as comments beside the code that each
 line describes:
