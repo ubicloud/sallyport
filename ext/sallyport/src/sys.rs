@@ -166,7 +166,14 @@ pub fn udp_socket(port: u16) -> std::io::Result<(UdpSocket, bool)> {
             }
             (socket, true)
         }
-        _ => (UdpSocket::bind(("0.0.0.0", port))?, false),
+        // Only a system that has no IPv6 gets an IPv4 socket. The call
+        // can fail for another cause, such as the want of a descriptor.
+        // That is a failure, and a tunnel is not left without IPv6 for
+        // it.
+        _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+            (UdpSocket::bind(("0.0.0.0", port))?, false)
+        }
+        _ => return Err(std::io::Error::last_os_error()),
     };
     socket.set_nonblocking(true)?;
     // The socket drops a burst that its buffer cannot hold, so a large
