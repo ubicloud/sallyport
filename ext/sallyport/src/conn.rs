@@ -426,6 +426,60 @@ fn carry(
     }
 }
 
+// TLA-conn> \* asks. The pair is read while the socket has room, and written while
+// TLA-conn> \* the socket holds bytes that the pair has not refused. A descriptor with
+// TLA-conn> \* neither asked of it is watched for a hangup, until the hangup has been
+// TLA-conn> \* seen.
+// TLA-conn> AskIn(t) == ~t.p.done /\ K!HasRoom(t.k) /\ Fault # "reads unasked"
+// TLA-conn> AskOut(t) == K!Holds(t.k) /\ (~t.p.deaf \/ Fault = "deaf asks") /\ Fault # "writes unasked"
+// TLA-conn> Watched(t) == \/ AskIn(t) \/ AskOut(t)
+// TLA-conn>               \/ t.left = "no" /\ Fault # "hangup unwatched"
+// TLA-conn>               \/ Fault = "hangup always watched"
+/// Says which events poll is to be asked about for the pair of an open
+/// connection, or says nothing if poll is not to watch the pair. `room`
+/// and `holds` are what Sock::asks says of the socket, and `left` is
+/// whether poll has reported a hangup.
+fn asks(pair: &Pair, room: bool, holds: bool, left: bool) -> Option<libc::c_short> {
+    // The pair is read while the socket has room, and written while the
+    // socket has bytes for Ruby, unless the pair has refused them.
+    let read = if !pair.done() && room { libc::POLLIN } else { 0 };
+    let write = if holds && !pair.deaf() { libc::POLLOUT } else { 0 };
+    // poll reports a hangup whether asked or not. So a descriptor with
+    // no events asked of it is watched for Ruby closing its end, and for
+    // nothing else. Once the hangup has been seen, poll would return for
+    // it for ever.
+    (read | write != 0 || !left).then_some(read | write)
+}
+
+impl Phase {
+    // TLA-conn> \* FdReady says whether poll returns for the descriptor. It reports a
+    // TLA-conn> \* hangup, and bytes that Ruby left unread, whatever it is asked. A
+    // TLA-conn> \* connection that Ruby makes is watched for Ruby giving it up.
+    // TLA-conn> FdReady(t) == CASE t.phase = "open" -> /\ Watched(t)
+    // TLA-conn>                                        /\ \/ AskIn(t) /\ P!Readable(t.p)
+    // TLA-conn>                                           \/ AskOut(t) /\ P!Writable(t.p)
+    // TLA-conn>                                           \/ P!HungUp(t.p) \/ P!Unread(t.p)
+    // TLA-conn>                 [] t.phase = "connecting" -> P!HungUp(t.p)
+    // TLA-conn>                 [] OTHER -> FALSE
+    /// Returns what poll is to watch for a connection in this phase: our
+    /// end of its pair, and the events to ask about. A phase that has no
+    /// pair has nothing to watch.
+    pub fn watch(&self, s: &Socket) -> Option<libc::pollfd> {
+        let (pair, events) = match self {
+            Phase::Listening { .. } | Phase::Dead { .. } => return None,
+            // Ruby may write before it has the status, and nothing reads
+            // that yet. So poll is not asked whether there is anything to
+            // read, for which it would return for ever.
+            Phase::Connecting { pair, .. } => (pair, 0),
+            Phase::Open(Open { pair, left, tail, .. }) => {
+                let (room, holds) = Sock::asks(s, tail);
+                (pair, asks(pair, room, holds, left.is_some())?)
+            }
+        };
+        Some(libc::pollfd { fd: pair.raw(), events, revents: 0 })
+    }
+}
+
 // TLA-conn@60> StepAt(t) == CASE t.at = "begin" -> Begin(t) [] t.at = "take" -> Take(t) [] t.at = "give" -> Give(t)
 // TLA-conn@60>                [] t.at = "end" -> End(t) [] t.at = "judge" -> Judge(t)
 // TLA-conn@60> First(t) == IF t.phase = "open" THEN "take" ELSE "begin"

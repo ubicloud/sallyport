@@ -100,7 +100,7 @@ struct Conn {
 
 // The model "conn" is in conn.rs. Some of its lines are in this file,
 // beside what the loop does for each connection: in poll, turn, orphan,
-// abort, sweep and poll_fds.
+// abort and sweep.
 
 /// A SYN to a port meets one of these.
 enum Welcome {
@@ -618,24 +618,6 @@ impl Stack {
         });
     }
 
-    // TLA-conn> \* poll_fds. The pair is read while the socket has room, and written
-    // TLA-conn> \* while the socket holds bytes that the pair has not refused. A
-    // TLA-conn> \* descriptor with neither asked of it is watched for a hangup, until the
-    // TLA-conn> \* hangup has been seen.
-    // TLA-conn> AskIn(t) == ~t.p.done /\ K!HasRoom(t.k) /\ Fault # "reads unasked"
-    // TLA-conn> AskOut(t) == K!Holds(t.k) /\ (~t.p.deaf \/ Fault = "deaf asks") /\ Fault # "writes unasked"
-    // TLA-conn> Watched(t) == \/ AskIn(t) \/ AskOut(t)
-    // TLA-conn>               \/ t.left = "no" /\ Fault # "hangup unwatched"
-    // TLA-conn>               \/ Fault = "hangup always watched"
-    // TLA-conn> \* FdReady says whether poll returns for the descriptor. It reports a
-    // TLA-conn> \* hangup, and bytes that Ruby left unread, whatever it is asked. A
-    // TLA-conn> \* connection that Ruby makes is watched for Ruby giving it up.
-    // TLA-conn> FdReady(t) == CASE t.phase = "open" -> /\ Watched(t)
-    // TLA-conn>                                        /\ \/ AskIn(t) /\ P!Readable(t.p)
-    // TLA-conn>                                           \/ AskOut(t) /\ P!Writable(t.p)
-    // TLA-conn>                                           \/ P!HungUp(t.p) \/ P!Unread(t.p)
-    // TLA-conn>                 [] t.phase = "connecting" -> P!HungUp(t.p)
-    // TLA-conn>                 [] OTHER -> FALSE
     /// Adds to `fds` each descriptor that poll should watch for the
     /// connections and the listeners.
     pub fn poll_fds(&self, fds: &mut Vec<libc::pollfd>) {
@@ -645,31 +627,7 @@ impl Stack {
             fds.push(libc::pollfd { fd: l.ctl.raw(), events: libc::POLLIN, revents: 0 });
         }
         for c in &self.conns {
-            // poll reports a hangup whether asked or not. So a descriptor
-            // with no events asked of it is watched for Ruby closing its
-            // end, and for nothing else.
-            let (pair, events) = match &c.phase {
-                Phase::Listening { .. } | Phase::Dead { .. } => continue,
-                // Ruby may write before it has the status, and nothing
-                // reads that yet. So poll is not asked whether there is
-                // anything to read, for which it would return for ever.
-                Phase::Connecting { pair, .. } => (pair, 0),
-                Phase::Open(Open { pair, left, tail, .. }) => {
-                    // The pair is read while the socket has room, and
-                    // written while the socket has bytes for Ruby, unless
-                    // the pair has refused them.
-                    let (room, holds) = Sock::asks(self.sockets.get::<Socket>(c.handle), tail);
-                    let read = if !pair.done() && room { libc::POLLIN } else { 0 };
-                    let write = if holds && !pair.deaf() { libc::POLLOUT } else { 0 };
-                    // Once the hangup has been seen, poll would return
-                    // for it for ever.
-                    if read | write == 0 && left.is_some() {
-                        continue;
-                    }
-                    (pair, read | write)
-                }
-            };
-            fds.push(libc::pollfd { fd: pair.raw(), events, revents: 0 });
+            fds.extend(c.phase.watch(self.sockets.get::<Socket>(c.handle)));
         }
     }
 }
