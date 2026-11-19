@@ -114,6 +114,7 @@ enum Welcome {
 // TLA-listen@0> EXTENDS Naturals
 // TLA-listen@0> CONSTANTS Peers,    \* each peer sends SYNs to the port from one address and port
 // TLA-listen@0>           Backlog,  \* how many connections the listener lets wait
+// TLA-listen@0>           Holds,    \* how many connections the listener's pair holds for Ruby
 // TLA-listen@0>           Fault     \* the fault that a variant puts in, or "none"
 // TLA-listen@0> \* The listener's pair is the one that ctl.rs describes.
 // TLA-listen@0> C == INSTANCE ctl
@@ -415,9 +416,10 @@ impl Stack {
     // TLA-listen@60> \* it is SYN_WAIT old.
     // TLA-listen@60> Ack(p) == s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1, !.made[p] = @ + 1]
     // TLA-listen@60> GivesUp(p) == s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
-    // TLA-listen@60> \* step sends Ruby a connection that is established, and counts it. It
+    // TLA-listen@60> \* step sends Ruby a connection that is established, and counts it. A
+    // TLA-listen@60> \* connection that finds the pair full waits for a later turn. step
     // TLA-listen@60> \* resets what waits for a listener that Ruby has closed.
-    // TLA-listen@60> Hand(p) == \/ /\ s.c.open /\ s.made[p] > 0
+    // TLA-listen@60> Hand(p) == \/ /\ s.c.open /\ s.made[p] > 0 /\ ~C!Full(s.c)
     // TLA-listen@60>               /\ s' = [s EXCEPT !.made[p] = @ - 1, !.given[p] = @ + 1, !.c = C!Sent(@)]
     // TLA-listen@60>            \/ ~s.c.open /\ s.made[p] > 0 /\ s' = [s EXCEPT !.made[p] = @ - 1]
     // TLA-listen@60>            \/ ~s.c.open /\ s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
@@ -626,8 +628,9 @@ impl Stack {
 // TLA-listen@90> \* The listener's count is of the connections that Ruby has yet to take,
 // TLA-listen@90> \* and of those that it has taken and credit has yet to count.
 // TLA-listen@90> Exact == s.c.unaccepted = s.c.queued + s.c.answers
-// TLA-listen@90> \* Neither side waits to send a message on the listener's pair, which
-// TLA-listen@90> \* holds as many each way as the largest backlog, as ctl.rs shows.
+// TLA-listen@90> \* The pair has no more to hold each way than the backlog. Where it
+// TLA-listen@90> \* holds as many, no connection waits for room in it. ctl.rs shows that
+// TLA-listen@90> \* of a pair with the buffer that Linux gives one by default.
 // TLA-listen@90> Fits == s.c.queued <= Backlog /\ s.c.answers <= Backlog
 // TLA-listen@90> \* No socket listens between two packets. One that did would take the
 // TLA-listen@90> \* next SYN to the port, whatever connection that SYN belonged to.
@@ -647,6 +650,7 @@ impl Stack {
 // TLA-listen.cfg> SPECIFICATION Spec
 // TLA-listen.cfg> CONSTANTS Peers = {p1, p2}
 // TLA-listen.cfg>   Backlog = 1
+// TLA-listen.cfg>   Holds = 2
 // TLA-listen.cfg>   Fault = "none"
 // TLA-listen.cfg> INVARIANTS Bounded Exact Fits NoStray OnePerPeer
 // TLA-listen.cfg> PROPERTIES FullIsSilent Shaken Handed Counted
@@ -657,6 +661,15 @@ impl Stack {
 // TLA-listen.cfg/two> Backlog = 2
 // TLA-listen.cfg/three> Peers = {p1, p2, p3}
 // TLA-listen.cfg/three> Backlog = 2
+//
+// A pair may hold fewer connections than the backlog, as it does where the
+// system's socket buffers are small. A connection then waits until Ruby
+// takes one, and Ruby owes nothing. So this variant leaves out Handed,
+// which says that the wait ends.
+//
+// TLA-listen.cfg/small-pair> Backlog = 2
+// TLA-listen.cfg/small-pair> Holds = 1
+// TLA-listen.cfg/small-pair> PROPERTIES FullIsSilent Shaken Counted
 //
 // Each of these variants has a fault that the code avoids, and the model
 // finds each. A SYN is given a socket though a socket has its connection:
@@ -982,6 +995,36 @@ mod tests {
         settle(&mut a, &mut b);
         assert_eq!(read(&mut rubies[2]), (vec![status::OK], false));
         assert_eq!(b.listeners[0].ctl.unaccepted(), 2);
+    }
+
+    #[test]
+    fn a_connection_waits_for_room_in_the_pair_of_its_listener() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        // The listener's pair is given a small buffer, as every pair has
+        // on a system whose socket buffers are small. It then holds fewer
+        // connections than the backlog.
+        let (ours, theirs) = sys::socketpair(libc::SOCK_SEQPACKET).unwrap();
+        let small: libc::c_int = 4096;
+        unsafe { libc::setsockopt(ours.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&raw const small).cast(), 4) };
+        b.listen(ours, 7, 32);
+        let listener = UnixDatagram::from(theirs);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(message(&listener), Some(vec![status::OK]));
+        let mut rubies: Vec<UnixStream> = (0..20).map(|_| connect(&mut a, B, 7)).collect();
+        settle(&mut a, &mut b);
+        assert!(rubies.iter_mut().all(|ruby| read(ruby) == (vec![status::OK], false)), "each handshake is over");
+        let waiting = |b: &Stack| b.conns.iter().filter(|c| matches!(c.phase, Phase::Listening { .. })).count();
+        let sent = b.listeners[0].ctl.unaccepted();
+        assert!(sent > 0 && sent < 20, "the pair took {sent} of the 20");
+        assert_eq!(waiting(&b), 20 - sent, "and the others wait, with none of them reset");
+        // Ruby takes the connections one by one. Each makes room for one
+        // that waits.
+        for taken in 1..=20 {
+            let _ruby = accept(&listener);
+            settle(&mut a, &mut b);
+            assert_eq!(waiting(&b), (20 - sent).saturating_sub(taken));
+        }
+        assert!(b.listeners[0].ctl.unaccepted() == 0 && a.conns.len() == 20);
     }
 
     #[test]

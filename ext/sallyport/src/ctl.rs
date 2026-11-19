@@ -11,10 +11,26 @@
 use crate::sys;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-/// A listener's backlog is no more than this, so that neither side ever
-/// waits to send a message: the pair holds this many each way, and the
-/// status with them (`the_pair_holds_the_messages_of_the_largest_backlog`).
+/// A listener's backlog is no more than this. With the socket buffer that
+/// Linux gives a pair by default, the pair holds this many messages each
+/// way, and the status with them
+/// (`the_pair_holds_the_messages_of_the_largest_backlog`). So no
+/// connection waits for room in the pair there. The buffer is a setting
+/// of the system, net.core.wmem_default, and where it is small a
+/// connection may wait
+/// (`a_pair_that_is_full_takes_no_more_until_ruby_takes_a_connection`).
 pub const MAX_BACKLOG: usize = 128;
+
+/// What became of a connection that the stack sent.
+#[derive(Debug, PartialEq)]
+pub enum Sent {
+    /// The pair took it.
+    Ok,
+    /// The pair has no room for it until Ruby takes a connection.
+    Full,
+    /// Ruby has closed the listener.
+    Gone,
+}
 
 // The module "ctl" is this contract as the model "listen" has it. The
 // lines of the module are here and beside the calls below, and Ruby's
@@ -29,6 +45,7 @@ pub const MAX_BACKLOG: usize = 128;
 // TLA-ctl> \*   answers     the answers of Ruby that the stack has yet to read
 // TLA-ctl> \*   unaccepted  Ctl::unaccepted
 // TLA-ctl> EXTENDS Naturals
+// TLA-ctl> CONSTANT Holds  \* how many connections the pair holds for Ruby
 // TLA-ctl> When(cond, x) == IF cond THEN {x} ELSE {}
 // TLA-ctl> New == [open |-> TRUE, queued |-> 0, answers |-> 0, unaccepted |-> 0]
 // TLA-ctl> \* Ruby may close the listener at any time.
@@ -51,20 +68,29 @@ impl Ctl {
         sys::send(self.fd.as_raw_fd(), &[status]);
     }
 
-    // TLA-ctl> \* Ctl::send, on a pair that Ruby has not closed
+    // TLA-ctl> \* Ctl::send, on a pair that Ruby has not closed. The pair takes a
+    // TLA-ctl> \* connection unless it is full.
+    // TLA-ctl> Full(c) == c.queued >= Holds
     // TLA-ctl> Sent(c) == [c EXCEPT !.queued = @ + 1, !.unaccepted = @ + 1]
     /// Sends Ruby a connection: the words that name its peer, and Ruby's
-    /// end of the connection's pair. Returns whether the pair took it,
-    /// and counts it if so. The pair has room for it, so it takes it
-    /// unless Ruby has closed the listener
+    /// end of the connection's pair. Says what became of it, and counts
+    /// it if the pair took it. A pair that is full takes it once Ruby has
+    /// taken a connection
+    /// (`a_pair_that_is_full_takes_no_more_until_ruby_takes_a_connection`),
+    /// and a pair takes none once Ruby has closed the listener
     /// (`a_listener_that_ruby_closed_has_ended`). If Ruby closes the
     /// listener and has not taken the connection, the kernel closes that
     /// end, and the connection is then one whose Ruby has closed
     /// (`a_connection_that_ruby_never_took_is_closed_with_the_listener`).
-    pub fn send(&mut self, peer: &str, theirs: &OwnedFd) -> bool {
-        let sent = sys::send_fd(self.fd.as_raw_fd(), peer.as_bytes(), theirs.as_raw_fd()) >= 0;
-        self.unaccepted += usize::from(sent);
-        sent
+    pub fn send(&mut self, peer: &str, theirs: &OwnedFd) -> Sent {
+        match sys::send_fd(self.fd.as_raw_fd(), peer.as_bytes(), theirs.as_raw_fd()) {
+            sys::AGAIN => Sent::Full,
+            n if n >= 0 => {
+                self.unaccepted += 1;
+                Sent::Ok
+            }
+            _ => Sent::Gone,
+        }
     }
 
     // TLA-ctl> \* Ctl::credit
@@ -116,9 +142,9 @@ mod tests {
         (Ctl::new(ours), ruby)
     }
 
-    /// Sends a connection on the pair. Returns whether the pair took it,
-    /// and our end of the connection.
-    fn connection(ours: &mut Ctl) -> (bool, Pair) {
+    /// Sends a connection on the pair. Returns what became of it, and our
+    /// end of the connection.
+    fn connection(ours: &mut Ctl) -> (Sent, Pair) {
         let (mine, theirs) = sys::socketpair(libc::SOCK_STREAM).unwrap();
         // The longest words that name a peer.
         (ours.send("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff 65535", &theirs), Pair::new(mine))
@@ -128,8 +154,8 @@ mod tests {
     fn the_pair_holds_the_messages_of_the_largest_backlog() {
         let (mut ours, ruby) = ctl();
         ours.say(0);
-        let sent: Vec<(bool, Pair)> = (0..MAX_BACKLOG).map(|_| connection(&mut ours)).collect();
-        assert!(sent.iter().all(|(sent, _)| *sent) && ours.unaccepted() == MAX_BACKLOG);
+        let sent: Vec<(Sent, Pair)> = (0..MAX_BACKLOG).map(|_| connection(&mut ours)).collect();
+        assert!(sent.iter().all(|(sent, _)| *sent == Sent::Ok) && ours.unaccepted() == MAX_BACKLOG);
         for _ in 0..MAX_BACKLOG {
             ruby.send(&[0]).unwrap();
         }
@@ -138,9 +164,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pair_that_is_full_takes_no_more_until_ruby_takes_a_connection() {
+        let (mut ours, ruby) = ctl();
+        let mut held = Vec::new();
+        loop {
+            let (sent, mine) = connection(&mut ours);
+            held.push(mine);
+            if sent != Sent::Ok {
+                assert_eq!(sent, Sent::Full);
+                break;
+            }
+        }
+        assert_eq!(ours.unaccepted(), held.len() - 1, "a connection that the pair did not take is not counted");
+        ruby.recv(&mut [0; 64]).unwrap();
+        assert_eq!(connection(&mut ours).0, Sent::Ok);
+    }
+
+    #[test]
     fn each_answer_is_a_message_of_its_own() {
         let (mut ours, ruby) = ctl();
-        let _sent: Vec<(bool, Pair)> = (0..4).map(|_| connection(&mut ours)).collect();
+        let _sent: Vec<(Sent, Pair)> = (0..4).map(|_| connection(&mut ours)).collect();
         ours.credit();
         assert_eq!(ours.unaccepted(), 4);
         for _ in 0..3 {
@@ -153,16 +196,16 @@ mod tests {
     #[test]
     fn a_listener_that_ruby_closed_has_ended() {
         let (mut ours, ruby) = ctl();
-        assert!(!ours.ended() && connection(&mut ours).0 && !ours.ended());
+        assert!(!ours.ended() && connection(&mut ours).0 == Sent::Ok && !ours.ended());
         drop(ruby);
-        assert!(ours.ended() && !connection(&mut ours).0 && ours.unaccepted() == 1);
+        assert!(ours.ended() && connection(&mut ours).0 == Sent::Gone && ours.unaccepted() == 1);
     }
 
     #[test]
     fn a_connection_that_ruby_never_took_is_closed_with_the_listener() {
         let (mut ours, ruby) = ctl();
         let (sent, mut mine) = connection(&mut ours);
-        assert!(sent && mine.hangup() == Hangup::No);
+        assert!(sent == Sent::Ok && mine.hangup() == Hangup::No);
         drop(ruby);
         assert!(mine.hangup() == Hangup::Yes && mine.read(&mut [0; 16]) == Took::End);
     }
