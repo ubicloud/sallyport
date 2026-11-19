@@ -91,6 +91,15 @@ task tla: "tla:tools" do
   sh "tools/tla", "check", "wake", "conn", "listen"
 end
 
+desc "Hold the code of an open connection to the model of it (needs Java)"
+task conform: "tla:tools" do
+  # TLC writes what the model makes of each state that it reaches, and a
+  # unit test gives the code each of those states.
+  sh "tools/tla", "values", "conn", "Passes"
+  sh({"SALLYPORT_PASSES" => File.expand_path("tmp/tla/conn.Passes", __dir__)},
+     "cargo", "test", "--release", "--locked", "--manifest-path", "ext/sallyport/Cargo.toml", "conn::tests")
+end
+
 namespace :tla do
   desc "Fetch TLC into tmp (needs curl)"
   task :tools do

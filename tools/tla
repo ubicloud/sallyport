@@ -44,12 +44,23 @@
 #                               directory is given.
 #   tools/tla check [MODEL...]  Write them, and run TLC on each model and
 #                               on each of its variants.
+#   tools/tla values MODEL SET  Write them, and have TLC write what a test
+#                               of the code needs of the model. SET is a
+#                               name that the model defines. In each state
+#                               it is a set, which is empty in a state
+#                               that the test has no use for. The elements
+#                               that it has in the states that TLC reaches
+#                               go into tmp/tla/MODEL.SET, one to a line,
+#                               each line once. TLC reaches the states of
+#                               the model's configuration and of each
+#                               variant that has no fault.
 #
 # TLC is tla2tools.jar, which is looked for at $TLA2TOOLS and then at
 # tmp/tla2tools.jar, where "rake tla:tools" puts it. $TLC_OPTS and
 # $JAVA_OPTS add options, for more workers or more memory.
 
 require "fileutils"
+require "set"
 
 ROOT = File.expand_path("..", __dir__)
 SOURCES = Dir.glob(%w[ext/sallyport/src/**/*.rs lib/**/*.rb], base: ROOT).sort.freeze
@@ -184,22 +195,28 @@ def extract(dir)
   end
 end
 
-# Runs TLC, and says in a line what came of it. Returns whether that was
-# what should come of it.
-def tlc(dir, model, variant, statements)
+# Returns the command that runs TLC on a module with a configuration.
+# TLC keeps its states in a directory that is named for the run.
+def command(dir, run, cfg, tla)
   # TLC runs in another directory, so the path is made whole.
   jar = File.expand_path(ENV.fetch("TLA2TOOLS", File.join(ROOT, "tmp/tla2tools.jar")))
   abort "there is no #{jar}: run `rake tla:tools`, or set TLA2TOOLS" unless File.exist?(jar)
-  label = [model.name, variant&.name].compact.join("/")
-  name = label.tr("/", ".")
-  states = File.join(dir, "states", name)
+  states = File.join(dir, "states", run)
   FileUtils.rm_rf(states)
   # TLC is told to check what happens in the end once, when it has every
   # state. It otherwise checks that again and again as the states grow,
   # which takes most of its time.
-  command = ["java", "-XX:+UseParallelGC", *ENV.fetch("JAVA_OPTS", "").split, "-cp", jar, "tlc2.TLC",
-             "-config", "#{name}.cfg", "-metadir", states, "-workers", "auto", "-lncheck", "final",
-             *ENV.fetch("TLC_OPTS", "").split, "#{model.name}.tla"]
+  ["java", "-XX:+UseParallelGC", *ENV.fetch("JAVA_OPTS", "").split, "-cp", jar, "tlc2.TLC",
+   "-config", cfg, "-metadir", states, "-workers", "auto", "-lncheck", "final",
+   *ENV.fetch("TLC_OPTS", "").split, tla]
+end
+
+# Runs TLC, and says in a line what came of it. Returns whether that was
+# what should come of it.
+def tlc(dir, model, variant, statements)
+  label = [model.name, variant&.name].compact.join("/")
+  name = label.tr("/", ".")
+  command = command(dir, name, "#{name}.cfg", "#{model.name}.tla")
   log = File.join(dir, "#{name}.log")
   passed = system(*command, chdir: dir, out: log, err: %i[child out])
   text = File.read(log)
@@ -220,6 +237,43 @@ def tlc(dir, model, variant, statements)
   false
 end
 
+# Has TLC write the elements that a set of the model has in the states
+# that it reaches, and says in a line how many there are. The states are
+# those of the model's configuration and of each variant that has no
+# fault.
+def values(dir, name, set)
+  runs = extract(dir).select { |model, variant, _| model.name == name && !variant&.fails }
+  abort "there is no model #{name}" if runs.empty?
+  abort "the model #{name} defines no #{set}" unless runs[0][0].lines.any? { |line| line.last.match?(/\A#{set} ==/) }
+  # TLC prints each element as it meets the state, and ToString puts an
+  # element on one line.
+  File.write(File.join(dir, "#{name}_values.tla"), <<~TLA)
+    ---- MODULE #{name}_values ----
+    EXTENDS #{name}, TLC
+    Printed == \\A value \\in #{set} : PrintT(ToString(value))
+    ====
+  TLA
+  found = Set.new
+  runs.each do |_, variant, statements|
+    run = [name, variant&.name, "values"].compact.join(".")
+    # TLC has only to reach each state, so it checks nothing else.
+    write(dir, run, statements.reject { |keyword, _| CHECKS.include?(keyword) } << ["INVARIANT", ["Printed"]])
+    rest = []
+    IO.popen(command(dir, run, "#{run}.cfg", "#{name}_values.tla"), chdir: dir, err: %i[child out]) do |out|
+      out.each_line(chomp: true) do |line|
+        # TLC prints a string as TLA+ writes one.
+        value = line[/\A"(.*)"\z/, 1]
+        value ? found << value.gsub(/\\(.)/, '\1') : rest << line
+      end
+    end
+    log = File.join(dir, "#{run}.log")
+    File.write(log, "#{rest.join("\n")}\n")
+    abort "FAIL  #{run}: TLC did not reach every state: see #{log}" unless $?.success?
+  end
+  File.write(File.join(dir, "#{name}.#{set}"), found.sort.map { |value| "#{value}\n" }.join)
+  puts "ok    #{name}: #{found.size} of #{set} in tmp/tla/#{name}.#{set}"
+end
+
 dir = File.join(ROOT, "tmp/tla")
 case ARGV.shift
 when "extract"
@@ -231,6 +285,9 @@ when "check"
   runs.select! { |model, _| ARGV.empty? || ARGV.include?(model.name) }
   results = runs.map { |model, variant, statements| tlc(dir, model, variant, statements) }
   exit results.all?
+when "values"
+  abort "tools/tla values MODEL SET" unless ARGV.size == 2
+  values(dir, *ARGV)
 else
   abort File.read(__FILE__)[/^# The TLA\+.*?(?=^\nrequire)/m].gsub(/^# ?/, "")
 end

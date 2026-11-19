@@ -720,3 +720,309 @@ impl Phase {
 // the comment at CleanEof describes.
 //
 // TLA-conn.cfg/eof-hides-reset!CleanEof>
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sock::Moved;
+    use std::collections::HashMap;
+
+    // The model says what carry does, and this test holds carry to it. For
+    // each state of an open connection, the model gives what poll is
+    // asked, and the state after a whole pass or after the step that the
+    // state is at. `rake conform` has TLC write that for every state that
+    // it reaches. The test then gives carry, or the step, a pair and a
+    // socket that are the records of the modules "pair" and "sock", in
+    // each of those states.
+    //
+    // TLA-conn@95> \* tools/tla writes the elements of Passes for a test in conn.rs, which
+    // TLA-conn@95> \* holds carry, its four steps and asks to them. Sight is what those can
+    // TLA-conn@95> \* see of a state, and what they can change.
+    // TLA-conn@95> Sight(t) == [pair |-> [f \in DOMAIN t.p \ {"quota"} |-> t.p[f]],
+    // TLA-conn@95>              sock |-> [f \in {"up", "down", "tx", "rx", "cut", "owed"} |-> t.k[f]],
+    // TLA-conn@95>              left |-> t.left, wait |-> t.wait, closing |-> t.closing, phase |-> t.phase]
+    // TLA-conn@95> \* A step comes again while it moves bytes. Whole is the state when the
+    // TLA-conn@95> \* step that a state is at has come for the last time.
+    // TLA-conn@95> RECURSIVE Whole(_)
+    // TLA-conn@95> Whole(t) == LET u == StepAt(t) IN IF u.at = t.at THEN Whole(u) ELSE u
+    // TLA-conn@95> \* For an open connection at rest, Passes has the state after a whole
+    // TLA-conn@95> \* pass. For one that is at a step, it has the state after that step,
+    // TLA-conn@95> \* which Ruby may have come to by acting between two steps.
+    // TLA-conn@95> Passes == IF s.phase # "open" THEN {}
+    // TLA-conn@95>           ELSE {[at |-> s.at, from |-> Sight(s),
+    // TLA-conn@95>                  to |-> Sight(IF s.at = "idle" THEN Pass(s) ELSE Whole(s)),
+    // TLA-conn@95>                  asks |-> [read |-> AskIn(s), write |-> AskOut(s), watched |-> Watched(s)],
+    // TLA-conn@95>                  caps |-> [pair |-> PairCap, tx |-> TxCap]]}
+
+    /// Reads a record as TLC prints it. Returns each field's value under
+    /// its path, as "from.pair.done". A string has lost its quotes.
+    fn fields(record: &str) -> HashMap<String, String> {
+        let (mut fields, mut path) = (HashMap::new(), Vec::new());
+        let mut rest = record.strip_prefix('[').expect("a record");
+        loop {
+            rest = rest.trim_start_matches([' ', ',']);
+            if let Some(after) = rest.strip_prefix(']') {
+                rest = after;
+                if path.pop().is_none() {
+                    break;
+                }
+                continue;
+            }
+            let (name, after) = rest.split_once(" |-> ").expect("a field");
+            path.push(name);
+            if let Some(inner) = after.strip_prefix('[') {
+                rest = inner;
+                continue;
+            }
+            let end = after.find([',', ']']).expect("the end of a value");
+            fields.insert(path.join("."), after[..end].trim_matches('"').to_string());
+            path.pop();
+            rest = &after[end..];
+        }
+        assert!(rest.is_empty(), "a record ends with its bracket");
+        fields
+    }
+
+    /// A pair that is the record of the module "pair". Each call does
+    /// what the module says of it.
+    #[derive(Debug, PartialEq)]
+    struct ModelPair {
+        from_ruby: usize,
+        for_ruby: usize,
+        from_shut: bool,
+        for_shut: bool,
+        gone: String,
+        err: bool,
+        done: bool,
+        deaf: bool,
+        told: bool,
+        cap: usize,
+    }
+
+    impl PairCalls for ModelPair {
+        fn read(&mut self, buf: &mut [u8]) -> Took {
+            if self.from_ruby > 0 {
+                let n = self.from_ruby.min(buf.len());
+                self.from_ruby -= n;
+                Took::Bytes(n)
+            } else if self.err {
+                self.err = false;
+                Took::Reset
+            } else if self.from_shut {
+                self.done = true;
+                Took::End
+            } else {
+                Took::Nothing
+            }
+        }
+
+        fn done(&self) -> bool {
+            self.done
+        }
+
+        fn stop(&mut self) {
+            (self.from_shut, self.done) = (true, true);
+        }
+
+        fn write(&mut self, buf: &[u8]) -> Gave {
+            if self.for_shut || self.gone != "no" {
+                self.deaf = true;
+                Gave::Refused
+            } else if self.for_ruby < self.cap {
+                let n = buf.len().min(self.cap - self.for_ruby);
+                self.for_ruby += n;
+                Gave::Bytes(n)
+            } else {
+                Gave::Full
+            }
+        }
+
+        fn deaf(&self) -> bool {
+            self.deaf
+        }
+
+        fn end(&mut self) {
+            (self.for_shut, self.told) = (true, true);
+        }
+
+        fn told(&self) -> bool {
+            self.told
+        }
+
+        fn hangup(&self) -> Hangup {
+            match (self.from_shut && self.for_shut, self.err) {
+                (true, true) => Hangup::Unread,
+                (true, false) => Hangup::Yes,
+                (false, _) => Hangup::No,
+            }
+        }
+    }
+
+    /// A socket that is the record of the module "sock", as far as carry
+    /// can see it. Each call does what the module says of it.
+    #[derive(Debug, PartialEq)]
+    struct ModelSock {
+        up: Up,
+        down: bool,
+        tx: usize,
+        rx: usize,
+        cut: bool,
+        owed: String,
+        cap: usize,
+    }
+
+    impl SockCalls for ModelSock {
+        fn up(&self) -> Up {
+            self.up
+        }
+
+        fn down_open(&self) -> bool {
+            self.down
+        }
+
+        fn has_room(&self) -> bool {
+            self.up == Up::Open && self.tx < self.cap
+        }
+
+        fn fill<R: Moved>(&mut self, read: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+            let found = self.has_room().then(|| read(&mut vec![0; self.cap - self.tx]))?;
+            self.tx += found.bytes();
+            Some(found)
+        }
+
+        fn all_acknowledged(&self) -> bool {
+            self.tx == 0
+        }
+
+        fn end(&mut self) {
+            self.up = Up::Ending;
+        }
+
+        fn holds(&self) -> bool {
+            self.rx > 0
+        }
+
+        fn drain<R: Moved>(&mut self, write: impl FnOnce(&[u8]) -> R) -> Option<R> {
+            let found = self.holds().then(|| write(&vec![0; self.rx]))?;
+            self.rx -= found.bytes();
+            Some(found)
+        }
+    }
+
+    impl ModelSock {
+        /// Does what the module says of Sock::abort.
+        fn abort(&mut self) {
+            if !self.cut {
+                self.owed = "rst".into();
+            }
+            (self.up, self.down, self.cut, self.tx) = (Up::Ended, false, true, 0);
+        }
+    }
+
+    /// What Sight is of a state, with the phase and the two times as the
+    /// model names them.
+    type Sight = (ModelPair, ModelSock, String, String, String);
+
+    /// Returns the half of a line of Passes that is under `side`.
+    fn sight(f: &HashMap<String, String>, side: &str) -> Sight {
+        let text = |name: &str| f[&format!("{side}.{name}")].clone();
+        let flag = |name: &str| text(name) == "TRUE";
+        let count = |name: &str| text(name).parse::<usize>().unwrap();
+        let pair = ModelPair {
+            from_ruby: count("pair.fromRuby"),
+            for_ruby: count("pair.forRuby"),
+            from_shut: flag("pair.fromShut"),
+            for_shut: flag("pair.forShut"),
+            gone: text("pair.gone"),
+            err: flag("pair.err"),
+            done: flag("pair.done"),
+            deaf: flag("pair.deaf"),
+            told: flag("pair.told"),
+            cap: f["caps.pair"].parse().unwrap(),
+        };
+        let up = match text("sock.up").as_str() {
+            "open" => Up::Open,
+            "ending" => Up::Ending,
+            _ => Up::Ended,
+        };
+        let sock = ModelSock {
+            up,
+            down: flag("sock.down"),
+            tx: count("sock.tx"),
+            rx: count("sock.rx"),
+            cut: flag("sock.cut"),
+            owed: text("sock.owed"),
+            cap: f["caps.tx"].parse().unwrap(),
+        };
+        (pair, sock, text("left"), text("wait"), text("phase"))
+    }
+
+    /// The moment of each pass that the test makes.
+    const NOW: Duration = Duration::from_secs(1_000_000);
+
+    /// Returns one of the two times of an open connection as the model
+    /// names it. The time is late when it began `limit` ago.
+    fn named(since: Option<Duration>, limit: Duration) -> &'static str {
+        match since {
+            None => "no",
+            Some(since) if NOW - since >= limit => "late",
+            Some(_) => "yes",
+        }
+    }
+
+    /// Returns a time that the model names so.
+    fn since(name: &str, limit: Duration) -> Option<Duration> {
+        match name {
+            "no" => None,
+            "late" => Some(NOW - limit),
+            _ => Some(NOW - Duration::from_secs(1)),
+        }
+    }
+
+    #[test]
+    fn carry_and_its_steps_do_what_the_model_says_in_every_state_that_tlc_reaches() {
+        // `rake conform` names the file that TLC wrote. Without the file
+        // there is nothing to hold carry to, as a Ruby test has nothing
+        // to run against without its fixture.
+        let Some(path) = std::env::var_os("SALLYPORT_PASSES") else { return };
+        let passes = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        assert!(passes.lines().count() > 1000, "TLC reaches more states than {path:?} has");
+        for line in passes.lines() {
+            let f = fields(line);
+            let (mut pair, mut sock, left, wait, _) = sight(&f, "from");
+            let asked = asks(&pair, sock.has_room(), sock.holds(), left != "no");
+            let ask = |name: &str, event| if f[&format!("asks.{name}")] == "TRUE" { event } else { 0 };
+            let watched =
+                (f["asks.watched"] == "TRUE").then_some(ask("read", libc::POLLIN) | ask("write", libc::POLLOUT));
+            assert_eq!(asked, watched, "poll is asked otherwise in {line}");
+
+            let (mut left, mut wait) = (since(&left, TCP_TIMEOUT), since(&wait, FIN_WAIT));
+            let closing = f["from.closing"] == "TRUE";
+            let fate = match f["at"].as_str() {
+                "idle" => carry(&mut pair, &mut sock, &mut left, &mut wait, NOW, closing),
+                "take" => take(&mut pair, &mut sock).unwrap_or(Fate::Rest),
+                "give" => {
+                    give(&mut pair, &mut sock);
+                    Fate::Rest
+                }
+                "end" => {
+                    end(&mut pair, &sock);
+                    Fate::Rest
+                }
+                "judge" => judge(&pair, &sock, &mut left, &mut wait, NOW, closing),
+                at => panic!("the model has no step {at}"),
+            };
+            // step resets the socket of a connection that carry aborts.
+            let phase = match fate {
+                Fate::Rest => "open",
+                Fate::Close => "dead",
+                Fate::Abort => {
+                    sock.abort();
+                    "dead"
+                }
+            };
+            let after = (pair, sock, named(left, TCP_TIMEOUT).into(), named(wait, FIN_WAIT).into(), phase.into());
+            assert_eq!(after, sight(&f, "to"), "the code goes otherwise from {line}");
+        }
+    }
+}

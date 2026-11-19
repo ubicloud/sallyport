@@ -123,6 +123,7 @@ each of its last 200 TCP packets, and `Tunnel#dump` returns them.
 | `sudo env "PATH=$PATH" ruby -Ilib -Itest test/test_kernel.rb` | The tests against the TCP of the Linux kernel, behind wireguard-go in a network namespace. | `rake fixtures`, root |
 | `rake vpp`, then `sudo env "PATH=$PATH" ruby -Ilib -Itest test/test_vpp.rb` | The tests against VPP, which the task fetches as packages for Ubuntu 24.04. | root, ethtool |
 | `rake tla` | TLC on the TLA+ models. The task fetches TLC. | Java |
+| `rake conform` | The code that moves the bytes of a connection, in every state that TLC reaches of the model of it. | Java, Cargo |
 
 The tests against another implementation put it in a ring. A test writes
 to a connection that it made, and reads the same bytes from a connection
@@ -161,6 +162,19 @@ keeps the promise, whatever Ruby and the peer do, and with Ruby free to
 act between any two system calls that the library makes on the pair.
 `listen` stands in the same way on `ctl`, which is what the library takes
 for granted of a listener's socket pair.
+
+The code is held to `conn` as the kernel is held to `pair`. `carry` is
+the function that moves the bytes of an open connection and decides how
+the connection ends. It makes a pass in four steps, and the model has
+the same four. `rake conform` has TLC write what the model says of each
+state of an open connection that it reaches: what `poll` is asked there,
+and the state after a whole pass, or after the step that the state is
+at. A unit test gives `carry`, or that step, a pair and a socket that are
+records of the model, in each of those states, and the outcome must be
+the one that the model has. In the model Ruby acts between two steps, so
+each step is run in the states that Ruby can bring about before it. A
+change that makes `carry` do otherwise than the model says fails that
+test.
 
 A model is written in the source, as comments beside the code that each
 line describes:
