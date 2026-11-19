@@ -109,7 +109,8 @@ module Sallyport
     #
     # Raises as connect(2) would: Errno::ECONNREFUSED, Errno::ENETUNREACH
     # if no peer's AllowedIPs hold the address, and Errno::ETIMEDOUT if the
-    # connection is not established in +timeout+ seconds. Raises
+    # connection is not established in +timeout+ seconds, or in two
+    # minutes if that is less. Raises
     # SocketError if +host+ is not an IP address, and Errno::ENETDOWN if
     # the tunnel has failed.
     def connect(host, port, timeout: 30)

@@ -313,14 +313,15 @@ impl Stack {
             return Welcome::Nobody;
         }
         l.ctl.credit();
-        let waits = |c: &&Conn| matches!(c.phase, Phase::Listening { listener } if listener == l.id);
+        let waits = |c: &&Conn| matches!(c.phase, Phase::Listening { listener, .. } if listener == l.id);
         let pending = l.ctl.unaccepted() + self.conns.iter().filter(waits).count();
         if pending >= l.backlog {
             return Welcome::Full;
         }
         let Some(s) = Sock::listening(port) else { return Welcome::Full };
         let handle = self.sockets.add(s);
-        self.conns.push(Conn { handle, local_port: None, phase: Phase::Listening { listener: l.id } });
+        let phase = Phase::Listening { listener: l.id, since: self.clock };
+        self.conns.push(Conn { handle, local_port: None, phase });
         Welcome::Socket
     }
 
@@ -410,8 +411,8 @@ impl Stack {
         });
     }
 
-    // TLA-listen@60> \* The peer finishes the handshake, or smoltcp gives the handshake up
-    // TLA-listen@60> \* after TCP_TIMEOUT.
+    // TLA-listen@60> \* The peer finishes the handshake, or step gives the handshake up when
+    // TLA-listen@60> \* it is SYN_WAIT old.
     // TLA-listen@60> Ack(p) == s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1, !.made[p] = @ + 1]
     // TLA-listen@60> GivesUp(p) == s.shaking[p] > 0 /\ s' = [s EXCEPT !.shaking[p] = @ - 1]
     // TLA-listen@60> \* step sends Ruby a connection that is established, and counts it. It
@@ -568,7 +569,7 @@ impl Stack {
             // A connection that a peer made goes to Ruby on the pair of
             // its listener, unless Ruby has closed that listener.
             let ctl = match phase {
-                Phase::Listening { listener } => {
+                Phase::Listening { listener, .. } => {
                     self.listeners.iter_mut().find(|l| l.id == listener).map(|l| &mut l.ctl)
                 }
                 _ => None,
@@ -615,8 +616,8 @@ impl Stack {
 // TLA-listen@90> Next == \/ \E p \in Peers : Syn(p, TRUE) \/ Syn(p, FALSE) \/ Rst(p) \/ Ack(p) \/ GivesUp(p)
 // TLA-listen@90>         \/ \E p \in Peers : Hand(p) \/ Ends(p)
 // TLA-listen@90>         \/ Accept \/ Counts \/ Close
-// TLA-listen@90> \* The stack counts and steps when it can, and smoltcp gives up each
-// TLA-listen@90> \* handshake that its peer leaves. The peers and Ruby owe nothing.
+// TLA-listen@90> \* The stack counts and steps when it can, and gives up each handshake
+// TLA-listen@90> \* that its peer leaves. The peers and Ruby owe nothing.
 // TLA-listen@90> Spec == Init /\ [][Next]_s /\ WF_s(Counts) /\ \A p \in Peers : WF_s(Hand(p)) /\ WF_s(GivesUp(p))
 // TLA-listen@90>
 // TLA-listen@90> \* No more than the backlog are pending: the connections that Ruby has not
@@ -686,7 +687,7 @@ impl Stack {
 mod tests {
     use super::*;
     use crate::config;
-    use crate::conn::FIN_WAIT;
+    use crate::conn::{FIN_WAIT, SYN_WAIT};
     use crate::sock::{RECV_BUF, SEND_BUF, TCP_TIMEOUT};
     use smoltcp::socket::tcp;
     use smoltcp::time::Duration as SDuration;
@@ -859,18 +860,29 @@ mod tests {
         let mut ruby = connect(&mut a, B, 7);
         // Nothing takes what A sends, and A's clock is put on a second at
         // a time.
-        let mut status = Vec::new();
-        for _ in 0..2 * TCP_TIMEOUT.as_secs() {
+        for _ in 1..SYN_WAIT.as_secs() {
             age(&mut a, Duration::from_secs(1));
             a.turn();
             while a.transmit().is_some() {}
-            let (bytes, end) = read(&mut ruby);
-            status.extend(bytes);
-            if end {
-                break;
-            }
         }
-        assert_eq!(status, [status::TIMED_OUT]);
+        assert_eq!(read(&mut ruby), (vec![], false), "the attempt has a second left");
+        age(&mut a, Duration::from_secs(1));
+        a.turn();
+        assert_eq!(read(&mut ruby), (vec![status::TIMED_OUT], true));
+        assert!(is_reset(&a.transmit().unwrap()) && a.conns.is_empty());
+    }
+
+    #[test]
+    fn an_attempt_that_is_refused_at_the_last_is_refused() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let mut ruby = connect(&mut a, B, 7);
+        a.turn();
+        while a.transmit().is_some() {}
+        // The first SYNs are lost. B has no listener, and resets the SYN
+        // that reaches it a second before A would give the attempt up.
+        age(&mut a, SYN_WAIT - Duration::from_secs(1));
+        settle(&mut a, &mut b);
+        assert_eq!(read(&mut ruby), (vec![status::REFUSED], true));
     }
 
     #[test]
@@ -993,6 +1005,25 @@ mod tests {
         let mut ruby = connect(&mut a, B, 7);
         settle(&mut a, &mut b);
         assert_eq!(read(&mut ruby), (vec![status::OK], false));
+    }
+
+    #[test]
+    fn a_handshake_that_its_peer_leaves_is_given_up() {
+        let (mut a, mut b) = (stack(A), stack(B));
+        let _listener = listen(&mut b, 7, 1);
+        let _ruby = connect(&mut a, B, 7);
+        a.turn();
+        b.receive(a.transmit().unwrap());
+        b.turn();
+        assert!(!is_reset(&b.transmit().unwrap()), "the SYN is answered");
+        // The answer is lost, and A sends no more.
+        age(&mut b, SYN_WAIT - Duration::from_secs(1));
+        b.turn();
+        assert!(std::iter::from_fn(|| b.transmit()).all(|packet| !is_reset(&packet)) && b.conns.len() == 1);
+        age(&mut b, Duration::from_secs(1));
+        b.turn();
+        assert!(std::iter::from_fn(|| b.transmit()).any(|packet| is_reset(&packet)));
+        assert!(b.conns.is_empty(), "and its place in the backlog is free");
     }
 
     #[test]

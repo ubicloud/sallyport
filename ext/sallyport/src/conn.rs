@@ -14,6 +14,10 @@ use crate::sys;
 use std::collections::VecDeque;
 use std::time::Duration;
 
+/// A handshake is given this long, whichever side began it. Linux gives
+/// one that it began about as long. It is less than a socket's timeout,
+/// so a socket that closes while it connects was reset by the peer.
+pub const SYN_WAIT: Duration = Duration::from_secs(120);
 /// A connection that Ruby has closed is given this long to hear the
 /// peer's FIN, once the peer has acknowledged ours. Linux gives as long.
 pub const FIN_WAIT: Duration = Duration::from_secs(60);
@@ -42,6 +46,7 @@ pub enum Phase {
     /// pair yet.
     Listening {
         listener: u64,
+        since: Duration,
     },
     Open(Open),
     /// The connection is closed to Ruby and has no pair. Its socket stays
@@ -156,7 +161,7 @@ enum Fate {
 // TLA-conn@0>   p       |-> P!New,    \* the pair
 // TLA-conn@0>   k       |-> K!New,    \* the socket
 // TLA-conn@0>   phase   |-> first,    \* "connecting", "listening", "open", "dead" or "removed"
-// TLA-conn@0>   old     |-> FALSE,    \* an attempt is as old as smoltcp's timeout
+// TLA-conn@0>   old     |-> FALSE,    \* the handshake is SYN_WAIT old
 // TLA-conn@0>   said    |-> "none",   \* what Ruby was told of the attempt: "ok", "refused" or "timedout"
 // TLA-conn@0>   listens |-> TRUE,     \* Ruby has not closed the listener
 // TLA-conn@0>   left    |-> "no",     \* Open.left is "no", "yes" or "late" (TCP_TIMEOUT ago)
@@ -196,15 +201,19 @@ enum Fate {
 // TLA-conn@10>             /\ \E k \in K!PeerAcks(s.k) \cup K!PeerAcksFin(s.k) : s' = Arrives(k)
 // TLA-conn@10> PeerSilent == s.phase # "removed" /\ \E k \in K!Silence(s.k) : s' = [s EXCEPT !.k = k]
 // TLA-conn@10> \* Time passes. A tick or a timer of smoltcp turns the loop, and the
-// TLA-conn@10> \* thread reads the clock then, so each of these steps wakes the loop. An
-// TLA-conn@10> \* attempt that fails is taken for refused or for timed out by how old it
-// TLA-conn@10> \* is, and smoltcp's timeout comes when it is old. The timeout of a
-// TLA-conn@10> \* socket takes effect between two passes.
-// TLA-conn@10> TimesOut == /\ s.at = "idle" /\ s.phase # "removed" /\ (s.phase = "connecting" => s.old)
+// TLA-conn@10> \* thread reads the clock then, so each of these steps wakes the loop.
+// TLA-conn@10> \* The timeout of a socket takes effect between two passes. It does not
+// TLA-conn@10> \* come to a socket whose handshake is not over, because step gives the
+// TLA-conn@10> \* handshake up sooner.
+// TLA-conn@10> TimesOut == /\ s.at = "idle" /\ s.phase = "open"
 // TLA-conn@10>             /\ \E k \in K!TimesOut(s.k) : s' = [s EXCEPT !.k = k, !.kick = TRUE]
 // TLA-conn@10> Forgets == /\ s.at = "idle" /\ s.phase = "open"
 // TLA-conn@10>            /\ \E k \in K!Forgets(s.k) : s' = [s EXCEPT !.k = k, !.kick = TRUE]
-// TLA-conn@10> Ages == ~s.old /\ s.phase = "connecting" /\ s' = [s EXCEPT !.old = TRUE, !.kick = TRUE]
+// TLA-conn@10> \* A handshake is old when the peer has not finished it for SYN_WAIT. The
+// TLA-conn@10> \* model takes such a peer for one that is silent for good, as it does
+// TLA-conn@10> \* for the timeout of a socket.
+// TLA-conn@10> Ages == /\ ~s.old /\ s.phase \in Early /\ s.k.gone
+// TLA-conn@10>         /\ s' = [s EXCEPT !.old = TRUE, !.kick = TRUE]
 // TLA-conn@10> Late == /\ s.phase = "open"
 // TLA-conn@10>         /\ \/ s.left = "yes" /\ s' = [s EXCEPT !.left = "late", !.kick = TRUE]
 // TLA-conn@10>            \/ s.wait = "yes" /\ s' = [s EXCEPT !.wait = "late", !.kick = TRUE]
@@ -219,13 +228,14 @@ enum Fate {
 // TLA-conn>          IF P!HungUp(t.p) THEN Abort(t)
 // TLA-conn>          ELSE IF K!Opening(t.k) = "done" \/ (Fault = "greets early" /\ K!Opening(t.k) = "pending")
 // TLA-conn>               THEN [t EXCEPT !.said = "ok", !.phase = "open", !.old = FALSE, !.at = "take"]
-// TLA-conn>          ELSE IF K!Opening(t.k) = "failed"
-// TLA-conn>               THEN Close([t EXCEPT !.said = IF t.old THEN "timedout" ELSE "refused"])
+// TLA-conn>          ELSE IF K!Opening(t.k) = "failed" THEN Close([t EXCEPT !.said = "refused"])
+// TLA-conn>          ELSE IF t.old /\ Fault # "waits for ever" THEN Abort([t EXCEPT !.said = "timedout"])
 // TLA-conn>          ELSE Rest(t)
 // TLA-conn>     [] t.phase = "listening" ->
 // TLA-conn>          IF ~t.listens THEN Abort(t)
 // TLA-conn>          ELSE IF K!Opening(t.k) = "done" THEN [t EXCEPT !.said = "ok", !.phase = "open", !.at = "take"]
 // TLA-conn>          ELSE IF K!Opening(t.k) = "failed" /\ Fault # "keeps a failure" THEN Close(t)
+// TLA-conn>          ELSE IF t.old /\ Fault # "waits for ever" THEN Abort(t)
 // TLA-conn>          ELSE Rest(t)
 /// Moves one connection as far as it will go, through each phase that it
 /// can leave now, and returns the phase that it is then in. `ctl` is the
@@ -240,30 +250,34 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
             // closing, and has shut the pair down.
             Phase::Connecting { pair, .. } if pair.hangup() != Hangup::No => break Fate::Abort,
             Phase::Connecting { pair, since } => match Sock::opening(s) {
-                // The peer answers a SYN with a bare SYN if it was
-                // connecting to us at the same moment, and the handshake
-                // is not over.
-                Opening::Pending => return Phase::Connecting { pair, since },
-                Opening::Failed => {
-                    // smoltcp does not say whether a reset or its timeout
-                    // closed the socket, so the time taken has to.
-                    let late = now - since + Duration::from_secs(1) >= TCP_TIMEOUT;
-                    pair.say(if late { status::TIMED_OUT } else { status::REFUSED });
-                    break Fate::Close;
-                }
                 Opening::Done => {
                     pair.say(status::OK);
                     Phase::open(pair)
                 }
+                // The peer reset the attempt. smoltcp's timeout closes a
+                // socket too, but not one that is given up sooner.
+                Opening::Failed => {
+                    pair.say(status::REFUSED);
+                    break Fate::Close;
+                }
+                Opening::Pending if now - since >= SYN_WAIT => {
+                    pair.say(status::TIMED_OUT);
+                    break Fate::Abort;
+                }
+                // The peer answers a SYN with a bare SYN if it was
+                // connecting to us at the same moment, and the handshake
+                // is not over.
+                Opening::Pending => return Phase::Connecting { pair, since },
             },
-            Phase::Listening { .. } => {
+            Phase::Listening { since, .. } => {
                 // Ruby closed the listener.
                 let Some(ctl) = ctl.as_deref_mut() else { break Fate::Abort };
                 match Sock::opening(s) {
+                    // The peer left the handshake unfinished.
+                    Opening::Pending if now - since >= SYN_WAIT => break Fate::Abort,
                     Opening::Pending => return phase,
-                    // The peer left the handshake unfinished, or it
-                    // finished the handshake and reset the connection at
-                    // once.
+                    // The peer finished the handshake, and reset the
+                    // connection at once.
                     Opening::Failed => break Fate::Close,
                     Opening::Done => {
                         // The system may have no descriptors to spare.
@@ -557,6 +571,10 @@ impl Phase {
 // TLA-conn@90> \* bytes for it. The peer is reset for them, as a TCP socket of the kernel
 // TLA-conn@90> \* resets it when it is closed with bytes unread.
 // TLA-conn@90> NoneOrphaned == Asleep(s) /\ s.phase = "open" /\ s.left # "no" => ~K!Holds(s.k)
+// TLA-conn@90> \* Nor does it rest in a handshake that has failed. The pass that finds
+// TLA-conn@90> \* the failure ends the connection, and does not leave that to the time
+// TLA-conn@90> \* that a handshake has.
+// TLA-conn@90> FailureEnds == Asleep(s) /\ s.phase \in Early => K!Opening(s.k) # "failed"
 // TLA-conn@90> \* An open connection is one whose handshake is over, and Ruby has been
 // TLA-conn@90> \* told so. Ruby is told of nothing else before the attempt is over, and
 // TLA-conn@90> \* is told once.
@@ -589,8 +607,10 @@ impl Phase {
 // TLA-conn@90> \* An attempt that failed leaves no socket, and neither does one whose
 // TLA-conn@90> \* listener Ruby closed before it was open.
 // TLA-conn@90> NotBegun == s.phase \in Early /\ (s.k.cut \/ ~s.listens) ~> s.phase = "removed"
-// TLA-conn@90> \* Ruby has its answer when the handshake is over, unless it left.
-// TLA-conn@90> Answered == s.phase = "connecting" /\ ~s.k.pending ~> s.phase # "connecting"
+// TLA-conn@90> \* A handshake ends when the peer has finished it or is gone, whichever
+// TLA-conn@90> \* side began it. Ruby then has its answer for a connection that it
+// TLA-conn@90> \* makes, unless it left first.
+// TLA-conn@90> Shaken == s.phase \in Early /\ (~s.k.pending \/ s.k.gone) ~> s.phase \notin Early
 // TLA-conn@90> \* If Ruby keeps reading, it is given what the socket holds, and then the
 // TLA-conn@90> \* end of the peer's stream, unless the connection ends or the pair
 // TLA-conn@90> \* refuses.
@@ -620,8 +640,8 @@ impl Phase {
 // TLA-conn.cfg>   PairCap = 1
 // TLA-conn.cfg>   Fault = "none"
 // TLA-conn.cfg> INVARIANTS RemovedClean DeadEnds NoneWithheld FinIsBare
-// TLA-conn.cfg>   NoMissedWake NoSpin CutStops NoneOrphaned OpenIsGreeted SaidAtTheEnd
-// TLA-conn.cfg> PROPERTIES SaidOnce Kept DeadGoes SilenceEnds LetGo NotBegun Answered ToRuby ToPeer
+// TLA-conn.cfg>   NoMissedWake NoSpin CutStops NoneOrphaned FailureEnds OpenIsGreeted SaidAtTheEnd
+// TLA-conn.cfg> PROPERTIES SaidOnce Kept DeadGoes SilenceEnds LetGo NotBegun Shaken ToRuby ToPeer
 // TLA-conn.cfg> CHECK_DEADLOCK FALSE
 //
 // A pair that holds two bytes can be half full. poll then reports no room
@@ -649,9 +669,13 @@ impl Phase {
 //
 // TLA-conn.cfg/greets-early!OpenIsGreeted> Fault = "greets early"
 //
+// step does not give up a handshake that the peer never finishes:
+//
+// TLA-conn.cfg/waits-for-ever!Shaken> Fault = "waits for ever"
+//
 // A socket that listened is kept when its handshake has failed:
 //
-// TLA-conn.cfg/keeps-a-failure!NotBegun> Fault = "keeps a failure"
+// TLA-conn.cfg/keeps-a-failure!FailureEnds> Fault = "keeps a failure"
 //
 // poll is not asked about a descriptor that is neither read nor written:
 //

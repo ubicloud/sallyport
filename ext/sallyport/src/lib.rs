@@ -176,10 +176,10 @@ pub unsafe extern "C" fn sp_close(h: *mut c_void, linger_ms: c_int) {
 /// Begins a TCP connection through the tunnel, and returns a descriptor
 /// for it at once. The first byte read from the descriptor is a status.
 /// It is 0 once the connection is established, and the connection's
-/// stream follows it. Otherwise it is 1 for refused, 2 for timed out, 3
-/// for an address that no peer takes, or 4 for no local port left, and
-/// the stream ends. Closing the descriptor before the status arrives
-/// abandons the attempt.
+/// stream follows it. Otherwise it is 1 for refused, 2 for an attempt
+/// that the peer has not answered in two minutes, 3 for an address that
+/// no peer takes, or 4 for no local port left, and the stream ends.
+/// Closing the descriptor before the status arrives abandons the attempt.
 ///
 /// Returns -1 and sets errno if no connection was begun: EINVAL if `addr`
 /// is not an IP address or `port` not a port, ENETDOWN if the tunnel's
