@@ -36,6 +36,11 @@ class TestTCP < Minitest::Test
     a, = pair
     assert_raises(SocketError) { a.connect("example.com", 7) }
     assert_raises(SocketError) { a.connect("10.9.0.2/32", 7) }
+    # The system would take each of these for an address that it does
+    # not name: 8.9.0.2, 10.9.0.2, 0.0.0.1 and twice 0.0.0.0.
+    ["010.9.0.2", "10.9.2", "1", "", nil].each do |host|
+      assert_raises(SocketError) { a.connect(host, 7, timeout: 0.2) }
+    end
     assert_raises(ArgumentError) { a.connect("10.9.0.2", 0) }
     assert_raises(ArgumentError) { a.connect("10.9.0.2", 65_536) }
     assert_raises(ArgumentError) { a.connect("10.9.0.2", "ssh") }

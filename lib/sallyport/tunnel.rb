@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "io/wait"
+require "ipaddr"
 
 module Sallyport
   # A Peer is what a tunnel knows of one of its peers: the peer's public
@@ -127,7 +128,14 @@ module Sallyport
     def connect(host, port, timeout: 30)
       port = self.class.port(port)
       # An address is asked for, and never a name: a tunnel has no
-      # resolver.
+      # resolver. The system's parser reads more than addresses. To it
+      # "010.9.0.2" is 8.9.0.2, "10.9.2" is 10.9.0.2 and "" is 0.0.0.0.
+      # IPAddr takes none of these.
+      begin
+        IPAddr.new(host.to_s)
+      rescue IPAddr::Error
+        raise SocketError, "#{host.inspect} is not an IP address"
+      end
       remote = Addrinfo.getaddrinfo(host.to_s, port, nil, :STREAM, nil, ::Socket::AI_NUMERICHOST).first
       # ::ffff:10.9.0.1 is the IPv4 address 10.9.0.1 in IPv6's writing.
       remote = Addrinfo.tcp(remote.ipv6_to_ipv4.ip_address, port) if remote.ipv6_v4mapped?
