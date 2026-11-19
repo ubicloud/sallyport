@@ -73,7 +73,9 @@ A commit that changes a copy keeps these rules:
   its row for as long as this holds.
 
 `tools/deviations check` holds the history and the table to the rules,
-and CI runs it. Two commits changed the copy of smoltcp before there
+and CI runs it. CI also has rustfmt check each copy with its default
+settings, as the checks of each project do, so that a deviation is laid
+out as its project wants. `rake deviations` runs both. Two commits changed the copy of smoltcp before there
 were rules, and each also changed files of this library. The tool names
 the two.
 

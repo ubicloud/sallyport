@@ -20,6 +20,12 @@ end
 desc "Check that each change of a copy in vendor is of a deviation that has a class"
 task :deviations do
   sh "tools/deviations", "check"
+  # Each project has rustfmt check its layout, so a deviation keeps to
+  # it. Without --config-path, rustfmt would lay a copy out as
+  # ext/sallyport/rustfmt.toml says.
+  sh "cargo", "fmt", "--manifest-path", "ext/sallyport/vendor/smoltcp/Cargo.toml", "--", "--check", "--config-path", "/dev/null"
+  sh "cargo", "fmt", "--all", "--manifest-path", "ext/sallyport/vendor/boringtun/Cargo.toml", "--", "--check",
+     "--config-path", "/dev/null"
 end
 
 desc "Run the tests that smoltcp and boringtun have of their own, on the copies in vendor"
