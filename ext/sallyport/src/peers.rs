@@ -56,6 +56,8 @@ pub struct Dropped {
 pub struct Peers {
     secret: StaticSecret,
     public: PublicKey,
+    /// The tunnel has these addresses.
+    own: Vec<IpAddr>,
     list: Vec<Peer>,
     /// The limiter checks the MACs of a handshake message, and counts the
     /// messages. Every session has it too, so that all of them check a
@@ -86,7 +88,8 @@ impl Peers {
             let (allowed, keepalive) = (p.allowed.clone(), p.keepalive.is_some());
             list.push(Peer { tunn, public: p.public, allowed, endpoint: p.endpoint, keepalive });
         }
-        Ok(Peers { secret, public, list, limiter, buf: vec![0; 65536], dropped: Dropped::default() })
+        let own = cfg.addrs.clone();
+        Ok(Peers { secret, public, own, list, limiter, buf: vec![0; 65536], dropped: Dropped::default() })
     }
 
     /// Begins a handshake with each peer that has a keepalive and a known
@@ -189,7 +192,7 @@ impl Peers {
         // AllowedIPs of two peers overlap, neither can send as an address
         // that the other holds more closely.
         let (packet, src) = packet?;
-        if self.route(&src) == Some(i) {
+        if self.route(&src) == Some(i) && !self.stray(&src) {
             Some(packet)
         } else {
             self.dropped.disallowed += 1;
@@ -204,6 +207,24 @@ impl Peers {
     fn route(&self, dst: &IpAddr) -> Option<usize> {
         let nets = self.list.iter().enumerate().flat_map(|(i, p)| p.allowed.iter().map(move |net| (net, i)));
         nets.filter(|(net, _)| contains(net, dst)).max_by_key(|(net, _)| net.1).map(|(_, i)| i)
+    }
+
+    /// Says whether no peer can have the address, whatever its
+    /// AllowedIPs say: the tunnel has it, or it is one that no host has
+    /// on a link. Linux drops a packet from most of these sources too. A
+    /// peer that is a gateway has every address in its AllowedIPs. Some
+    /// programs trust what comes from the loopback address, and they
+    /// must not hear that peer there.
+    fn stray(&self, src: &IpAddr) -> bool {
+        self.own.contains(src)
+            || match src {
+                IpAddr::V4(src) => {
+                    src.is_loopback() || src.is_multicast() || src.is_broadcast() || src.is_unspecified()
+                }
+                IpAddr::V6(src) => {
+                    src.is_loopback() || src.is_multicast() || src.is_unspecified() || src.to_ipv4_mapped().is_some()
+                }
+            }
     }
 
     /// Says whether some peer takes packets for the address.
@@ -540,6 +561,53 @@ mod tests {
         let mut datagrams = sent(&mut second, &ip(B, A));
         assert_eq!(settle(&mut a, &mut second, &mut datagrams, 3).0, [ip(B, A)]);
         assert_eq!(a.route(&B.parse().unwrap()), Some(1));
+    }
+
+    /// Builds a small IPv6 packet from one address to another.
+    fn ip6(src: &str, dst: &str) -> Vec<u8> {
+        let mut p = vec![0x60, 0, 0, 0, 0, 4, 253, 64];
+        for addr in [src, dst] {
+            p.extend(addr.parse::<std::net::Ipv6Addr>().unwrap().octets());
+        }
+        p.extend(b"data");
+        p
+    }
+
+    #[test]
+    fn a_source_that_no_peer_can_have_is_dropped() {
+        // B is a gateway to A: every address is in its AllowedIPs.
+        let ((ka, pa), (kb, pb)) = (key(1), key(2));
+        let a = format!(
+            "[Interface]\nPrivateKey = {ka}\nAddress = {A}, fd09::1\n\
+             [Peer]\nPublicKey = {pb}\nAllowedIPs = 0.0.0.0/0, ::/0"
+        );
+        let b = format!(
+            "[Interface]\nPrivateKey = {kb}\nAddress = {B}\n\
+             [Peer]\nPublicKey = {pa}\nAllowedIPs = {A}/32, fd09::1/128\nEndpoint = 192.0.2.1:1"
+        );
+        let mut a = Peers::new(&config::parse(&a).unwrap()).unwrap();
+        let mut b = Peers::new(&config::parse(&b).unwrap()).unwrap();
+        let mut refused = 0;
+        // The loopback address, an address of A, and addresses that are
+        // the source of no packet.
+        for src in ["127.0.0.1", "127.9.9.9", A, "224.0.0.1", "255.255.255.255", "0.0.0.0"] {
+            let mut datagrams = sent(&mut b, &ip(src, A));
+            assert!(settle(&mut a, &mut b, &mut datagrams, 2).0.is_empty(), "{src}");
+            refused += 1;
+            assert_eq!(a.dropped, Dropped { unknown: 0, refused: 0, disallowed: refused }, "{src}");
+        }
+        // And an IPv4 address in the dress of an IPv6 address, which
+        // Ruby would take for the address of another peer.
+        for src in ["::1", "fd09::1", "ff02::1", "::", "::ffff:10.9.0.2", "::ffff:127.0.0.1"] {
+            let mut datagrams = sent(&mut b, &ip6(src, "fd09::1"));
+            assert!(settle(&mut a, &mut b, &mut datagrams, 2).0.is_empty(), "{src}");
+            refused += 1;
+            assert_eq!(a.dropped.disallowed, refused, "{src}");
+        }
+        for packet in [ip(B, A), ip("192.0.2.7", A), ip6("fd09::2", "fd09::1"), ip6("2001:db8::7", "fd09::1")] {
+            let mut datagrams = sent(&mut b, &packet);
+            assert_eq!(settle(&mut a, &mut b, &mut datagrams, 2).0, [packet]);
+        }
     }
 
     #[test]
