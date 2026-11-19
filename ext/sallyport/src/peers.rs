@@ -84,6 +84,13 @@ impl Peers {
             // boringtun puts the index in the high 24 bits of each session
             // index that it gives this peer, and peer_of reads it back.
             let (theirs, limiter) = (PublicKey::from(p.public), Some(limiter.clone()));
+            // A few public keys give the same secret with every private
+            // key, which is all zeros. Anyone could work out the keys of a
+            // session with such a peer. boringtun does not look for them,
+            // and the kernel's WireGuard fails every handshake with one.
+            if !secret.diffie_hellman(&theirs).was_contributory() {
+                return Err("a peer has a PublicKey that makes no secret".into());
+            }
             let tunn = Tunn::new(secret.clone(), theirs, p.psk, p.keepalive, i as u32, limiter);
             let (allowed, keepalive) = (p.allowed.clone(), p.keepalive.is_some());
             list.push(Peer { tunn, public: p.public, allowed, endpoint: p.endpoint, keepalive });
@@ -645,6 +652,25 @@ mod tests {
         assert_eq!(route("192.0.2.1"), None);
         assert!(peers.reaches(&"10.1.1.1".parse().unwrap()));
         assert!(!peers.reaches(&"11.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_peer_may_not_have_a_key_that_makes_no_secret() {
+        // Two of the points of low order on the curve, as a key gives
+        // them.
+        let mut one = [0; 32];
+        one[0] = 1;
+        for low in [[0; 32], one] {
+            let conf = format!(
+                "[Interface]\nPrivateKey = {}\nAddress = 10.9.0.1\n[Peer]\nPublicKey = {}\nAllowedIPs = 10.9.0.2/32",
+                key(1).0,
+                keys::encode(&low)
+            );
+            assert_eq!(
+                Peers::new(&config::parse(&conf).unwrap()).err().unwrap(),
+                "a peer has a PublicKey that makes no secret"
+            );
+        }
     }
 
     #[test]

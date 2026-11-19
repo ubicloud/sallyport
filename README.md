@@ -313,3 +313,8 @@ boringtun 0.7.1:
   no key exchange on a message that fails them. boringtun then checks them
   again, because its function for a message that is already checked is
   not public.
+- It does not look at what a key exchange gives. A few public keys give
+  zeros with every private key, and a session with such a peer would have
+  keys that anyone can make. The tunnel refuses a configuration that has
+  one as a peer's key
+  (`a_peer_may_not_have_a_key_that_makes_no_secret`).
