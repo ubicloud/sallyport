@@ -54,10 +54,18 @@ module Sallyport
       raise ArgumentError, "a tunnel takes a configuration or its parts, and not both" if config && !parts.empty?
 
       config ||= self.class.config(**parts)
-      # The library takes C strings, and one would end at a NUL.
-      [config, debug || ""].each do |text|
+      # The library reads the two texts while other threads run. It is
+      # given copies that no other thread has. If a thread changed the
+      # caller's String meanwhile, the library would read memory that the
+      # String had let go of.
+      config, debug = [config, debug || ""].map do |text|
         raise TypeError, "the configuration is not a String" unless text.is_a?(String)
+
+        text = text.dup
+        # The library takes C strings, and one would end at a NUL.
         raise ArgumentError, "the configuration holds a NUL" if text.include?("\0")
+
+        text
       end
 
       reason = Fiddle::Pointer.malloc(256, Fiddle::RUBY_FREE)

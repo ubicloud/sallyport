@@ -24,6 +24,28 @@ class TestTunnel < Minitest::Test
     t.close
   end
 
+  # The library reads the configuration while other threads run. Eight
+  # megabytes of comments take it long enough for another thread to clear
+  # the caller's String meanwhile. If the library read that String, the
+  # test would end in a segmentation fault.
+  def test_a_configuration_may_change_while_the_tunnel_is_made
+    key, = keypair
+    text = Sallyport::Tunnel.config(private_key: key, addresses: ["10.9.0.1"]) + ("# a line that says nothing\n" * 300_000)
+    5.times do
+      # A copy would share the memory of the String that it was made
+      # from. This one has its own.
+      conf = String.new(capacity: text.bytesize) << text
+      wiper = Thread.new do
+        sleep 0.001
+        conf.clear
+      end
+      t = Sallyport::Tunnel.new(conf)
+      wiper.join
+      assert_operator t.listen_port, :>, 0
+      t.close
+    end
+  end
+
   def test_a_tunnel_tells_its_port
     key, = keypair
     port = free_udp_port
