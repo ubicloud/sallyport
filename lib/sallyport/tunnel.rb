@@ -98,8 +98,8 @@ module Sallyport
     # These are the lines of the model "wake" for Ruby's part. See
     # ext/sallyport/src/engine.rs for the model.
     #
-    # TLA-wake> \* Tunnel#connect and Tunnel#listen call the library under the
-    # TLA-wake> \* tunnel's lock, and only while the tunnel has its handle.
+    # TLA-wake> \* Tunnel#connect, Tunnel#listen and Tunnel#dump call the library
+    # TLA-wake> \* under the tunnel's lock, and only while the tunnel has its handle.
     # TLA-wake> CEnter(c) == /\ s.cpc[c] = "idle" /\ s.mon = "none" /\ s.held
     # TLA-wake>              /\ s' = [s EXCEPT !.mon = c, !.cpc[c] = "push"]
     # TLA-wake> CReturn(c) == /\ s.cpc[c] = "return" /\ s' = [s EXCEPT !.mon = "none", !.cpc[c] = "done"]
@@ -216,25 +216,28 @@ module Sallyport
       count.negative? ? failed : count
     end
 
-    # TLA-wake> \* Tunnel#dump holds the lock for as long as it waits.
-    # TLA-wake> AEnter == /\ s.apc = "idle" /\ s.mon = "none" /\ s.held
-    # TLA-wake>           /\ s' = [s EXCEPT !.mon = "asker", !.apc = "ask"]
-    # TLA-wake> AReturn == /\ s.apc = "return" /\ s' = [s EXCEPT !.mon = "none", !.apc = "done"]
-
     # Returns a description of the tunnel for a person to read: what it
     # has counted, a line for each peer, and two lines for each connection,
     # of which the second is the TCP socket as smoltcp prints it. It is
     # there to show why something does not move, and its form may change.
     def dump
-      size = 1 << 16
-      loop do
-        text = Fiddle::Pointer.malloc(size, Fiddle::RUBY_FREE)
-        need = synchronize { Native::DUMP.call(handle, text, size) }
-        failed if need.zero?
-        return text.to_s.force_encoding(Encoding::UTF_8) if need <= size
+      # The wait for the lock can be interrupted. From the call until the
+      # descriptor has an owner, an exception from another thread waits.
+      io = synchronize do
+        Thread.handle_interrupt(Object => :never) do
+          fd, code = Native::DUMP.call(handle), Fiddle.last_error
+          raise SystemCallError.new("a description of the tunnel", code) if fd.negative?
 
-        size = need
+          IO.for_fd(fd)
+        end
       end
+      # The tunnel's thread writes the description and ends the stream. A
+      # thread that fails first writes nothing.
+      text = io.read
+      failed if text.empty?
+      text.force_encoding(Encoding::UTF_8)
+    ensure
+      io&.close
     end
 
     # Returns a Peer for each peer, in the order of the configuration.

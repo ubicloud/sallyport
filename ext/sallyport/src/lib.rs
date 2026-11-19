@@ -18,7 +18,7 @@ mod sock;
 mod sys;
 mod tcp;
 
-use engine::{Cmd, Dump, Engine, Knobs, Shared};
+use engine::{Cmd, Engine, Knobs, Shared};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::IpAddr;
 use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
@@ -26,7 +26,6 @@ use std::panic::catch_unwind;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 pub struct Handle {
     shared: Arc<Shared>,
@@ -248,46 +247,25 @@ pub unsafe extern "C" fn sp_connections(h: *mut c_void) -> isize {
     h.shared.connections.load(Ordering::Relaxed) as isize
 }
 
-// TLA-wake> \* sp_dump asks under the lock on `dump`, and wakes the thread.
-// TLA-wake> AAsk == /\ s.apc = "ask" /\ s.dlock = "none"
-// TLA-wake>         /\ s' = [s EXCEPT !.dlock = "asker", !.dump = "asked", !.apc = "wake"]
-// TLA-wake> AWake == /\ s.apc = "wake" /\ s' = Woke([s EXCEPT !.apc = "check"])
-// TLA-wake> \* It waits until it is answered or the thread has ended. It holds the
-// TLA-wake> \* lock while it looks, and lets it go only as it begins to wait.
-// TLA-wake> ACheck == /\ s.apc = "check"
-// TLA-wake>           /\ s' = [s EXCEPT !.apc = IF s.dump = "done" \/ s.dead THEN "take" ELSE "sleep"]
-// TLA-wake> ASleep == /\ s.apc = "sleep" /\ s' = [s EXCEPT !.dlock = "none", !.apc = "wait"]
-// TLA-wake> AWoken == /\ s.apc = "woken" /\ s.dlock = "none"
-// TLA-wake>           /\ s' = [s EXCEPT !.dlock = "asker", !.apc = "check"]
-// TLA-wake> ATake == /\ s.apc = "take"
-// TLA-wake>          /\ s' = [s EXCEPT !.dump = "none", !.dlock = "none", !.apc = "return"]
-/// Writes a description of the tunnel into `buf`, for a person to read:
-/// what the tunnel has counted, then a line for each peer as sp_stats
-/// gives it, then two lines for each connection. The tunnel's thread
-/// writes the description at the next turn of its loop, and the call
-/// waits for that. Returns how many bytes the whole of it needs, as
-/// sp_stats does, or 0 if the thread has ended or did not answer within
-/// a second.
+/// Asks the tunnel's thread for a description of the tunnel, for a
+/// person to read, and returns a descriptor for it at once. The thread
+/// writes the description on the descriptor from the next turn of its
+/// loop: what the tunnel has counted, then a line for each peer as
+/// sp_stats gives it, then two lines for each connection. The stream then
+/// ends. A stream that ends with nothing in it is that of a thread which
+/// ended before it could answer.
+///
+/// Returns -1 and sets errno if nothing was begun, as sp_connect does.
 ///
 /// # Safety
-/// `h` came from sp_open, and `buf` has room for `len` bytes.
+/// `h` came from sp_open.
 #[no_mangle]
-pub unsafe extern "C" fn sp_dump(h: *mut c_void, buf: *mut c_char, len: usize) -> usize {
+pub unsafe extern "C" fn sp_dump(h: *mut c_void) -> c_int {
     let h = &*h.cast::<Handle>();
-    let mut dump = h.shared.dump.lock().unwrap_or_else(|e| e.into_inner());
-    *dump = Dump::Asked;
-    h.shared.wake();
-    let ended = || h.shared.dead.load(Ordering::Acquire);
-    let unanswered = |dump: &mut Dump| !matches!(dump, Dump::Done(_)) && !ended();
-    let waited = h.shared.dumped.wait_timeout_while(dump, Duration::from_secs(1), unanswered);
-    let mut dump = waited.unwrap_or_else(|e| e.into_inner()).0;
-    match std::mem::take(&mut *dump) {
-        Dump::Done(text) => {
-            put(buf, len, &text);
-            text.len() + 1
-        }
-        _ => 0,
-    }
+    h.pair(libc::SOCK_STREAM, |fd| Cmd::Describe { fd }).unwrap_or_else(|errno| {
+        *libc::__errno_location() = errno;
+        -1
+    })
 }
 
 /// Returns the tunnel's UDP port.

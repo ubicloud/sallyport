@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// boringtun's timers run this often.
@@ -23,20 +23,20 @@ const UDP_BATCH: usize = 1024;
 
 /// A command is what a call into the library asks of a tunnel's thread.
 /// It carries our end of a socket pair, which is closed if the command is
-/// dropped.
+/// dropped. The caller has the other end, and the thread answers on the
+/// pair.
 pub enum Cmd {
     Connect { fd: OwnedFd, addr: IpAddr, port: u16 },
     Listen { fd: OwnedFd, port: u16, backlog: usize },
+    Describe { fd: OwnedFd },
 }
 
-/// A caller asks the thread to describe the tunnel, and the thread
-/// answers at the next turn of its loop.
-#[derive(Default)]
-pub enum Dump {
-    #[default]
-    None,
-    Asked,
-    Done(String),
+/// A description of the tunnel that a caller asked for, and how much of
+/// it the caller's pair has taken.
+struct Telling {
+    fd: OwnedFd,
+    text: Vec<u8>,
+    sent: usize,
 }
 
 // The model "wake" is of what a tunnel's thread shares with the threads
@@ -47,7 +47,7 @@ pub enum Dump {
 // them.
 //
 // TLA-wake@0> EXTENDS Naturals
-// TLA-wake@0> CONSTANTS Callers,   \* the Ruby threads that each begin one connection
+// TLA-wake@0> CONSTANTS Callers,   \* the Ruby threads that each make one call
 // TLA-wake@0>           PipeCap,   \* how many bytes the pipe holds
 // TLA-wake@0>           MayPanic,  \* the tunnel's thread may panic at any point
 // TLA-wake@0>           Ticks,     \* poll also returns for a timer
@@ -60,12 +60,9 @@ pub enum Dump {
 // TLA-wake@0>              pipe  |-> 0,       \* how many bytes are in the pipe
 // TLA-wake@0>              rOpen |-> TRUE,    \* the read end of the pipe is open
 // TLA-wake@0>              wOpen |-> TRUE,    \* the write end of the pipe is open
-// TLA-wake@0>              dump  |-> "none",  \* Shared.dump: "none", "asked" or "done"
-// TLA-wake@0>              dlock |-> "none",  \* who holds the lock on Shared.dump
 // TLA-wake@0>              epc   |-> "top",   \* where the tunnel's thread is
 // TLA-wake@0>              fd    |-> [c \in Callers |-> "none"],  \* who has the descriptor that each caller made
 // TLA-wake@0>              cpc   |-> [c \in Callers |-> "idle"],  \* where each caller is
-// TLA-wake@0>              apc   |-> "idle",  \* where the thread that asks for a description is
 // TLA-wake@0>              kpc   |-> "idle",  \* where the thread that closes the tunnel is
 // TLA-wake@0>              mon   |-> "none",  \* who holds the lock of the Ruby Tunnel
 // TLA-wake@0>              held  |-> TRUE,    \* the Tunnel has the handle
@@ -88,9 +85,6 @@ pub struct Shared {
     pub stats: Mutex<String>,
     /// How many connections the stack had when the loop last turned.
     pub connections: AtomicUsize,
-    /// A caller waits on `dumped` while `dump` is asked for.
-    pub dump: Mutex<Dump>,
-    pub dumped: Condvar,
 }
 
 // TLA-wake@0> \* Shared::wake writes a byte into the pipe and does not wait. A pipe
@@ -150,6 +144,8 @@ pub struct Engine {
     udp_v6: bool,
     peers: Peers,
     stack: Stack,
+    /// The descriptions that are not yet written whole.
+    telling: Vec<Telling>,
     next_tick: Instant,
     buf: Vec<u8>,
     /// These count the datagrams that have arrived, and the packets that
@@ -185,8 +181,6 @@ impl Engine {
             linger: AtomicU32::new(0),
             stats: Mutex::default(),
             connections: AtomicUsize::new(0),
-            dump: Mutex::default(),
-            dumped: Condvar::new(),
         });
         let engine = Engine {
             shared: shared.clone(),
@@ -194,6 +188,7 @@ impl Engine {
             udp_v6,
             peers,
             stack: Stack::new(cfg, knobs.sack),
+            telling: Vec::new(),
             next_tick: Instant::now(),
             buf: vec![0; 65536],
             datagrams: 0,
@@ -218,8 +213,8 @@ impl Engine {
     // TLA-wake> ETake == /\ s.epc = "take"
     // TLA-wake>          /\ s' = [s EXCEPT !.fd = [c \in Callers |-> IF c \in s.cmds THEN "taken" ELSE s.fd[c]],
     // TLA-wake>                            !.cmds = {}, !.epc = "handle"]
-    // TLA-wake> \* It then does each. The descriptor of a command that is done is in the
-    // TLA-wake> \* stack, or it is closed because the command was refused.
+    // TLA-wake> \* It then does each. The thread keeps the descriptor of a command that
+    // TLA-wake> \* is done, for as long as it has more to send on it, or closes it.
     // TLA-wake> EHandle == /\ s.epc = "handle"
     // TLA-wake>            /\ IF \E c \in Callers : s.fd[c] = "taken"
     // TLA-wake>                 THEN \E c \in Callers, to \in {"engine", "closed"} :
@@ -233,8 +228,29 @@ impl Engine {
                 Cmd::Connect { fd, addr, port } if self.peers.reaches(&addr) => self.stack.connect(fd, addr, port),
                 Cmd::Connect { fd, .. } => Stack::refuse(fd, status::NO_ROUTE),
                 Cmd::Listen { fd, port, backlog } => self.stack.listen(fd, port, backlog),
+                Cmd::Describe { fd } => {
+                    let text = self.describe().into_bytes();
+                    self.telling.push(Telling { fd, text, sent: 0 });
+                }
             }
         }
+    }
+
+    /// Writes as much of each description as its pair takes now. A
+    /// description that is written whole is dropped, which ends the
+    /// stream that the caller reads. So is one whose caller has closed
+    /// its end.
+    fn tell(&mut self) {
+        self.telling.retain_mut(|telling| {
+            while telling.sent < telling.text.len() {
+                match sys::send(telling.fd.as_raw_fd(), &telling.text[telling.sent..]) {
+                    n if n > 0 => telling.sent += n as usize,
+                    0 | sys::AGAIN => return true,
+                    _ => return false,
+                }
+            }
+            false
+        });
     }
 
     /// Takes datagrams from the UDP socket, and gives the stack the IP
@@ -288,14 +304,9 @@ impl Engine {
         self.finish(&mut fds);
     }
 
-    // TLA-wake> \* A turn does the thread's work, which the model leaves out. It then
-    // TLA-wake> \* answers a caller that asked for a description, and waits in poll.
-    // TLA-wake> \* The thread holds the lock on `dump` while it answers and while it
-    // TLA-wake> \* notifies.
-    // TLA-wake> ETurn == /\ s.epc = "turn" /\ s.dlock = "none"
-    // TLA-wake>          /\ s' = [s EXCEPT !.dump = IF @ = "asked" THEN "done" ELSE @,
-    // TLA-wake>                            !.apc = IF s.dump = "asked" /\ @ = "wait" THEN "woken" ELSE @,
-    // TLA-wake>                            !.epc = IF Fault = "late drain" THEN "drain" ELSE "poll"]
+    // TLA-wake> \* A turn does the thread's work, which the model leaves out, and then
+    // TLA-wake> \* waits in poll.
+    // TLA-wake> ETurn == s.epc = "turn" /\ s' = [s EXCEPT !.epc = IF Fault = "late drain" THEN "drain" ELSE "poll"]
     // TLA-wake> \* poll returns when the pipe holds a byte, and the pipe is drained only
     // TLA-wake> \* then. The drain comes before the commands are next taken. So a byte
     // TLA-wake> \* that it takes never stood for a command that is still to be seen.
@@ -315,7 +326,7 @@ impl Engine {
         self.stack.turn();
         self.flush();
         self.shared.connections.store(self.stack.connections(), Ordering::Relaxed);
-        self.dump();
+        self.tell();
 
         let mut wait = self.next_tick.saturating_duration_since(Instant::now()).min(most);
         if let Some(delay) = self.stack.poll_delay() {
@@ -334,6 +345,13 @@ impl Engine {
             revents: 0,
         }));
         self.stack.poll_fds(fds);
+        // A description waits for room in its pair, or for its caller to
+        // close the other end.
+        fds.extend(self.telling.iter().map(|telling| libc::pollfd {
+            fd: telling.fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        }));
         sys::poll(fds, wait);
         if fds[0].revents != 0 {
             sys::drain(self.shared.wake_r.as_raw_fd());
@@ -365,14 +383,9 @@ impl Engine {
         }
     }
 
-    /// Describes the tunnel for the caller that asked, if one did. The
-    /// description is for a person who wants to know why something does
-    /// not move.
-    fn dump(&self) {
-        let mut dump = self.shared.dump.lock().unwrap_or_else(|e| e.into_inner());
-        if !matches!(*dump, Dump::Asked) {
-            return;
-        }
+    /// Describes the tunnel for a person who wants to know why something
+    /// does not move.
+    fn describe(&self) -> String {
         assert!(!self.knobs.fail, "the tunnel's thread was told to fail");
         let Dropped { unknown, refused, disallowed } = self.peers.dropped;
         let mut text = format!(
@@ -390,8 +403,7 @@ impl Engine {
                 text += "\n";
             }
         }
-        *dump = Dump::Done(text);
-        self.shared.dumped.notify_all();
+        text
     }
 
     // TLA-wake> \* A tunnel that is told to stop takes no more commands. It then serves
@@ -439,16 +451,10 @@ impl Engine {
 // TLA-wake>            /\ s' = [s EXCEPT !.fd = [c \in Callers |-> IF s.fd[c] = "taken" /\ Fault # "closed by hand"
 // TLA-wake>                                                         THEN "closed" ELSE s.fd[c]],
 // TLA-wake>                              !.epc = "drop"]
-// TLA-wake> \* Drop for Engine refuses commands, whatever ended the thread. It then
-// TLA-wake> \* notifies a caller that waits for a description, and it takes the lock
-// TLA-wake> \* on `dump` first. A caller holds that lock from when it sees `dead`
-// TLA-wake> \* false until it begins to wait. So the notify cannot come before the
-// TLA-wake> \* caller waits for it.
-// TLA-wake> EDrop == /\ s.epc = "drop" /\ s' = [Refused(s) EXCEPT !.epc = "notify"]
-// TLA-wake> ENotify == /\ s.epc = "notify" /\ (s.dlock = "none" \/ Fault = "unlocked notify")
-// TLA-wake>            /\ s' = [s EXCEPT !.apc = IF @ = "wait" THEN "woken" ELSE @, !.epc = "fields"]
-// TLA-wake> \* The engine's fields are dropped last, and the descriptors of the stack
-// TLA-wake> \* with them. The pipe is not among them: the handle is the last to hold
+// TLA-wake> \* Drop for Engine refuses commands, whatever ended the thread.
+// TLA-wake> EDrop == /\ s.epc = "drop" /\ s' = [Refused(s) EXCEPT !.epc = "fields"]
+// TLA-wake> \* The engine's fields are dropped last, and the descriptors that the
+// TLA-wake> \* thread keeps with them. The pipe is not among them: the handle is the last to hold
 // TLA-wake> \* it. Suppose that the thread closed its end of the pipe here. A caller
 // TLA-wake> \* may have queued a command and not yet written its byte. It would then
 // TLA-wake> \* write to a pipe that nothing reads, which is SIGPIPE.
@@ -462,28 +468,23 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.refuse_commands();
-        // A caller that waits for a description will get none.
-        drop(self.shared.dump.lock());
-        self.shared.dumped.notify_all();
     }
 }
 
 // TLA-wake@90> Engine == \/ ETop \/ ETake \/ EHandle \/ ETurn \/ EPoll \/ EDrain
-// TLA-wake@90>           \/ ERefuse \/ ELinger \/ EUnwind \/ EDrop \/ ENotify \/ EFields
+// TLA-wake@90>           \/ ERefuse \/ ELinger \/ EUnwind \/ EDrop \/ EFields
 // TLA-wake@90> Caller(c) == CPush(c) \/ CWake(c) \/ CReturn(c)
-// TLA-wake@90> Asker == AAsk \/ AWake \/ ACheck \/ ASleep \/ AWoken \/ ATake \/ AReturn
 // TLA-wake@90> Closer == KPop \/ KStop \/ KWake \/ KJoin \/ KFree \/ KReturn
-// TLA-wake@90> Next == \/ Engine \/ EPanic \/ KEnter \/ Closer \/ AEnter \/ Asker
+// TLA-wake@90> Next == \/ Engine \/ EPanic \/ KEnter \/ Closer
 // TLA-wake@90>         \/ \E c \in Callers : CEnter(c) \/ Caller(c)
 // TLA-wake@90> \* Every thread runs if it can. Nobody has to call, to close or to panic.
-// TLA-wake@90> Spec == /\ Init /\ [][Next]_s /\ WF_s(Engine) /\ WF_s(Closer) /\ WF_s(Asker)
+// TLA-wake@90> Spec == /\ Init /\ [][Next]_s /\ WF_s(Engine) /\ WF_s(Closer)
 // TLA-wake@90>         /\ \A c \in Callers : WF_s(Caller(c))
 // TLA-wake@90>
 // TLA-wake@90> \* No thread is in a call on a handle that has been freed.
-// TLA-wake@90> NoUseAfterFree == s.freed => /\ \A c \in Callers : s.cpc[c] \notin {"push", "wake"}
-// TLA-wake@90>                              /\ s.apc \in {"idle", "return", "done"}
+// TLA-wake@90> NoUseAfterFree == s.freed => \A c \in Callers : s.cpc[c] \notin {"push", "wake"}
 // TLA-wake@90> \* Both ends of the pipe are open when a thread is about to write to it.
-// TLA-wake@90> Waking == {s.cpc[c] : c \in Callers} \cup {s.apc, s.kpc}
+// TLA-wake@90> Waking == {s.cpc[c] : c \in Callers} \cup {s.kpc}
 // TLA-wake@90> PipeIsThere == "wake" \in Waking => s.rOpen /\ s.wOpen
 // TLA-wake@90> \* Once the thread has ended, it holds no descriptor and none waits for it.
 // TLA-wake@90> NoLeak == s.epc = "done" => \A c \in Callers : s.fd[c] \in {"none", "closed"}
@@ -501,10 +502,6 @@ impl Drop for Engine {
 // TLA-wake@90> \* A byte in the pipe is drained unless the thread is ending. So the
 // TLA-wake@90> \* thread does not turn for ever for one byte.
 // TLA-wake@90> Drained == s.pipe > 0 ~> s.pipe = 0 \/ s.epc \notin {"top", "take", "handle", "turn", "poll", "drain"}
-// TLA-wake@90> \* A caller that asks for a description returns. The code also has a
-// TLA-wake@90> \* timeout of a second, which the model leaves out to show that no
-// TLA-wake@90> \* caller needs it.
-// TLA-wake@90> Answered == s.apc = "ask" ~> s.apc = "done"
 //
 // The model is checked without the timer, to show that no wake depends on
 // it, and with a panic possible at any point.
@@ -516,7 +513,7 @@ impl Drop for Engine {
 // TLA-wake.cfg>   Ticks = FALSE
 // TLA-wake.cfg>   Fault = "none"
 // TLA-wake.cfg> INVARIANTS NoUseAfterFree PipeIsThere NoLeak FreedLast TakenOnce
-// TLA-wake.cfg> PROPERTIES Taken Stops Released Drained Answered
+// TLA-wake.cfg> PROPERTIES Taken Stops Released Drained
 // TLA-wake.cfg> CHECK_DEADLOCK FALSE
 //
 // It is checked with the timer too, and with a third caller.
@@ -537,10 +534,6 @@ impl Drop for Engine {
 // The pipe is drained after the commands are taken:
 //
 // TLA-wake.cfg/late-drain!Taken> Fault = "late drain"
-//
-// Drop for Engine notifies without the lock:
-//
-// TLA-wake.cfg/unlocked-notify!Answered> Fault = "unlocked notify"
 //
 // Tunnel#close takes no lock:
 //

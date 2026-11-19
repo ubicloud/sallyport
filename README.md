@@ -60,12 +60,13 @@ descriptor that it selects on and gives to OpenSSL. The thread holds the
 other end, and moves bytes between it and the TCP socket. Both have
 bounded buffers, so each direction has flow control from end to end.
 
-No call into the library waits for a connection to be made. `connect` gets
-a descriptor at once, and the outcome arrives on it as its first byte. So
-Ruby waits in its own I/O, where a timeout or an interrupt can reach it. A
-listener is a socket pair too, of the kind that keeps messages apart. Each
-connection arrives on it as a message that carries the connection's
-descriptor.
+No call into the library waits for the tunnel's thread, but the call
+that closes the tunnel. `connect` gets a descriptor at once, and the
+outcome arrives on it as its first byte. So Ruby waits in its own I/O,
+where a timeout or an interrupt can reach it. A listener is a socket pair
+too, of the kind that keeps messages apart. Each connection arrives on it
+as a message that carries the connection's descriptor. `dump` gets a
+descriptor as well, and reads the description from it.
 
 ## What it does not do
 

@@ -37,7 +37,7 @@ module Sallyport
     CONNECT = bind("sp_connect", [P, P, I], I)
     LISTEN = bind("sp_listen", [P, I, I], I)
     CONNECTIONS = bind("sp_connections", [P], S)
-    DUMP = bind("sp_dump", [P, P, Z], Z, waits: true)
+    DUMP = bind("sp_dump", [P], I)
     PORT = bind("sp_port", [P], I)
     STATS = bind("sp_stats", [P, P, Z], Z)
     PRIVATE_KEY = bind("sp_private_key", [P], I)

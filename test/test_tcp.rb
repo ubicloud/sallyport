@@ -196,6 +196,18 @@ class TestTCP < Minitest::Test
     refute_match(/the last TCP packets/, pair.first.dump)
   end
 
+  # A description can be longer than a socket pair holds. The tunnel's
+  # thread then writes it as the caller reads it.
+  def test_a_long_description_arrives_whole
+    a, b = pair(debug: "trace=100000")
+    client, server = connection(a, b)
+    data = Random.new(12).bytes(8 << 20)
+    assert_equal data.bytesize, transfer(client, server, data).bytesize
+    text = a.dump
+    assert_operator text.bytesize, :>, 300_000
+    assert_match(/\A +\d+\.\d{4} (in |out) \d+>\d+ \S+ seq \d+ ack \d+ win \d+ len \d+\n\z/, text.lines.last)
+  end
+
   # The setting has the thread panic when it is asked to describe the
   # tunnel, which a fault in the library might do at any time.
   def test_a_tunnel_whose_thread_has_failed
