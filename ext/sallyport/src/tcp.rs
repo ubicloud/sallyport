@@ -706,7 +706,8 @@ impl Stack {
     // TLA-conn> Orphan == /\ s.at = "idle" /\ ~s.closing /\ s.phase # "removed"
     // TLA-conn>           /\ s' = [s EXCEPT !.closing = TRUE, !.kick = TRUE,
     // TLA-conn>                             !.listens = @ /\ s.phase # "listening",
-    // TLA-conn>                             !.p = IF s.phase \in {"connecting", "open"} THEN P!Shut(@) ELSE @]
+    // TLA-conn>                             !.p = IF s.phase \in {"connecting", "open"} /\ Fault # "closes quietly"
+    // TLA-conn>                                   THEN P!Shut(@) ELSE @]
     /// Stops the listening, and leaves every connection as it would be if
     /// Ruby had closed its end. The tunnel is closing.
     pub fn orphan(&mut self) {
@@ -960,7 +961,7 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
     // TLA-conn>           THEN [t EXCEPT !.k = K!End(@)] ELSE t
     // TLA-conn> Onward(t) == [Fin(t) EXCEPT !.at = "give"]
     // TLA-conn> Take(t) ==
-    // TLA-conn>   IF ~t.p.done /\ t.k.up # "open" THEN Onward([t EXCEPT !.p = P!Stop(@)])
+    // TLA-conn>   IF ~t.p.done /\ t.k.up # "open" /\ Fault # "writes on" THEN Onward([t EXCEPT !.p = P!Stop(@)])
     // TLA-conn>   ELSE IF t.p.done \/ ~K!HasRoom(t.k) THEN Onward(t)
     // TLA-conn>   ELSE LET n == Min(t.p.fromRuby, K!Room(t.k))
     // TLA-conn>            u == [t EXCEPT !.p = P!Took(@, n), !.k = K!Filled(@, n)]
@@ -1023,7 +1024,7 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
     // TLA-conn>       v == [u EXCEPT !.wait = IF @ = "no" /\ acked THEN "yes" ELSE @]
     // TLA-conn>   IN  IF t.left = "no" /\ P!HungUp(t.p) /\ P!Unread(t.p) THEN Abort(t)
     // TLA-conn>       ELSE IF v.k.up = "ended" /\ ~v.k.down /\ (v.p.told \/ Fault = "early close") THEN Close(v)
-    // TLA-conn>       ELSE IF v.left # "no" /\ K!Holds(v.k) THEN Abort(v)
+    // TLA-conn>       ELSE IF v.left # "no" /\ K!Holds(v.k) /\ Fault # "keeps unread" THEN Abort(v)
     // TLA-conn>       ELSE IF v.k.up = "ended" /\ v.k.down /\ (v.closing \/ v.wait = "late") THEN Abort(v)
     // TLA-conn>       ELSE IF v.left = "late" /\ Fault # "no deadline" THEN Abort(v)
     // TLA-conn>       ELSE Rest(v)
@@ -1101,6 +1102,13 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 // TLA-conn@90> \* When poll returns for the descriptor, a pass changes something. So the
 // TLA-conn@90> \* loop does not spin on the descriptor.
 // TLA-conn@90> NoSpin == s.phase \in Live /\ s.at = "idle" /\ FdReady(s) => Pass(s) # s
+// TLA-conn@90> \* A connection that is cut does not rest while Ruby may write to it. A
+// TLA-conn@90> \* write by Ruby fails, as a write to a TCP socket does once it is reset.
+// TLA-conn@90> CutStops == Asleep(s) /\ s.phase = "open" /\ s.k.cut => s.p.fromShut
+// TLA-conn@90> \* Nor does a connection rest while Ruby has left and the socket holds
+// TLA-conn@90> \* bytes for it. The peer is reset for them, as a TCP socket of the kernel
+// TLA-conn@90> \* resets it when it is closed with bytes unread.
+// TLA-conn@90> NoneOrphaned == Asleep(s) /\ s.phase = "open" /\ s.left # "no" => ~K!Holds(s.k)
 // TLA-conn@90> \* An open connection is one whose handshake is over, and Ruby has been
 // TLA-conn@90> \* told so. Ruby is told of nothing else before the attempt is over, and
 // TLA-conn@90> \* is told once.
@@ -1164,7 +1172,7 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 // TLA-conn.cfg>   PairCap = 1
 // TLA-conn.cfg>   Fault = "none"
 // TLA-conn.cfg> INVARIANTS RemovedClean DeadEnds NoneWithheld FinIsBare
-// TLA-conn.cfg>   NoMissedWake NoSpin OpenIsGreeted SaidAtTheEnd
+// TLA-conn.cfg>   NoMissedWake NoSpin CutStops NoneOrphaned OpenIsGreeted SaidAtTheEnd
 // TLA-conn.cfg> PROPERTIES SaidOnce Kept DeadGoes SilenceEnds LetGo NotBegun Answered ToRuby ToPeer
 // TLA-conn.cfg> CHECK_DEADLOCK FALSE
 //
@@ -1215,6 +1223,19 @@ fn carry(mut open: Open, s: &mut Socket, now: Duration, closing: bool) -> Fate {
 //
 // TLA-conn.cfg/reads-unasked!ToPeer> Fault = "reads unasked"
 // TLA-conn.cfg/writes-unasked!ToRuby> Fault = "writes unasked"
+//
+// A connection that the peer has reset goes on taking what Ruby writes:
+//
+// TLA-conn.cfg/writes-on!CutStops> Fault = "writes on"
+//
+// A connection keeps the bytes that the peer sends once Ruby has left:
+//
+// TLA-conn.cfg/keeps-unread!NoneOrphaned> Fault = "keeps unread"
+//
+// A tunnel that is closing leaves each pair as it is, and then resets
+// connections whose Ruby has not left:
+//
+// TLA-conn.cfg/closes-quietly!Kept> Fault = "closes quietly"
 //
 // A connection that Ruby has left has no deadline but the one in
 // FIN-WAIT-2:
