@@ -110,6 +110,20 @@ pub enum Hangup {
     Unread,
 }
 
+/// carry makes these calls on a pair, and no others. Pair has them for the
+/// kernel's socket pair. A test in conn.rs has them for a pair that is the
+/// record of the module "pair", and so holds carry to the model.
+pub trait PairCalls {
+    fn read(&mut self, buf: &mut [u8]) -> Took;
+    fn done(&self) -> bool;
+    fn stop(&mut self);
+    fn write(&mut self, buf: &[u8]) -> Gave;
+    fn deaf(&self) -> bool;
+    fn end(&mut self);
+    fn told(&self) -> bool;
+    fn hangup(&self) -> Hangup;
+}
+
 /// Our end of the pair, and what it has said so far.
 pub struct Pair {
     fd: OwnedFd,
@@ -118,11 +132,7 @@ pub struct Pair {
     told: bool,
 }
 
-impl Pair {
-    pub fn new(fd: OwnedFd) -> Pair {
-        Pair { fd, done: false, deaf: false, told: false }
-    }
-
+impl PairCalls for Pair {
     // TLA-pair> \* Pair::read says one of these. It tells once of bytes that Ruby left
     // TLA-pair> \* unread. Took is the pair after a read that took n bytes.
     // TLA-pair> Read(p) == IF p.fromRuby > 0 THEN "bytes" ELSE IF p.err THEN "reset"
@@ -134,7 +144,7 @@ impl Pair {
     /// closed its end. After that it gives the end, if Ruby has closed its
     /// end or shut down its writing, or if we have shut down our reading
     /// (`a_read_gives_the_bytes_and_then_says_why_there_are_no_more`).
-    pub fn read(&mut self, buf: &mut [u8]) -> Took {
+    fn read(&mut self, buf: &mut [u8]) -> Took {
         match sys::read(self.fd.as_raw_fd(), buf) {
             n if n > 0 => Took::Bytes(n as usize),
             0 => {
@@ -148,7 +158,7 @@ impl Pair {
 
     /// Says whether no more comes from the pair: a read has given the
     /// end, or `stop` has shut down our reading.
-    pub fn done(&self) -> bool {
+    fn done(&self) -> bool {
         self.done
     }
 
@@ -157,7 +167,7 @@ impl Pair {
     /// Ends what Ruby may write: a write by Ruby fails from now on. Ruby
     /// can still read what it is given
     /// (`a_pair_whose_reading_we_stop_refuses_what_ruby_writes`).
-    pub fn stop(&mut self) {
+    fn stop(&mut self) {
         sys::shutdown(self.fd.as_raw_fd(), libc::SHUT_RD);
         self.done = true;
     }
@@ -174,7 +184,7 @@ impl Pair {
     /// its end, the pair refuses them a moment before poll reports the
     /// hangup: Linux shuts down the end that closes before it tells the
     /// other. No test can hold that moment.
-    pub fn write(&mut self, buf: &[u8]) -> Gave {
+    fn write(&mut self, buf: &[u8]) -> Gave {
         match sys::send(self.fd.as_raw_fd(), buf) {
             n if n > 0 => Gave::Bytes(n as usize),
             0 | sys::AGAIN => Gave::Full,
@@ -186,7 +196,7 @@ impl Pair {
     }
 
     /// Says whether the pair has refused a write.
-    pub fn deaf(&self) -> bool {
+    fn deaf(&self) -> bool {
         self.deaf
     }
 
@@ -194,25 +204,14 @@ impl Pair {
     // TLA-pair> End(p) == [p EXCEPT !.forShut = TRUE, !.told = TRUE]
     /// Ends what Ruby reads, after the bytes that were written already
     /// (`ruby_reads_the_end_after_what_it_was_given`).
-    pub fn end(&mut self) {
+    fn end(&mut self) {
         sys::shutdown(self.fd.as_raw_fd(), libc::SHUT_WR);
         self.told = true;
     }
 
     /// Says whether `end` has ended what Ruby reads.
-    pub fn told(&self) -> bool {
+    fn told(&self) -> bool {
         self.told
-    }
-
-    // TLA-pair> \* Pair::shut
-    // TLA-pair> Shut(p) == [p EXCEPT !.fromShut = TRUE, !.forShut = TRUE]
-    /// Shuts our end down both ways. To our end, the pair is then what a
-    /// pair is whose other end Ruby has closed: a read gives what Ruby had
-    /// written and then the end, a write is refused, and poll reports a
-    /// hangup. Ruby reads what it was given and then the end, and a write
-    /// by Ruby fails (`a_pair_that_we_shut_down_is_as_one_that_ruby_closed`).
-    pub fn shut(&self) {
-        sys::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR);
     }
 
     // TLA-pair> \* Pair::hangup. poll reports a hangup when no more can go either way,
@@ -226,12 +225,29 @@ impl Pair {
     /// (`poll_reports_a_hangup_when_no_more_can_go_either_way`). It tells
     /// of bytes that Ruby left unread when it closed, until a read has
     /// told of them (`a_read_gives_the_bytes_and_then_says_why_there_are_no_more`).
-    pub fn hangup(&self) -> Hangup {
+    fn hangup(&self) -> Hangup {
         match sys::revents(self.fd.as_raw_fd(), 0) {
             r if r & libc::POLLERR != 0 => Hangup::Unread,
             r if r & libc::POLLHUP != 0 => Hangup::Yes,
             _ => Hangup::No,
         }
+    }
+}
+
+impl Pair {
+    pub fn new(fd: OwnedFd) -> Pair {
+        Pair { fd, done: false, deaf: false, told: false }
+    }
+
+    // TLA-pair> \* Pair::shut
+    // TLA-pair> Shut(p) == [p EXCEPT !.fromShut = TRUE, !.forShut = TRUE]
+    /// Shuts our end down both ways. To our end, the pair is then what a
+    /// pair is whose other end Ruby has closed: a read gives what Ruby had
+    /// written and then the end, a write is refused, and poll reports a
+    /// hangup. Ruby reads what it was given and then the end, and a write
+    /// by Ruby fails (`a_pair_that_we_shut_down_is_as_one_that_ruby_closed`).
+    pub fn shut(&self) {
+        sys::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR);
     }
 
     /// Sends the status that is the first byte of a connection that Ruby

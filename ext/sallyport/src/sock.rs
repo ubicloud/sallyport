@@ -144,6 +144,20 @@ pub trait Moved {
     fn bytes(&self) -> usize;
 }
 
+/// carry makes these calls on a socket, and no others. Sock has them for
+/// smoltcp's socket. A test in conn.rs has them for a socket that is the
+/// record of the module "sock", and so holds carry to the model.
+pub trait SockCalls {
+    fn up(&self) -> Up;
+    fn down_open(&self) -> bool;
+    fn has_room(&self) -> bool;
+    fn fill<R: Moved>(&mut self, read: impl FnOnce(&mut [u8]) -> R) -> Option<R>;
+    fn all_acknowledged(&self) -> bool;
+    fn end(&mut self);
+    fn holds(&self) -> bool;
+    fn drain<R: Moved>(&mut self, write: impl FnOnce(&[u8]) -> R) -> Option<R>;
+}
+
 /// One connection's socket, with the bytes that were taken out of it for
 /// Ruby before smoltcp could clear them.
 pub struct Sock<'a> {
@@ -262,87 +276,6 @@ impl<'a> Sock<'a> {
         Sock { s, tail }
     }
 
-    /// Says how far the stream to the peer has come. It only goes on:
-    /// from open to ending when carry ends it, and to ended when the peer
-    /// acknowledges that or the connection is cut.
-    pub fn up(&self) -> Up {
-        match self.s.state() {
-            tcp::State::Established | tcp::State::CloseWait => Up::Open,
-            tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck => Up::Ending,
-            _ => Up::Ended,
-        }
-    }
-
-    /// Says whether the peer may still send. It may not once its FIN has
-    /// arrived, or once the connection is cut. The FIN is taken only
-    /// after every byte before it: Stack::receive gives smoltcp a FIN
-    /// apart from its data to make that so
-    /// (`a_fin_is_not_taken_with_a_segment_that_the_window_cut`).
-    pub fn down_open(&self) -> bool {
-        matches!(self.s.state(), tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2)
-    }
-
-    // TLA-sock> \* Sock::has_room and Sock::fill
-    // TLA-sock> HasRoom(k) == k.up = "open" /\ k.tx < TxCap
-    // TLA-sock> Room(k) == TxCap - k.tx
-    // TLA-sock> Filled(k, n) == [k EXCEPT !.tx = @ + n]
-    /// Says whether the socket has room for bytes from Ruby now.
-    pub fn has_room(&self) -> bool {
-        self.s.can_send()
-    }
-
-    /// Lets `read` put bytes for the peer into the socket's buffer, and
-    /// returns what `read` found. Returns nothing if the socket takes no
-    /// bytes, which carry rules out by asking for room first.
-    pub fn fill<R: Moved>(&mut self, read: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
-        let filled = |buf: &mut [u8]| {
-            let found = read(buf);
-            (found.bytes(), found)
-        };
-        self.s.send(filled).ok()
-    }
-
-    // TLA-sock> \* Sock::all_acknowledged and Sock::end
-    // TLA-sock> AllAcked(k) == k.tx = 0
-    // TLA-sock> End(k) == [k EXCEPT !.up = "ending"]
-    /// Says whether the peer has acknowledged all that the socket took.
-    pub fn all_acknowledged(&self) -> bool {
-        self.s.send_queue() == 0
-    }
-
-    /// Ends the stream to the peer. carry does this only when the peer
-    /// has acknowledged everything, because smoltcp does not send a FIN
-    /// well behind data that a shut window holds back
-    /// (`a_fin_does_not_ride_on_the_probe_of_a_shut_window`,
-    /// `a_fin_waits_for_a_peer_that_ended_first_to_take_the_data`).
-    pub fn end(&mut self) {
-        self.s.close();
-    }
-
-    // TLA-sock> \* Sock::holds and Sock::drain
-    // TLA-sock> Holds(k) == k.rx > 0
-    // TLA-sock> Drained(k, n) == [k EXCEPT !.rx = @ - n]
-    /// Says whether the socket holds bytes for Ruby.
-    pub fn holds(&self) -> bool {
-        !self.tail.is_empty() || self.s.can_recv()
-    }
-
-    /// Lets `write` take bytes for Ruby, the oldest first, and returns
-    /// what `write` found. Returns nothing if the socket holds no bytes,
-    /// which carry rules out by asking first.
-    pub fn drain<R: Moved>(&mut self, write: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        if !self.tail.is_empty() {
-            let found = write(self.tail.as_slices().0);
-            self.tail.drain(..found.bytes());
-            return Some(found);
-        }
-        let drained = |buf: &mut [u8]| {
-            let found = write(buf);
-            (found.bytes(), found)
-        };
-        self.s.recv(drained).ok()
-    }
-
     // TLA-sock> \* Sock::opening
     // TLA-sock> Opening(k) == IF k.pending THEN "pending" ELSE IF k.cut THEN "failed" ELSE "done"
     /// Says how the handshake of a socket stands. A socket that listens
@@ -372,5 +305,88 @@ impl<'a> Sock<'a> {
     /// bytes from Ruby, and whether it holds bytes for Ruby.
     pub fn asks(s: &Socket, tail: &VecDeque<u8>) -> (bool, bool) {
         (s.can_send(), s.can_recv() || !tail.is_empty())
+    }
+}
+
+impl SockCalls for Sock<'_> {
+    /// Says how far the stream to the peer has come. It only goes on:
+    /// from open to ending when carry ends it, and to ended when the peer
+    /// acknowledges that or the connection is cut.
+    fn up(&self) -> Up {
+        match self.s.state() {
+            tcp::State::Established | tcp::State::CloseWait => Up::Open,
+            tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck => Up::Ending,
+            _ => Up::Ended,
+        }
+    }
+
+    /// Says whether the peer may still send. It may not once its FIN has
+    /// arrived, or once the connection is cut. The FIN is taken only
+    /// after every byte before it: Stack::receive gives smoltcp a FIN
+    /// apart from its data to make that so
+    /// (`a_fin_is_not_taken_with_a_segment_that_the_window_cut`).
+    fn down_open(&self) -> bool {
+        matches!(self.s.state(), tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2)
+    }
+
+    // TLA-sock> \* Sock::has_room and Sock::fill
+    // TLA-sock> HasRoom(k) == k.up = "open" /\ k.tx < TxCap
+    // TLA-sock> Room(k) == TxCap - k.tx
+    // TLA-sock> Filled(k, n) == [k EXCEPT !.tx = @ + n]
+    /// Says whether the socket has room for bytes from Ruby now.
+    fn has_room(&self) -> bool {
+        self.s.can_send()
+    }
+
+    /// Lets `read` put bytes for the peer into the socket's buffer, and
+    /// returns what `read` found. Returns nothing if the socket takes no
+    /// bytes, which carry rules out by asking for room first.
+    fn fill<R: Moved>(&mut self, read: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        let filled = |buf: &mut [u8]| {
+            let found = read(buf);
+            (found.bytes(), found)
+        };
+        self.s.send(filled).ok()
+    }
+
+    // TLA-sock> \* Sock::all_acknowledged and Sock::end
+    // TLA-sock> AllAcked(k) == k.tx = 0
+    // TLA-sock> End(k) == [k EXCEPT !.up = "ending"]
+    /// Says whether the peer has acknowledged all that the socket took.
+    fn all_acknowledged(&self) -> bool {
+        self.s.send_queue() == 0
+    }
+
+    /// Ends the stream to the peer. carry does this only when the peer
+    /// has acknowledged everything, because smoltcp does not send a FIN
+    /// well behind data that a shut window holds back
+    /// (`a_fin_does_not_ride_on_the_probe_of_a_shut_window`,
+    /// `a_fin_waits_for_a_peer_that_ended_first_to_take_the_data`).
+    fn end(&mut self) {
+        self.s.close();
+    }
+
+    // TLA-sock> \* Sock::holds and Sock::drain
+    // TLA-sock> Holds(k) == k.rx > 0
+    // TLA-sock> Drained(k, n) == [k EXCEPT !.rx = @ - n]
+    /// Says whether the socket holds bytes for Ruby.
+    fn holds(&self) -> bool {
+        !self.tail.is_empty() || self.s.can_recv()
+    }
+
+    /// Lets `write` take bytes for Ruby, the oldest first, and returns
+    /// what `write` found. Returns nothing if the socket holds no bytes,
+    /// which carry rules out by asking first.
+    fn drain<R: Moved>(&mut self, write: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if !self.tail.is_empty() {
+            let found = write(self.tail.as_slices().0);
+            self.tail.drain(..found.bytes());
+            return Some(found);
+        }
+        let drained = |buf: &mut [u8]| {
+            let found = write(buf);
+            (found.bytes(), found)
+        };
+        self.s.recv(drained).ok()
     }
 }

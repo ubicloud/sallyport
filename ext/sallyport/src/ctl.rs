@@ -103,7 +103,7 @@ impl Ctl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pair::{Hangup, Pair, Took};
+    use crate::pair::{Hangup, Pair, PairCalls, Took};
     use std::os::unix::net::UnixDatagram;
 
     /// Makes a listener's pair, and returns our end and Ruby's end. std

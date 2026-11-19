@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::conn::{status, step, Open, Phase};
 use crate::ctl::Ctl;
 use crate::packet::{rst, split_fin, syn, without_sack};
-use crate::pair::Pair;
+use crate::pair::{Pair, PairCalls};
 use crate::sock::{Sock, Socket, ACK_DELAY};
 use crate::sys;
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};

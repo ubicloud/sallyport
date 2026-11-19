@@ -8,8 +8,8 @@
 //! part of the stack's loop that turns it, which is in tcp.rs.
 
 use crate::ctl::Ctl;
-use crate::pair::{Gave, Hangup, Pair, Took};
-use crate::sock::{Opening, Sock, Socket, Up, TCP_TIMEOUT};
+use crate::pair::{Gave, Hangup, Pair, PairCalls, Took};
+use crate::sock::{Opening, Sock, SockCalls, Socket, Up, TCP_TIMEOUT};
 use crate::sys;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -301,10 +301,12 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
 }
 
 /// Moves bytes each way for an open connection, and passes on the end of
-/// each direction. `left` and `wait` are those of Open.
+/// each direction. `left` and `wait` are those of Open. It asks nothing of
+/// the pair and of the socket but through their calls, so a test can give
+/// it the pair and the socket of the model.
 fn carry(
-    pair: &mut Pair,
-    s: &mut Sock,
+    pair: &mut impl PairCalls,
+    s: &mut impl SockCalls,
     left: &mut Option<Duration>,
     wait: &mut Option<Duration>,
     now: Duration,
@@ -439,7 +441,7 @@ fn carry(
 /// connection, or says nothing if poll is not to watch the pair. `room`
 /// and `holds` are what Sock::asks says of the socket, and `left` is
 /// whether poll has reported a hangup.
-fn asks(pair: &Pair, room: bool, holds: bool, left: bool) -> Option<libc::c_short> {
+fn asks(pair: &impl PairCalls, room: bool, holds: bool, left: bool) -> Option<libc::c_short> {
     // The pair is read while the socket has room, and written while the
     // socket has bytes for Ruby, unless the pair has refused them.
     let read = if !pair.done() && room { libc::POLLIN } else { 0 };
