@@ -199,7 +199,7 @@ class TestTCP < Minitest::Test
     assert_match(/^\d+ datagrams in: 0 from no peer, 0 refused, 0 from a source not allowed$/, text)
     assert_match(/^#{Regexp.escape(a.peers.first.public_key)} 127\.0\.0\.1:#{b.listen_port} \d+ \d+ \d+$/, text)
     assert_match(/^open 10\.9\.0\.1:7 to 10\.9\.0\.2:\d+: ESTABLISHED, 0 bytes to send and 0 to give Ruby, /, text)
-    assert_match(/^  Socket \{ state: Established, /, text)
+    refute_match(/^  Socket \{/, text)
     assert_equal Encoding::UTF_8, text.encoding
   end
 
@@ -212,6 +212,9 @@ class TestTCP < Minitest::Test
     assert_match(/\A +\d+\.\d{4} out \d+>7 S seq \d+ ack 0 win \d+ len 0\n\z/, trace[0])
     assert_match(/\A +\d+\.\d{4} in  7>\d+ S\. seq \d+ ack \d+ win \d+ len 0\n\z/, trace[1])
     assert(trace.any? { |line| line.match?(/ out \d+>7 P?\. seq \d+ ack \d+ win \d+ len 4\n\z/) })
+    # With a trace, the description has smoltcp's account of each socket
+    # too.
+    assert_match(/^  Socket \{ state: Established, /, b.dump)
     refute_match(/the last TCP packets/, pair.first.dump)
   end
 

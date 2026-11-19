@@ -105,7 +105,8 @@ impl Shared {
 #[derive(Debug, Default, PartialEq)]
 pub struct Knobs {
     /// `trace=N` keeps a line for each of the last N TCP packets, a
-    /// million at most, and the tunnel's description then has them.
+    /// million at most. The tunnel's description then has them, and
+    /// smoltcp's account of each socket.
     pub trace: usize,
     /// `fail` has the thread panic when it is next asked to describe the
     /// tunnel. The tests use it to see what a failed tunnel does.
@@ -399,7 +400,7 @@ impl Engine {
             self.datagrams, self.packets
         );
         self.peers.stats(&mut text);
-        self.stack.describe(&mut text);
+        self.stack.describe(&mut text, self.knobs.trace > 0);
         if self.knobs.trace > 0 {
             text += "the last TCP packets, each with the seconds since the tunnel started:\n";
             for line in &self.trace {

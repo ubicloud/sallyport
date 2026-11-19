@@ -117,12 +117,15 @@ thread's answer from it.
 `Tunnel#peers` gives each peer's endpoint, the age of its last handshake
 and its byte counts. `Tunnel#connections` counts the connections.
 `Tunnel#dump` returns a description of the tunnel for a person to read,
-with two lines for each connection.
+with a line for each connection.
 
 A tunnel's packets are encrypted on the wire, so tcpdump shows nothing of
 the TCP inside. With `SALLYPORT_DEBUG=trace=200` in the environment, or
 `debug: "trace=200"` given to `Tunnel.new`, the tunnel keeps a line for
-each of its last 200 TCP packets, and `Tunnel#dump` returns them.
+each of its last 200 TCP packets, and `Tunnel#dump` returns them. It
+then also returns the account that smoltcp gives of each connection's
+socket. That account takes the tunnel's thread some 6 ms for each
+connection, in which the tunnel does nothing else.
 
 ## Tests
 

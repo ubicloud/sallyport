@@ -45,7 +45,8 @@ module Sallyport
     # +debug+ is for looking inside a tunnel: settings with commas between
     # them, which the environment gives as SALLYPORT_DEBUG if the caller
     # gives none. "trace=N" keeps a line for each of the last N TCP
-    # packets, and Tunnel#dump then returns them.
+    # packets. Tunnel#dump then returns them, and smoltcp's account of
+    # each connection's socket.
     #
     # Raises ArgumentError for a fault in the configuration, and the
     # system's error, such as Errno::EADDRINUSE, if the tunnel cannot be
@@ -245,9 +246,12 @@ module Sallyport
     end
 
     # Returns a description of the tunnel for a person to read: what it
-    # has counted, a line for each peer, and two lines for each connection,
-    # of which the second is the TCP socket as smoltcp prints it. It is
-    # there to show why something does not move, and its form may change.
+    # has counted, a line for each peer, and a line for each connection.
+    # With a trace, each connection has a second line, which is the TCP
+    # socket as smoltcp prints it. That line takes the tunnel's thread
+    # some milliseconds to write, in which the tunnel does nothing else.
+    # The description is there to show why something does not move, and
+    # its form may change.
     def dump
       ask(Native::DUMP, "a description of the tunnel")
     end

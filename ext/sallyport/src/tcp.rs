@@ -438,10 +438,12 @@ impl Stack {
         self.conns.iter().filter(|c| !matches!(c.phase, Phase::Listening { .. } | Phase::Dead)).count()
     }
 
-    /// Describes every connection, each in two lines. The first is what
-    /// the stack knows of it. The second is smoltcp's account of the
-    /// socket, without the bytes in its buffers.
-    pub fn describe(&self, text: &mut String) {
+    /// Describes every connection in a line, which is what the stack
+    /// knows of it. With `detail`, a second line is smoltcp's account of
+    /// the socket. That one takes milliseconds to write for each
+    /// connection, because smoltcp writes out every byte of the socket's
+    /// buffers on the way, and the thread does nothing else meanwhile.
+    pub fn describe(&self, text: &mut String, detail: bool) {
         for c in &self.conns {
             let (phase, pair) = match &c.phase {
                 Phase::Connecting { pair, .. } => ("connecting", Some(pair)),
@@ -463,7 +465,9 @@ impl Stack {
                 if pair.is_some_and(Pair::told) { ", the peer has ended its stream" } else { "" },
                 if left { ", Ruby is gone" } else { "" },
             );
-            let _ = writeln!(text, "  {}", Sock::detail(s));
+            if detail {
+                let _ = writeln!(text, "  {}", Sock::detail(s));
+            }
         }
     }
 
