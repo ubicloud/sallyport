@@ -718,6 +718,12 @@ impl Phase {
 //
 // TLA-conn.cfg/remove-at-once!RemovedClean> Fault = "remove at once"
 //
+// A dead socket is kept until every socket has sent all that it has to
+// send. The model has one connection. The others may have more to send in
+// every turn than a turn sends, and the sweep then never comes:
+//
+// TLA-conn.cfg/waits-for-the-others!DeadGoes> Fault = "waits for the others"
+//
 // Ruby is told of a connection before its handshake is over:
 //
 // TLA-conn.cfg/greets-early!OpenIsGreeted> Fault = "greets early"

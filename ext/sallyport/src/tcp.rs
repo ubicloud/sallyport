@@ -469,14 +469,17 @@ impl Stack {
 
     // TLA-conn> \* Every turn of the loop has each socket send what it owes.
     // TLA-conn> Dispatch == s.phase # "removed" /\ s.k.owed # "none" /\ s' = [s EXCEPT !.k = K!Sent(@)]
-    /// Has every socket send what it has to send. Returns whether every
-    /// socket has sent all of it.
-    pub fn poll(&mut self) -> bool {
+    /// Has every socket send what it has to send.
+    pub fn poll(&mut self) {
         let now = self.now();
         // smoltcp's poll sends until no socket has more to send. A socket
         // whose timer did not move would keep it there for ever, so the
         // rounds are counted. What is left goes at the next turn.
-        (0..EGRESS_ROUNDS).any(|_| self.iface.poll_egress(now, &mut self.link, &mut self.sockets) == PollResult::None)
+        for _ in 0..EGRESS_ROUNDS {
+            if self.iface.poll_egress(now, &mut self.link, &mut self.sockets) == PollResult::None {
+                break;
+            }
+        }
     }
 
     // TLA-conn@70> \* The thread may turn the loop at any time, as it does for the tick and
@@ -500,11 +503,13 @@ impl Stack {
         self.now();
         self.ingress();
         self.pump();
-        // A dead connection's socket goes when it has sent what it owed,
-        // and a socket delays nothing that it owes.
-        if self.poll() {
-            self.sweep();
-        }
+        self.poll();
+        // A dead connection's socket owes the peer one packet at the most,
+        // a reset or the ACK of the peer's FIN, and it delays neither. So
+        // the first round has sent that packet, and the socket goes now,
+        // whatever the other sockets have left to send
+        // (`a_connection_that_ends_goes_though_another_has_more_to_send`).
+        self.sweep();
     }
 
     // TLA-conn> \* The tunnel is closing. orphan shuts down each pair both ways, and
@@ -581,10 +586,12 @@ impl Stack {
     }
 
     // TLA-conn> \* sweep removes a dead connection when its socket has sent what it owed.
-    // TLA-conn> Sweep == s.phase = "dead" /\ s.k.owed = "none" /\ s' = [s EXCEPT !.phase = "removed"]
-    /// Removes each dead connection. The sockets have just sent all that
-    /// they had to send, so the socket of a connection that ended in this
-    /// turn goes in this turn.
+    // TLA-conn> \* It does not wait for what the other sockets have to send.
+    // TLA-conn> Sweep == /\ s.phase = "dead" /\ s.k.owed = "none" /\ Fault # "waits for the others"
+    // TLA-conn>          /\ s' = [s EXCEPT !.phase = "removed"]
+    /// Removes each dead connection. Its socket has just sent the packet
+    /// that it owed, if it owed one, so the socket of a connection that
+    /// ended in this turn goes in this turn.
     fn sweep(&mut self) {
         let (sockets, ports) = (&mut self.sockets, &mut self.local_ports);
         self.conns.retain(|c| {
@@ -712,9 +719,13 @@ mod tests {
     const A: &str = "10.9.0.1";
     const B: &str = "10.9.0.2";
 
-    fn stack(addr: &str) -> Stack {
+    fn cfg(addr: &str) -> Config {
         let key = crate::keys::encode(&[1; 32]);
-        Stack::new(&config::parse(&format!("[Interface]\nPrivateKey = {key}\nAddress = {addr}")).unwrap(), false)
+        config::parse(&format!("[Interface]\nPrivateKey = {key}\nAddress = {addr}")).unwrap()
+    }
+
+    fn stack(addr: &str) -> Stack {
+        Stack::new(&cfg(addr), false)
     }
 
     /// Begins a connection, and returns Ruby's end of its pair.
@@ -1840,6 +1851,49 @@ mod tests {
         assert!(!is_reset(&ack) && a.transmit().is_none());
         assert!(a.finished(), "and the connection's socket is gone");
         assert_eq!(read(&mut client), (b"bye".to_vec(), true));
+    }
+
+    #[test]
+    fn a_connection_that_ends_goes_though_another_has_more_to_send() {
+        // B's link takes packets of 88 bytes, which is less than the
+        // parser allows. So B asks for segments of 48 bytes, the smallest
+        // that smoltcp agrees to. A turn has a socket send EGRESS_ROUNDS
+        // packets at the most, and B's window takes more segments than
+        // that.
+        let (mut a, mut b) = (stack(A), Stack::new(&Config { mtu: 88, ..cfg(B) }, false));
+        let (mut bulk, mut sink) = connected(&mut a, &mut b);
+        // A's congestion window grows by a segment for each ACK, and B
+        // acknowledges once in a turn. So B takes each segment in a turn
+        // of its own, until A may send as much as B's window takes.
+        let mut at = 0;
+        loop {
+            at = write_from(&mut bulk, at, 1 << 16);
+            a.turn();
+            let sent: Vec<Vec<u8>> = std::iter::from_fn(|| a.transmit()).collect();
+            if sent.is_empty() {
+                break;
+            }
+            for packet in sent {
+                b.receive(packet);
+                b.turn();
+                read(&mut sink);
+                while let Some(ack) = b.transmit() {
+                    a.receive(ack);
+                }
+            }
+        }
+        let (other, mut server) = connected(&mut a, &mut b);
+        server.write_all(b"unread").unwrap();
+        settle(&mut a, &mut b);
+        // The second connection ends in a turn that leaves segments of
+        // the first unsent.
+        write_from(&mut bulk, at, at + (1 << 16));
+        drop(other);
+        a.turn();
+        let sent: Vec<Vec<u8>> = std::iter::from_fn(|| a.transmit()).collect();
+        assert!(sent.len() > EGRESS_ROUNDS && a.poll_delay() == Some(Duration::ZERO), "the turn left segments unsent");
+        assert_eq!(sent.iter().filter(|packet| is_reset(packet)).count(), 1, "and it sent the reset");
+        assert_eq!(a.conns.len(), 1, "so the socket that owed the reset is gone");
     }
 
     #[test]

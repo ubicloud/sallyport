@@ -111,8 +111,10 @@ const MIN_RTO: Duration = Duration::from_millis(200);
 // TLA-sock> \* when it sends those bytes again.
 // TLA-sock> TimesOut(k) == When(~(k.up = "ended" /\ ~k.down) /\ (k.gone \/ Fault = "no keep-alive"),
 // TLA-sock>                     [Cut(k) EXCEPT !.owed = "rst"])
-// TLA-sock> \* Stack::poll has smoltcp send what a socket owes. The socket delays
-// TLA-sock> \* none of it: Sock::make has it acknowledge at once.
+// TLA-sock> \* Stack::poll has smoltcp send what a socket owes. That is one packet,
+// TLA-sock> \* and the first round of a poll sends it, whatever the other sockets
+// TLA-sock> \* have to send. The socket delays none of it: Sock::make has it
+// TLA-sock> \* acknowledge at once.
 // TLA-sock> Sent(k) == [k EXCEPT !.owed = "none"]
 
 /// The stream to the peer, as carry sees it.
