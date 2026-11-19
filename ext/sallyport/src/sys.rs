@@ -161,6 +161,15 @@ pub fn udp_socket(port: u16) -> std::io::Result<(UdpSocket, bool)> {
     for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
         unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, option, (&raw const want).cast(), 4) };
     }
+    // An IPv4 datagram leaves without the mark that forbids a router to
+    // cut it up, as a datagram of the kernel's WireGuard does. With the
+    // mark, a link on the way drops a datagram that is too large for it.
+    // The system learns of that only from an ICMP message, and many a
+    // path lets none through.
+    let whole: libc::c_int = libc::IP_PMTUDISC_DONT;
+    unsafe {
+        libc::setsockopt(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, (&raw const whole).cast(), 4)
+    };
     Ok((socket, v6))
 }
 
@@ -187,4 +196,20 @@ pub fn random<const N: usize>() -> [u8; N] {
 pub fn random_fill(buf: &mut [u8]) {
     let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
     assert_eq!(n, buf.len() as isize, "getrandom: {}", std::io::Error::last_os_error());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_datagram_may_be_cut_up_on_its_way() {
+        let (socket, _) = udp_socket(0).unwrap();
+        let (mut mode, mut size): (libc::c_int, libc::socklen_t) = (-1, 4);
+        let got = unsafe {
+            let (mode, size) = ((&raw mut mode).cast(), &raw mut size);
+            libc::getsockopt(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, mode, size)
+        };
+        assert_eq!((got, mode), (0, libc::IP_PMTUDISC_DONT));
+    }
 }
