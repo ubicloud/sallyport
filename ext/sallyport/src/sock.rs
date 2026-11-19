@@ -22,21 +22,10 @@ pub type Socket = tcp::Socket<'static>;
 /// acknowledged them.
 pub const SEND_BUF: usize = 256 * 1024;
 /// A socket holds this many bytes that the peer sent, until the pair has
-/// room for them. A TCP header can give a window of this size and no more
-/// unless the window is scaled, so the peer sends this much at the most
-/// in one round trip.
-///
-/// smoltcp gets a scaled window wrong. It rounds the window down to the
-/// scale, so the end of the window moves back by a few bytes as the
-/// buffer fills. It takes a segment as far as the end that it has on
-/// record, which its last ACK gave, and the peer may have sent as far as
-/// an end that it was given before. smoltcp drops the bytes between the
-/// two, and takes the FIN of that segment all the same. Ruby would read
-/// the end of the stream without those bytes. While a window is shut,
-/// smoltcp also counts nothing from such a peer as heard, and its
-/// timeout would reset a peer that is there. The peer may scale its own
-/// window whatever this size is.
-pub const RECV_BUF: usize = 65535;
+/// room for them. The peer sends this much at the most in one round
+/// trip. It is more than a TCP header can say, so smoltcp scales the
+/// window, and the number in a header counts 8 bytes.
+pub const RECV_BUF: usize = 256 * 1024;
 /// A connection is dead when its peer has sent nothing for this long.
 /// smoltcp counts the silence whether or not anything waits to be
 /// acknowledged, so a connection has to ask a quiet peer to answer.
@@ -89,8 +78,10 @@ const MIN_RTO: Duration = Duration::from_millis(200);
 // TLA-sock> \* Our FIN follows our data, so it is acknowledged after the data.
 // TLA-sock> PeerAcksFin(k) == When(~k.gone /\ k.tx = 0 /\ k.up = "ending", [k EXCEPT !.up = "ended"])
 // TLA-sock> \* The socket takes the peer's FIN only when it has taken all that the
-// TLA-sock> \* peer sent before it. smoltcp does not see to that, so Stack::receive
-// TLA-sock> \* gives it each FIN in a packet of its own.
+// TLA-sock> \* peer sent before it. smoltcp as its project has it does not see to
+// TLA-sock> \* that: it takes the FIN of a segment that it cut at the end of the
+// TLA-sock> \* window. The copy passes over such a FIN, which is part of its
+// TLA-sock> \* deviation "receive-window".
 // TLA-sock> PeerFins(k) == When(~k.pending /\ ~k.gone /\ k.down,
 // TLA-sock>                     [k EXCEPT !.down = FALSE, !.fin = TRUE, !.owed = "ack"])
 // TLA-sock> \* A reset leaves what was received for Ruby to read, and leaves nothing
@@ -106,9 +97,10 @@ const MIN_RTO: Duration = Duration::from_millis(200);
 // TLA-sock> \* anything waits for an answer. So the socket asks a quiet peer to
 // TLA-sock> \* answer, with set_keep_alive, and it hears a peer that is there. The
 // TLA-sock> \* stack's clock does not count the time that the thread stood still, so
-// TLA-sock> \* the socket has asked by then. And with a window that has no scale, a
-// TLA-sock> \* peer that has sent past the end that smoltcp has on record is heard
-// TLA-sock> \* when it sends those bytes again.
+// TLA-sock> \* the socket has asked by then. And the copy takes what a peer sent as
+// TLA-sock> \* far as any end of the window that it gave, which is the rest of
+// TLA-sock> \* "receive-window". So a peer that filled a window which has shut is
+// TLA-sock> \* heard when it answers.
 // TLA-sock> TimesOut(k) == When(~(k.up = "ended" /\ ~k.down) /\ (k.gone \/ Fault = "no keep-alive"),
 // TLA-sock>                     [Cut(k) EXCEPT !.owed = "rst"])
 // TLA-sock> \* Stack::poll has smoltcp send what a socket owes. That is one packet,

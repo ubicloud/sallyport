@@ -103,7 +103,7 @@ thread's answer from it.
   write after a reset raises `Errno::EPIPE`.
 - A socket that has shut down its reading, with `close_read`, goes on
   writing. What the peer sends to it from then on stays in the tunnel,
-  64 KiB of it at the most, and the peer is held after that. If the
+  256 KiB of it at the most, and the peer is held after that. If the
   socket is closed while the tunnel holds such bytes, the peer is reset.
 - It agrees to no selective acknowledgement. The last section says why.
 - It does not delay an ACK, as most TCPs do to send it with data. An ACK
@@ -116,16 +116,13 @@ thread's answer from it.
   last ACK has left by the end of the turn that ends it. If that ACK is
   lost, the peer sends its FIN again, and is answered with a reset where
   a kernel sends the ACK again. Neither side has lost a byte by then.
-- The window that it gives a peer has no scale, so a peer sends 64 KiB
-  at the most in one round trip. Where a round trip takes 100 ms, Ruby
-  reads 640 KiB a second at the most. The last section says why.
 - A listener's backlog is 128 connections at most.
 - A tunnel answers a peer from the address that the system chooses for
   the way back. On a machine with several addresses, that may not be the
   address that the peer wrote to, and a NAT or a firewall on the peer's
   side may then drop the answer. The kernel's WireGuard answers from the
   address that it was written to.
-- A connection has 320 KiB of buffers from its first packet on, and
+- A connection has 512 KiB of buffers from its first packet on, and
   keeps them until it has ended. A socket that Ruby has closed can take
   a while to end: up to 60 seconds if the peer does not end its stream,
   and up to 300 if the peer is gone. The tunnel's thread holds a
@@ -258,8 +255,8 @@ copy in this repository mends a fault where a deviation is named, and
   the segment are dropped and its FIN is taken all the same. The program
   then reads the end of the stream without those bytes. While the window
   is shut, nothing from that peer counts as heard, and the timeout
-  resets a peer that is there. This library gives a window of 65535
-  bytes, which has no scale
+  resets a peer that is there. The deviation `receive-window` mends
+  this: the socket takes a segment as far as any end that it gave
   (`a_stream_that_ends_where_the_window_ends_is_read_whole`,
   `a_peer_that_has_filled_a_shut_window_is_still_heard`).
 - A keep-alive carries the window as it is when it is sent, and so does
@@ -267,9 +264,9 @@ copy in this repository mends a fault where a deviation is named, and
   that it gave a window in either. If a peer takes the window from such
   a segment, it may send further than the socket takes. Linux takes it
   from a keep-alive that follows data. There too the FIN of a segment
-  that was cut is taken. This library gives smoltcp a FIN in a packet of
-  its own, after the data
-  (`a_fin_is_not_taken_with_a_segment_that_the_window_cut`).
+  that was cut is taken. `receive-window` mends this as well: the two
+  count as giving a window, and the FIN of a segment that was cut is
+  passed over (`a_fin_is_not_taken_with_a_segment_that_the_window_cut`).
 - The `Debug` of a TCP socket writes every byte of its two buffers,
   whether or not they hold anything. For two buffers of 256 KiB that is
   1.6 MB of text, which takes 10 ms. The deviation `ring-debug` mends
