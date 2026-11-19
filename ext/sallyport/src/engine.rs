@@ -152,6 +152,10 @@ pub struct Engine {
     /// The answers that are not yet written whole.
     telling: Vec<Telling>,
     next_tick: Instant,
+    /// A command or a packet has given the stack cause for a turn.
+    stirred: bool,
+    /// When the stack next has a timer, as it said after its last turn.
+    stack_due: Option<Instant>,
     buf: Vec<u8>,
     /// These count the datagrams that have arrived, and the packets that
     /// the stack has sent.
@@ -193,6 +197,8 @@ impl Engine {
             stack: Stack::new(cfg, knobs.sack, set),
             telling: Vec::new(),
             next_tick: Instant::now(),
+            stirred: true,
+            stack_due: None,
             buf: vec![0; 65536],
             datagrams: 0,
             packets: 0,
@@ -219,6 +225,7 @@ impl Engine {
     fn commands(&mut self) {
         let cmds = std::mem::take(&mut *self.shared.cmds.lock().unwrap_or_else(|e| e.into_inner()));
         for cmd in cmds {
+            self.stirred |= !matches!(cmd, Cmd::Tell { .. });
             match cmd {
                 Cmd::Connect { fd, addr, port } if self.peers.reaches(&addr) => self.stack.connect(fd, addr, port),
                 Cmd::Connect { fd, .. } => Stack::refuse(fd, status::NO_ROUTE),
@@ -267,6 +274,7 @@ impl Engine {
             if let Some(packet) = packet {
                 self.trace("in ", &packet);
                 self.stack.receive(packet);
+                self.stirred = true;
             }
         }
         true
@@ -317,17 +325,30 @@ impl Engine {
     /// there is more to do, or for `most` at the longest.
     fn serve(&mut self, fds: &mut Vec<libc::pollfd>, most: Duration) {
         let more = self.udp_in();
-        if Instant::now() >= self.next_tick {
+        let ticked = Instant::now() >= self.next_tick;
+        if ticked {
             self.tick();
             self.next_tick = Instant::now() + TICK;
         }
-        self.stack.turn();
-        self.flush();
+        // The stack has a turn when something concerns it: a packet or a
+        // command, a pair that poll reported, a timer of its own, or the
+        // tick, at which it looks at every connection. A datagram that
+        // carried no packet for it is no such thing. Anyone can send
+        // those, and a turn costs time for each socket that the stack
+        // has.
+        let reported = fds.get(2).is_none_or(|set| set.revents != 0);
+        let due = self.stack_due.is_some_and(|at| Instant::now() >= at);
+        if self.stirred || reported || due || ticked {
+            self.stirred = false;
+            self.stack.turn();
+            self.flush();
+            self.stack_due = self.stack.poll_delay().map(|delay| Instant::now() + delay);
+        }
         self.tell();
 
         let mut wait = self.next_tick.saturating_duration_since(Instant::now()).min(most);
-        if let Some(delay) = self.stack.poll_delay() {
-            wait = wait.min(delay);
+        if let Some(at) = self.stack_due {
+            wait = wait.min(at.saturating_duration_since(Instant::now()));
         }
         // The turn left each connection at rest, and poll reports what
         // moves one on. Only the datagrams that were not taken do not
@@ -350,8 +371,15 @@ impl Engine {
             events: libc::POLLOUT,
             revents: 0,
         }));
-        sys::poll(fds, wait);
-        if fds[0].revents != 0 {
+        if !sys::poll(fds, wait) {
+            // poll could not look, which a signal does to it now and
+            // then, and a limit of the process may do each time. The
+            // loop goes on as if everything were reported, and does not
+            // spin.
+            fds.clear();
+            std::thread::sleep(wait.min(Duration::from_millis(10)));
+        }
+        if fds.first().is_some_and(|eventfd| eventfd.revents != 0) {
             sys::drain(self.shared.eventfd.as_raw_fd());
         }
     }
@@ -431,6 +459,7 @@ impl Engine {
         self.stack.orphan();
         let until = Instant::now() + Duration::from_millis(self.shared.linger.load(Ordering::Acquire).into());
         while !self.stack.finished() && Instant::now() < until {
+            self.stirred = true;
             self.serve(fds, Duration::from_millis(10).min(until.saturating_duration_since(Instant::now())));
         }
         self.stack.abort();

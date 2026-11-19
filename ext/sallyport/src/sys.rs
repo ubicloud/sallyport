@@ -65,12 +65,14 @@ pub fn ended(fd: RawFd) -> bool {
 }
 
 /// Waits until a descriptor is ready or the time has passed, for a second
-/// at most.
-pub fn poll(fds: &mut [libc::pollfd], wait: Duration) {
+/// at most. Says whether poll looked at the descriptors: it does not when
+/// a signal interrupts it, or when the process has set its limit of
+/// descriptors below their number.
+pub fn poll(fds: &mut [libc::pollfd], wait: Duration) -> bool {
     // A wait of less than a millisecond is rounded up, since poll would
     // otherwise return at once and the caller would spin.
     let ms = wait.as_micros().div_ceil(1000).min(1000) as libc::c_int;
-    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) >= 0 }
 }
 
 /// Runs `f` with every signal blocked, and returns what it gives. A
