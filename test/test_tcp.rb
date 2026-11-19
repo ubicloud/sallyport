@@ -149,6 +149,20 @@ class TestTCP < Minitest::Test
     end
   end
 
+  # The tunnel's thread may close its end of a listener's pair with an
+  # answer of ours unread, and the system then reports a reset to our
+  # end. This pair shows that without the race.
+  def test_an_accept_takes_a_reset_for_the_close_of_the_tunnel
+    a, = pair
+    ours, theirs = UNIXSocket.pair(:SEQPACKET)
+    listener = Sallyport::Listener.new(ours, 7, a)
+    ours.send("\0", 0)
+    theirs.close
+    assert_raises(IOError) { listener.accept(timeout: 1) }
+  ensure
+    ours&.close
+  end
+
   def test_bytes_cross_each_way
     a, b = pair
     ["10.9.0.1", "fd09::1"].each do |to|

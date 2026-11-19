@@ -57,7 +57,14 @@ module Sallyport
     # if none has. The tunnel's thread sends each as a message that names
     # the peer and carries the connection's descriptor.
     def take
-      from, _, flags, rights = @io.recvmsg_nonblock(64, 0, 64, scm_rights: true, exception: false)
+      from, _, flags, rights =
+        begin
+          @io.recvmsg_nonblock(64, 0, 64, scm_rights: true, exception: false)
+        rescue Errno::ECONNRESET
+          # The tunnel's thread closed its end before it had read our
+          # last answer. The system reports that as a reset, once.
+          raise IOError, "the tunnel was closed"
+        end
       return nil if from == :wait_readable
       raise IOError, "the tunnel was closed" if from.nil? || from.empty?
 
