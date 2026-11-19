@@ -191,28 +191,33 @@ class TestTCP < Minitest::Test
   # its caller reads it. If the tunnel closes meanwhile, the caller is
   # told so, and is not given the part that was written.
   def test_a_description_that_a_close_cuts_short_is_not_returned
-    whole = cut = 0
-    until whole.positive? && cut.positive?
-      a, b = pair(debug: "trace=100000")
-      client, server = connection(a, b)
-      transfer(client, server, Random.new(12).bytes(4 << 20))
-      asking = Thread.new do
-        a.dump
-      rescue IOError => e
-        e
+    a, b = pair(debug: "trace=100000")
+    client, server = connection(a, b)
+    transfer(client, server, Random.new(12).bytes(16 << 20))
+    # The thread that asks is held where it would read the answer. The
+    # tunnel's thread has the question by then, and can write no more of
+    # the answer than the pair holds.
+    held, closed = Queue.new, Queue.new
+    asking = Thread.new do
+      asker, once = Thread.current, true
+      before_the_read = TracePoint.new(:c_call) do |call|
+        next unless once && Thread.current == asker && call.method_id == :read
+
+        once = false
+        held << true
+        closed.pop
       end
-      asking.report_on_exception = false
-      sleep((whole + cut).odd? ? 0.0005 : 0.01)
-      a.close(linger: 0)
-      b.close(linger: 0)
-      case (answer = asking.value)
-      when IOError then cut += 1
-      else
-        assert_match(/ len \d+\n\z/, answer, "the description is whole")
-        whole += 1
-      end
-      flunk "a close never #{whole.zero? ? "left a description whole" : "cut one short"}" if whole + cut > 60
+      before_the_read.enable { a.dump }
+    rescue IOError => e
+      e
     end
+    asking.report_on_exception = false
+    Timeout.timeout(10) { held.pop }
+    a.close(linger: 0)
+    closed << true
+    answer = asking.value
+    assert_instance_of IOError, answer, "the caller was given #{answer.to_s.bytesize} bytes"
+    b.close(linger: 0)
   end
 
   def test_bytes_cross_each_way
