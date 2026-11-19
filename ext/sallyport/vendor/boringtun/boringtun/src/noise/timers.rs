@@ -312,15 +312,14 @@ impl Tunn {
     }
 
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
-        let current_session = self.current;
-        if self.sessions[current_session % super::N_SESSIONS].is_some() {
-            let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
-            let duration_since_session_established = self.timers[TimeSessionEstablished];
+        let current_session = self.current_session()?.local_index();
+        let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
+        // TimeSessionEstablished is also set by a handshake that the peer began and has
+        // not completed, so the time is that of the session itself.
+        let duration_since_session_established =
+            self.timers.session_timers[current_session % super::N_SESSIONS];
 
-            Some(duration_since_tun_start - duration_since_session_established)
-        } else {
-            None
-        }
+        Some(duration_since_tun_start - duration_since_session_established)
     }
 
     pub fn persistent_keepalive(&self) -> Option<u16> {

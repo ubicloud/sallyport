@@ -42,6 +42,7 @@ table of classes follows it.
 | `smoltcp` | `ring-debug` | `fix` | The `Debug` of a ring buffer leaves out the elements of its storage. That of a TCP socket wrote every octet of its two buffers. |
 | `smoltcp` | `sends-now` | `addition` | `Socket::sends_now` says whether a socket has a segment to send at once. |
 | `smoltcp` | `lock` | `build` | `Cargo.lock` names the crates that the tests of smoltcp are built with here. |
+| `boringtun` | `confirmed-session` | `fix` | A tunnel sends in the session that the peer has shown it holds the keys of, and counts the time since a handshake from that one. It took whatever session was in that place of its ring. |
 
 | Class | What a deviation of the class is |
 | --- | --- |
