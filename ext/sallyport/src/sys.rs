@@ -173,6 +173,17 @@ pub fn udp_socket(port: u16) -> std::io::Result<(UdpSocket, bool)> {
     Ok((socket, v6))
 }
 
+/// Returns the address of a datagram's sender as a peer's endpoint keeps
+/// it. An IPv6 socket gives an IPv4 sender an IPv6 address, and udp_send
+/// takes the IPv4 one. Another IPv6 address is kept whole. Its scope
+/// says which link a link-local sender is on, and an answer needs it.
+pub fn udp_from(from: SocketAddr) -> SocketAddr {
+    match from {
+        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(from, |v4| SocketAddr::new(v4.into(), v6.port())),
+        SocketAddr::V4(_) => from,
+    }
+}
+
 /// Sends a datagram. If the socket's buffer is full the datagram is
 /// dropped, as a full link would drop it.
 pub fn udp_send(socket: &UdpSocket, v6: bool, datagram: &[u8], to: SocketAddr) {
@@ -201,6 +212,7 @@ pub fn random_fill(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv6Addr, SocketAddrV6};
 
     #[test]
     fn a_datagram_may_be_cut_up_on_its_way() {
@@ -211,5 +223,15 @@ mod tests {
             libc::getsockopt(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, mode, size)
         };
         assert_eq!((got, mode), (0, libc::IP_PMTUDISC_DONT));
+    }
+
+    #[test]
+    fn a_sender_keeps_its_scope_and_an_ipv4_sender_its_family() {
+        let mapped = SocketAddr::new("::ffff:192.0.2.1".parse().unwrap(), 7);
+        assert_eq!(udp_from(mapped), "192.0.2.1:7".parse().unwrap());
+        let local = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse::<Ipv6Addr>().unwrap(), 7, 0, 3));
+        assert_eq!(udp_from(local), local);
+        let plain: SocketAddr = "192.0.2.1:7".parse().unwrap();
+        assert_eq!(udp_from(plain), plain);
     }
 }

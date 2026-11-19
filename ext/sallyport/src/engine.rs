@@ -8,7 +8,7 @@ use crate::peers::{Dropped, Peers};
 use crate::sys;
 use crate::tcp::Stack;
 use std::collections::VecDeque;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -255,7 +255,7 @@ impl Engine {
             if self.dropping() {
                 continue;
             }
-            let from = SocketAddr::new(from.ip().to_canonical(), from.port());
+            let from = sys::udp_from(from);
             let (udp, v6) = (&self.udp, self.udp_v6);
             let packet = self.peers.receive(&self.buf[..len], from, &mut |d, to| sys::udp_send(udp, v6, d, to));
             if let Some(packet) = packet {
