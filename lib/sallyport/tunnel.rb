@@ -84,6 +84,9 @@ module Sallyport
         @holder = [handle]
         ObjectSpace.define_finalizer(self, self.class.finalizer(@holder, @pid))
         @listen_port = Native::PORT.call(handle)
+        # An exception that has waited is raised as this block ends. The
+        # caller is then given no tunnel, and could not close this one.
+        close(linger: 0) if Thread.pending_interrupt?
         nil
       end
       return unless code
@@ -136,7 +139,11 @@ module Sallyport
           fd, code = Native::CONNECT.call(handle, remote.ip_address, port), Fiddle.last_error
           raise SystemCallError.new(to, code) if fd.negative?
 
-          Socket.adopt(fd, remote, self)
+          socket = Socket.adopt(fd, remote, self)
+          # An exception that has waited is raised as this block ends,
+          # and the caller is then given no socket to close.
+          socket.close if Thread.pending_interrupt?
+          socket
         end
       end
       begin
@@ -172,7 +179,12 @@ module Sallyport
           fd, code = Native::LISTEN.call(handle, port, backlog), Fiddle.last_error
           raise SystemCallError.new("TCP port #{port}", code) if fd.negative?
 
-          UNIXSocket.for_fd(fd)
+          io = UNIXSocket.for_fd(fd)
+          # An exception that has waited is raised as this block ends.
+          # The caller is then given no listener, and the port would stay
+          # taken.
+          io.close if Thread.pending_interrupt?
+          io
         end
       end
       begin

@@ -46,6 +46,36 @@ class TestTunnel < Minitest::Test
     end
   end
 
+  # Runs the block with an exception of another thread waiting, as one
+  # waits while a call into the library is under way, and returns what
+  # the block gave before the exception was raised.
+  def interrupted
+    given = nil
+    assert_raises(Timeout::Error) do
+      Thread.handle_interrupt(Timeout::Error => :never) do
+        Thread.current.raise(Timeout::Error, "from another thread")
+        given = yield
+      end
+    end
+    given
+  end
+
+  def test_a_tunnel_whose_maker_is_interrupted_is_closed
+    key, = keypair
+    parts = {private_key: key, addresses: ["10.9.0.1"], listen_port: free_udp_port}
+    assert interrupted { Sallyport::Tunnel.new(**parts) }.closed?
+    # Its UDP port is free at once, with no wait for the collector.
+    tunnel(**parts)
+  end
+
+  def test_a_listener_whose_maker_is_interrupted_leaves_its_port_free
+    key, = keypair
+    t = tunnel(private_key: key, addresses: ["10.9.0.1"])
+    # The listener was closed, and so its maker cannot read how it fared.
+    assert_nil interrupted { assert_raises(IOError) { t.listen(7) } && nil }
+    eventually { t.listen(7) }.close
+  end
+
   def test_a_tunnel_tells_its_port
     key, = keypair
     port = free_udp_port
