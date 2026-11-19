@@ -178,7 +178,8 @@ records of the model, in each of those states, and the outcome must be
 the one that the model has. In the model Ruby acts between two steps, so
 each step is run in the states that Ruby can bring about before it. A
 change that makes `carry` do otherwise than the model says fails that
-test.
+test. The test holds `shake` to the model in the same way, which is the
+function that decides what has become of a handshake.
 
 A model is written in the source, as comments beside the code that each
 line describes:

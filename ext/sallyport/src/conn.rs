@@ -218,25 +218,59 @@ enum Fate {
 // TLA-conn@10>         /\ \/ s.left = "yes" /\ s' = [s EXCEPT !.left = "late", !.kick = TRUE]
 // TLA-conn@10>            \/ s.wait = "yes" /\ s' = [s EXCEPT !.wait = "late", !.kick = TRUE]
 
-// TLA-conn> \* step, for a connection that is not open yet. Ruby is told of a
+/// What has become of a handshake.
+#[derive(Debug, PartialEq)]
+enum Shake {
+    /// The peer has yet to finish it.
+    Wait,
+    /// The connection is established.
+    Done,
+    /// The peer reset it.
+    Refused,
+    /// The peer has not finished it in SYN_WAIT.
+    TimedOut,
+    /// Ruby has left.
+    Abandoned,
+}
+
+// TLA-conn> \* shake says what has become of a handshake. Ruby has left a connection
+// TLA-conn> \* that it makes when it has closed its end of the pair, and one that a
+// TLA-conn> \* peer makes when it has closed the listener.
+// TLA-conn> Shake(t) ==
+// TLA-conn>   IF (t.phase = "connecting" /\ P!HungUp(t.p)) \/ (t.phase = "listening" /\ ~t.listens) THEN "abandoned"
+// TLA-conn>   ELSE IF K!Opening(t.k) = "done" \/ (Fault = "greets early" /\ K!Opening(t.k) = "pending") THEN "done"
+// TLA-conn>   ELSE IF K!Opening(t.k) = "failed" /\ Fault # "keeps a failure" THEN "refused"
+// TLA-conn>   ELSE IF t.old /\ Fault # "waits for ever" THEN "timedout"
+// TLA-conn>   ELSE "wait"
+/// Says what has become of a handshake. `left` is whether Ruby has left,
+/// and `old` is whether the handshake has had SYN_WAIT.
+fn shake(left: bool, opening: Opening, old: bool) -> Shake {
+    match opening {
+        _ if left => Shake::Abandoned,
+        Opening::Done => Shake::Done,
+        // Only a reset from the peer closes a socket so soon. smoltcp's
+        // timeout closes a socket too, but not one that is given up
+        // sooner.
+        Opening::Failed => Shake::Refused,
+        Opening::Pending if old => Shake::TimedOut,
+        // The peer answers a SYN with a bare SYN if it was connecting to
+        // us at the same moment, and the handshake is not over.
+        Opening::Pending => Shake::Wait,
+    }
+}
+
+// TLA-conn> \* step, for a connection whose handshake is not over. Ruby is told of a
 // TLA-conn> \* connection once, when its handshake is over: with the status of one
 // TLA-conn> \* that it makes, or with the descriptor of one that it accepts. The
 // TLA-conn> \* listener's pair has room for the descriptor, as the model "listen"
 // TLA-conn> \* shows. A connection that becomes open is carried in the same pass.
 // TLA-conn> Begin(t) ==
-// TLA-conn>   CASE t.phase = "connecting" ->
-// TLA-conn>          IF P!HungUp(t.p) THEN Abort(t)
-// TLA-conn>          ELSE IF K!Opening(t.k) = "done" \/ (Fault = "greets early" /\ K!Opening(t.k) = "pending")
-// TLA-conn>               THEN [t EXCEPT !.said = "ok", !.phase = "open", !.old = FALSE, !.at = "take"]
-// TLA-conn>          ELSE IF K!Opening(t.k) = "failed" THEN Close([t EXCEPT !.said = "refused"])
-// TLA-conn>          ELSE IF t.old /\ Fault # "waits for ever" THEN Abort([t EXCEPT !.said = "timedout"])
-// TLA-conn>          ELSE Rest(t)
-// TLA-conn>     [] t.phase = "listening" ->
-// TLA-conn>          IF ~t.listens THEN Abort(t)
-// TLA-conn>          ELSE IF K!Opening(t.k) = "done" THEN [t EXCEPT !.said = "ok", !.phase = "open", !.at = "take"]
-// TLA-conn>          ELSE IF K!Opening(t.k) = "failed" /\ Fault # "keeps a failure" THEN Close(t)
-// TLA-conn>          ELSE IF t.old /\ Fault # "waits for ever" THEN Abort(t)
-// TLA-conn>          ELSE Rest(t)
+// TLA-conn>   LET told(status) == [t EXCEPT !.said = IF t.phase = "connecting" THEN status ELSE @]
+// TLA-conn>   IN CASE Shake(t) = "done" -> [t EXCEPT !.said = "ok", !.phase = "open", !.old = FALSE, !.at = "take"]
+// TLA-conn>        [] Shake(t) = "refused" -> Close(told("refused"))
+// TLA-conn>        [] Shake(t) = "timedout" -> Abort(told("timedout"))
+// TLA-conn>        [] Shake(t) = "abandoned" -> Abort(t)
+// TLA-conn>        [] OTHER -> Rest(t)
 /// Moves one connection as far as it will go, through each phase that it
 /// can leave now, and returns the phase that it is then in. `ctl` is the
 /// pair of the listener that a connection in Phase::Listening waits for,
@@ -246,40 +280,33 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
         phase = match phase {
             // sweep removes it.
             Phase::Dead => return phase,
-            // Ruby gave up waiting, and closed its end. Or the tunnel is
-            // closing, and has shut the pair down.
-            Phase::Connecting { pair, .. } if pair.hangup() != Hangup::No => break Fate::Abort,
-            Phase::Connecting { pair, since } => match Sock::opening(s) {
-                Opening::Done => {
-                    pair.say(status::OK);
-                    Phase::open(pair)
+            Phase::Connecting { pair, since } => {
+                // Ruby has left if it gave up waiting, and closed its
+                // end. A tunnel that is closing has shut the pair down,
+                // which is the same to our end.
+                let left = pair.hangup() != Hangup::No;
+                match shake(left, Sock::opening(s), now - since >= SYN_WAIT) {
+                    Shake::Wait => return Phase::Connecting { pair, since },
+                    Shake::Done => {
+                        pair.say(status::OK);
+                        Phase::open(pair)
+                    }
+                    Shake::Refused => {
+                        pair.say(status::REFUSED);
+                        break Fate::Close;
+                    }
+                    Shake::TimedOut => {
+                        pair.say(status::TIMED_OUT);
+                        break Fate::Abort;
+                    }
+                    Shake::Abandoned => break Fate::Abort,
                 }
-                // The peer reset the attempt. smoltcp's timeout closes a
-                // socket too, but not one that is given up sooner.
-                Opening::Failed => {
-                    pair.say(status::REFUSED);
-                    break Fate::Close;
-                }
-                Opening::Pending if now - since >= SYN_WAIT => {
-                    pair.say(status::TIMED_OUT);
-                    break Fate::Abort;
-                }
-                // The peer answers a SYN with a bare SYN if it was
-                // connecting to us at the same moment, and the handshake
-                // is not over.
-                Opening::Pending => return Phase::Connecting { pair, since },
-            },
+            }
             Phase::Listening { since, .. } => {
-                // Ruby closed the listener.
-                let Some(ctl) = ctl.as_deref_mut() else { break Fate::Abort };
-                match Sock::opening(s) {
-                    // The peer left the handshake unfinished.
-                    Opening::Pending if now - since >= SYN_WAIT => break Fate::Abort,
-                    Opening::Pending => return phase,
-                    // The peer finished the handshake, and reset the
-                    // connection at once.
-                    Opening::Failed => break Fate::Close,
-                    Opening::Done => {
+                let old = now - since >= SYN_WAIT;
+                match (shake(ctl.is_none(), Sock::opening(s), old), ctl.as_deref_mut()) {
+                    (Shake::Wait, _) => return phase,
+                    (Shake::Done, Some(ctl)) => {
                         // The system may have no descriptors to spare.
                         let Ok((ours, theirs)) = sys::socketpair(libc::SOCK_STREAM) else { break Fate::Abort };
                         let Some(from) = Sock::peer(s) else { break Fate::Abort };
@@ -289,6 +316,10 @@ pub fn step(mut phase: Phase, s: &mut Socket, mut ctl: Option<&mut Ctl>, now: Du
                         }
                         Phase::open(Pair::new(ours))
                     }
+                    // The peer finished the handshake, and reset the
+                    // connection at once.
+                    (Shake::Refused, _) => break Fate::Close,
+                    _ => break Fate::Abort,
                 }
             }
             Phase::Open(mut open) => {
@@ -665,7 +696,7 @@ impl Phase {
 //
 // TLA-conn.cfg/remove-at-once!RemovedClean> Fault = "remove at once"
 //
-// Ruby is sent the status before the handshake is over:
+// Ruby is told of a connection before its handshake is over:
 //
 // TLA-conn.cfg/greets-early!OpenIsGreeted> Fault = "greets early"
 //
@@ -673,7 +704,7 @@ impl Phase {
 //
 // TLA-conn.cfg/waits-for-ever!Shaken> Fault = "waits for ever"
 //
-// A socket that listened is kept when its handshake has failed:
+// A socket is kept when its handshake has failed:
 //
 // TLA-conn.cfg/keeps-a-failure!FailureEnds> Fault = "keeps a failure"
 //
@@ -754,7 +785,8 @@ mod tests {
     // state is at. `rake conform` has TLC write that for every state that
     // it reaches. The test then gives carry, or the step, a pair and a
     // socket that are the records of the modules "pair" and "sock", in
-    // each of those states.
+    // each of those states. For a connection whose handshake is not over,
+    // the model gives what shake says, and the test asks shake.
     //
     // TLA-conn@95> \* tools/tla writes the elements of Passes for a test in conn.rs, which
     // TLA-conn@95> \* holds carry, its four steps and asks to them. Sight is what those can
@@ -768,12 +800,18 @@ mod tests {
     // TLA-conn@95> Whole(t) == LET u == StepAt(t) IN IF u.at = t.at THEN Whole(u) ELSE u
     // TLA-conn@95> \* For an open connection at rest, Passes has the state after a whole
     // TLA-conn@95> \* pass. For one that is at a step, it has the state after that step,
-    // TLA-conn@95> \* which Ruby may have come to by acting between two steps.
-    // TLA-conn@95> Passes == IF s.phase # "open" THEN {}
-    // TLA-conn@95>           ELSE {[at |-> s.at, from |-> Sight(s),
-    // TLA-conn@95>                  to |-> Sight(IF s.at = "idle" THEN Pass(s) ELSE Whole(s)),
-    // TLA-conn@95>                  asks |-> [read |-> AskIn(s), write |-> AskOut(s), watched |-> Watched(s)],
-    // TLA-conn@95>                  caps |-> [pair |-> PairCap, tx |-> TxCap]]}
+    // TLA-conn@95> \* which Ruby may have come to by acting between two steps. For a
+    // TLA-conn@95> \* connection whose handshake is not over, it has what shake says.
+    // TLA-conn@95> Passes == CASE s.phase = "open" ->
+    // TLA-conn@95>                  {[at |-> s.at, from |-> Sight(s),
+    // TLA-conn@95>                    to |-> Sight(IF s.at = "idle" THEN Pass(s) ELSE Whole(s)),
+    // TLA-conn@95>                    asks |-> [read |-> AskIn(s), write |-> AskOut(s), watched |-> Watched(s)],
+    // TLA-conn@95>                    caps |-> [pair |-> PairCap, tx |-> TxCap]]}
+    // TLA-conn@95>             [] s.phase \in Early ->
+    // TLA-conn@95>                  {[at |-> "shake", from |-> Sight(s), listens |-> s.listens, old |-> s.old,
+    // TLA-conn@95>                    opening |-> K!Opening(s.k), shake |-> Shake(s),
+    // TLA-conn@95>                    caps |-> [pair |-> PairCap, tx |-> TxCap]]}
+    // TLA-conn@95>             [] OTHER -> {}
 
     /// Reads a record as TLC prints it. Returns each field's value under
     /// its path, as "from.pair.done". A string has lost its quotes.
@@ -1001,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn carry_and_its_steps_do_what_the_model_says_in_every_state_that_tlc_reaches() {
+    fn a_connection_does_what_the_model_says_in_every_state_that_tlc_reaches() {
         // `rake conform` names the file that TLC wrote. Without the file
         // there is nothing to hold carry to, as a Ruby test has nothing
         // to run against without its fixture.
@@ -1010,7 +1048,18 @@ mod tests {
         assert!(passes.lines().count() > 1000, "TLC reaches more states than {path:?} has");
         for line in passes.lines() {
             let f = fields(line);
-            let (mut pair, mut sock, left, wait, _) = sight(&f, "from");
+            let (mut pair, mut sock, left, wait, phase) = sight(&f, "from");
+            if f["at"] == "shake" {
+                let left = if phase == "connecting" { pair.hangup() != Hangup::No } else { f["listens"] == "FALSE" };
+                let opening = match f["opening"].as_str() {
+                    "pending" => Opening::Pending,
+                    "done" => Opening::Done,
+                    _ => Opening::Failed,
+                };
+                let said = format!("{:?}", shake(left, opening, f["old"] == "TRUE")).to_lowercase();
+                assert_eq!(said, f["shake"], "shake says otherwise in {line}");
+                continue;
+            }
             let asked = asks(&pair, sock.has_room(), sock.holds(), left != "no");
             let ask = |name: &str, event| if f[&format!("asks.{name}")] == "TRUE" { event } else { 0 };
             let watched =
