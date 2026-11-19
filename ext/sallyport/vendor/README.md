@@ -107,7 +107,8 @@ that came after is in the list.
 `rake vendored` runs the tests that each project has of its own: the
 library tests of smoltcp with its default features, and the tests of
 boringtun with its default features, which leave out those that need a
-TUN device. CI runs them on each push. A deviation brings its tests in
+TUN device. It runs the tests of boringtun once more with the feature
+`mock-instant`, which has them move a clock of their own. CI runs them on each push. A deviation brings its tests in
 the manner of the project, and they run there.
 
 The file `smoltcp/Cargo.lock` is not from smoltcp, which keeps no lock
