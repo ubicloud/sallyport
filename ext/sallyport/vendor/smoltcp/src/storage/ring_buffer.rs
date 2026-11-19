@@ -3,6 +3,7 @@
 // [RFC 1940]: https://github.com/rust-lang/rust/issues/43302
 
 use core::cmp;
+use core::fmt;
 use managed::ManagedSlice;
 
 use crate::storage::Resettable;
@@ -23,11 +24,22 @@ use super::{Empty, Full};
 ///
 /// This implementation is suitable for both simple uses such as a FIFO queue
 /// of UDP packets, and advanced ones such as a TCP reassembly buffer.
-#[derive(Debug)]
 pub struct RingBuffer<'a, T: 'a> {
     storage: ManagedSlice<'a, T>,
     read_at: usize,
     length: usize,
+}
+
+/// The elements of the storage are left out. A TCP socket has two ring
+/// buffers, and its `Debug` would else write every octet of both.
+impl<'a, T: 'a> fmt::Debug for RingBuffer<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RingBuffer")
+            .field("capacity", &self.capacity())
+            .field("read_at", &self.read_at)
+            .field("length", &self.length)
+            .finish()
+    }
 }
 
 impl<'a, T: 'a> RingBuffer<'a, T> {
@@ -410,6 +422,16 @@ impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_debug_leaves_out_the_storage() {
+        let mut ring = RingBuffer::new(vec![0u8; 65536]);
+        assert_eq!(ring.enqueue_slice(b"abc"), 3);
+        assert_eq!(
+            format!("{ring:?}"),
+            "RingBuffer { capacity: 65536, read_at: 0, length: 3 }"
+        );
+    }
 
     #[test]
     fn test_buffer_length_changes() {
