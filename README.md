@@ -336,7 +336,8 @@ Ruby 3.3:
   held off then keeps a process from its exit. So `Tunnel#connect` and
   `Tunnel#listen` hold off interrupts only once they have the lock.
 
-boringtun 0.7.1:
+boringtun 0.7.1. Here too the copy mends a fault where a deviation is
+named:
 
 - It gives a handshake up after 90 seconds, and begins another only when
   it is given a packet to send. Its timers report the expiry before they
@@ -362,8 +363,11 @@ boringtun 0.7.1:
   in a session only when the peer has shown that it holds the keys.
   After eight initiations that their sender does not complete, as with a
   preshared key that does not match, the peer reads as alive, and
-  packets for it leave in a session that it does not have. The tunnel
-  does nothing about this.
+  packets for it leave in a session that it does not have. The
+  deviation `confirmed-session` mends this
+  (`a_peer_that_completes_no_handshake_has_no_session`). A session that
+  the peer has not confirmed can still push the confirmed one out of the
+  eight places. The tunnel then begins a handshake for the next packet.
 - A session lasts 180 seconds, and boringtun begins the next one when it
   has something to send and none to send it in. A peer that sends only
   keepalives, every 25 seconds, is without a session for some 20 seconds
