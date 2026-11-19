@@ -17,6 +17,16 @@ task :slow do
   sh "cargo", "test", "--release", "--locked", "--manifest-path", "ext/sallyport/Cargo.toml", "--", "--ignored"
 end
 
+desc "Run the tests that smoltcp and boringtun have of their own, on the copies in vendor"
+task :vendored do
+  # The copies are changed here, so their tests are run here. Each is
+  # built with the crates that a lock file names, and outside its
+  # directory.
+  rest = ["--release", "--locked", "--target-dir", "ext/sallyport/target/vendored"]
+  sh "cargo", "test", "--lib", "--manifest-path", "ext/sallyport/vendor/smoltcp/Cargo.toml", *rest
+  sh "cargo", "test", "-p", "boringtun", "--manifest-path", "ext/sallyport/vendor/boringtun/Cargo.toml", *rest
+end
+
 # Wireproxy is the second implementation that the tests talk to. It is a
 # Go program, and its go.mod asks for Go 1.26.
 WIREPROXY = "github.com/windtf/wireproxy/cmd/wireproxy@v1.1.3"

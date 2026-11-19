@@ -50,7 +50,10 @@ tunnel.peers.each { |peer| puts "#{peer.public_key} #{peer.alive?}" }
 The gem is a Rust library behind a C ABI of eleven functions, which Ruby
 binds by hand with Fiddle. [boringtun](https://github.com/cloudflare/boringtun)
 is its WireGuard and [smoltcp](https://github.com/smoltcp-rs/smoltcp) is
-its TCP. To install the gem is to build the library, which takes Cargo.
+its TCP. The repository holds a copy of each in `ext/sallyport/vendor`,
+and the library is built with those. `ext/sallyport/vendor/README.md`
+says where each copy is from and how it has been changed. To install the
+gem is to build the library, which takes Cargo.
 
 Each tunnel has a thread of its own, which never takes the GVL. The
 thread owns the UDP socket, the WireGuard sessions and the TCP stack.
@@ -161,6 +164,7 @@ connection, in which the tunnel does nothing else.
 | `rake vpp`, then `sudo env "PATH=$PATH" ruby -Ilib -Itest test/test_vpp.rb` | The tests against VPP, which the task fetches as packages for Ubuntu 24.04. | root, ethtool |
 | `rake tla` | TLC on the TLA+ models. The task fetches TLC. | Java |
 | `rake conform` | The code that moves the bytes of a connection, in every state that TLC reaches of the model of it. | Java, Cargo |
+| `rake vendored` | The tests that smoltcp and boringtun have of their own, on the copies in `ext/sallyport/vendor`. | Cargo |
 
 The tests against another implementation put it in a ring. A test writes
 to a connection that it made, and reads the same bytes from a connection
@@ -240,7 +244,7 @@ The tests against other implementations, and the models, found the
 following. Each is something that another project may want to know of,
 and most name the test that shows it.
 
-smoltcp, at the commit that `ext/sallyport/Cargo.toml` names:
+smoltcp, at the commit that `ext/sallyport/vendor/README.md` names:
 
 - Release 0.14.0 panics when a peer fills a receive window whose edge the
   window scale rounded back. The fix is on the main branch and in no
@@ -367,3 +371,12 @@ boringtun 0.7.1:
   keys that anyone can make. The tunnel refuses a configuration that has
   one as a peer's key
   (`a_peer_may_not_have_a_key_that_makes_no_secret`).
+
+## License
+
+The library is under the Apache License 2.0, which is in `LICENSE`. The
+two directories in `ext/sallyport/vendor` are not: each is a copy of
+another project, and is under that project's license, which the
+directory holds. smoltcp is under 0BSD, and boringtun under the BSD
+3-Clause license. When this repository changes something in such a
+directory, the change is under the license of the directory.

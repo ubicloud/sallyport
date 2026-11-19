@@ -9,13 +9,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 base64 = "0.22"
-boringtun = { version = "0.7", default-features = false }
+# boringtun and smoltcp are built from the copies in vendor. The README
+# there says where each is from, and under which license it is.
+boringtun = { path = "vendor/boringtun/boringtun", default-features = false }
 libc = "0.2"
-# smoltcp 0.14.0 panics when a peer fills a receive window whose edge the
-# window scale rounded back ("attempt to subtract sequence numbers with
-# underflow"). The fix is on smoltcp's main branch and in no release yet.
-# Go back to a release when one has it.
-smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "c68ace42306fa6a31b7d3c893043829587a9c7a8", default-features = false, features = [
+smoltcp = { path = "vendor/smoltcp", default-features = false, features = [
   "std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic",
   "iface-max-addr-count-8", "iface-max-route-count-2",
 ] }

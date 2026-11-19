@@ -63,7 +63,7 @@ require "fileutils"
 require "set"
 
 ROOT = File.expand_path("..", __dir__)
-SOURCES = Dir.glob(%w[ext/sallyport/src/**/*.rs lib/**/*.rb], base: ROOT).sort.freeze
+SOURCES = Dir.glob(%w[ext/sallyport/src/**/*.rs ext/sallyport/vendor/**/*.rs lib/**/*.rb], base: ROOT).sort.freeze
 COMMENT = %r{\A\s*(?://[/!]?|#)\s*}
 PRAGMA = %r{#{COMMENT}TLA-(?<model>\w+)
             (?:@(?<section>\d+)|(?<cfg>\.cfg)(?:/(?<variant>[\w-]+)(?:!(?<fails>\w+))?)?)?
