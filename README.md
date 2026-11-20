@@ -251,7 +251,11 @@ copy in this repository mends a fault where a deviation is named, and
 - A window that has a scale is rounded down to it, so the end of the
   window moves back by a few bytes as the buffer fills. A segment is
   taken as far as the end that the socket has on record, which its last
-  ACK gave. If the peer sent as far as an earlier end, the last bytes of
+  ACK gave. smoltcp has done so since release 0.13.0. Before that it
+  took a segment as far as its buffer had room, which is as far as any
+  end that it gave. RFC 7323 says in section 2.4 that a receiver must
+  take, as in window, a segment that was in window for any ACK that it
+  sent. If the peer sent as far as an earlier end, the last bytes of
   the segment are dropped and its FIN is taken all the same. The program
   then reads the end of the stream without those bytes. While the window
   is shut, nothing from that peer counts as heard, and the timeout
