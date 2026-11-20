@@ -1818,6 +1818,8 @@ impl<'a> Socket<'a> {
         // From RFC 7323:
         // The receiver MUST honor, as in window, any segment that would have been in
         // window for any <ACK> sent by the receiver.
+        // And from RFC 9293 (3.10.7.4):
+        // The total of RCV.NXT and RCV.WND should not be reduced.
         let window_end = match self.remote_adv_edge {
             Some(furthest) if furthest > window_end => furthest,
             _ => window_end,
@@ -2000,6 +2002,8 @@ impl<'a> Socket<'a> {
         // If a FIN is received at the end of a segment whose payload was cut at
         // the right edge of the window, the octets before the FIN are missing:
         // disregard this FIN. The remote sends it again with those octets.
+        // RFC 9293 (3.10.7.4) has the portions of a segment that lie outside the
+        // window trimmed off, including SYN and FIN, before the segment is processed.
         if control == TcpControl::Fin && segment_end > window_end {
             tcp_trace!("ignoring FIN because the segment ends beyond the window");
             control = TcpControl::None;

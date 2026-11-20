@@ -38,7 +38,7 @@ table of classes follows it.
 
 | Copy | Deviation | Class | What it changes |
 | --- | --- | --- | --- |
-| `smoltcp` | `receive-window` | `fix` | A socket takes a segment as far as any edge of the receive window that it advertised, which RFC 7323 asks for in section 2.4, and passes over the FIN of a segment that it cut there. |
+| `smoltcp` | `receive-window` | `fix` | A socket takes a segment as far as any edge of the receive window that it advertised, which RFC 7323 asks for in section 2.4. It passes over the FIN of a segment that it cut there, since RFC 9293 has what lies outside the window trimmed off a segment, a FIN included (section 3.10.7.4). |
 | `smoltcp` | `ring-debug` | `fix` | The `Debug` of a ring buffer leaves out the elements of its storage. That of a TCP socket wrote every octet of its two buffers. |
 | `smoltcp` | `sends-now` | `addition` | `Socket::sends_now` says whether a socket has a segment to send at once. |
 | `smoltcp` | `lock` | `build` | `Cargo.lock` names the crates that the tests of smoltcp are built with here. |
