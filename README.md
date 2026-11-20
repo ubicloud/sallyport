@@ -112,11 +112,27 @@ thread's answer from it.
   and one ACK answers all that the turn took in. So a segment that
   arrives alone has an ACK to itself, where most TCPs send one ACK for
   two segments. Segments that arrive faster than the thread turns share
-  an ACK.
+  an ACK. RFC 9293 says that a TCP should delay an ACK (section
+  3.8.6.3).
 - A connection that has ended leaves no socket to wait in TIME-WAIT. Its
   last ACK has left by the end of the turn that ends it. If that ACK is
   lost, the peer sends its FIN again, and is answered with a reset where
   a kernel sends the ACK again. Neither side has lost a byte by then.
+  RFC 9293 has the side that closes first wait there for four minutes
+  (section 3.6.1). The wait is also for a segment of the connection that
+  arrives late, which is not to meet a new connection that has the same
+  addresses and ports. A new connection from the tunnel takes one of
+  16,384 ports at random, and begins at a random sequence number, so a
+  late segment is seldom taken for a part of it.
+- It does not leave a quiet connection alone. When nothing has passed on
+  a connection for 75 seconds, the tunnel asks the peer for an ACK. When
+  the peer has sent nothing for 300 seconds, the tunnel resets the
+  connection. So a connection that has nothing to send does not outlast
+  an outage of five minutes, as a connection of the kernel does. RFC
+  9293 has keep-alives off unless the program asks for them (section
+  3.8.4). They are on here because smoltcp counts the silence of a peer
+  whether or not anything waits to be acknowledged, which the section on
+  what the other implementations showed sets out.
 - A listener's backlog is 128 connections at most.
 - A tunnel answers a peer from the address that the system chooses for
   the way back. On a machine with several addresses, that may not be the
@@ -280,7 +296,9 @@ copy in this repository mends a fault where a deviation is named, and
   this (`test_debug_leaves_out_the_storage`, among the tests of the
   copy).
 - A socket's timeout counts the time since the peer's last packet,
-  whether or not anything waits to be acknowledged. A connection that is
+  whether or not anything waits to be acknowledged. The documentation of
+  `set_timeout` says that a connection does not time out while its
+  transmit buffer is empty and no keep-alive is set. A connection that is
   only quiet is reset unless a keep-alive is set as well
   (`a_quiet_connection_stays_open_until_its_peer_is_gone`).
 - When TIME-WAIT is over, the socket is cleared, and with it the bytes
