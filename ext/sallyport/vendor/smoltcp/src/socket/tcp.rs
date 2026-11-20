@@ -534,7 +534,8 @@ pub struct Socket<'a> {
     /// The furthest right edge of the receive window that was ever advertised.
     /// The window field is rounded down to the window scale, so the edge that
     /// the last segment advertised can be up to `(1 << shift) - 1` octets short
-    /// of an earlier one. The remote may have sent up to the earlier one.
+    /// of an earlier one. The remote may have sent up to the earlier one, and
+    /// RFC 7323 has the receiver honor it (section 2.4).
     remote_adv_edge: Option<TcpSeqNumber>,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
@@ -1814,7 +1815,9 @@ impl<'a> Socket<'a> {
         } else {
             window_start
         };
-        // The window is never taken back: an edge that was advertised stands.
+        // From RFC 7323:
+        // The receiver MUST honor, as in window, any segment that would have been in
+        // window for any <ACK> sent by the receiver.
         let window_end = match self.remote_adv_edge {
             Some(furthest) if furthest > window_end => furthest,
             _ => window_end,
