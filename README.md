@@ -256,7 +256,9 @@ copy in this repository mends a fault where a deviation is named, and
   end that it gave. RFC 7323 says in section 2.4 that a receiver must
   take, as in window, a segment that was in window for any ACK that it
   sent. If the peer sent as far as an earlier end, the last bytes of
-  the segment are dropped and its FIN is taken all the same. The program
+  the segment are dropped and its FIN is taken all the same. RFC 9293
+  has what lies outside the window trimmed off a segment before the
+  segment is processed, and a FIN with it (section 3.10.7.4). The program
   then reads the end of the stream without those bytes. While the window
   is shut, nothing from that peer counts as heard, and the timeout
   resets a peer that is there. The deviation `receive-window` mends
