@@ -105,7 +105,8 @@ thread's answer from it.
   writing. What the peer sends to it from then on stays in the tunnel,
   256 KiB of it at the most, and the peer is held after that. If the
   socket is closed while the tunnel holds such bytes, the peer is reset.
-- It agrees to no selective acknowledgement. The last section says why.
+- It agrees to no selective acknowledgement. The section on what the
+  other implementations showed says why.
 - It does not delay an ACK, as most TCPs do to send it with data. An ACK
   leaves in the turn of the tunnel's thread that took the segments in,
   and one ACK answers all that the turn took in. So a segment that
